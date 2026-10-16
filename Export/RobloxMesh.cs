@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace Rbx2Source.Export
 {
@@ -59,7 +61,10 @@ namespace Rbx2Source.Export
             var mesh = new RobloxMesh { Version = header.Substring(8) };
             int major = mesh.Version.Length > 0 ? mesh.Version[0] - '0' : 0;
             if (major < 2)
-                throw new NotSupportedException("Text meshes (version " + mesh.Version + ") have no skinning or facial data.");
+            {
+                mesh.ReadText(Encoding.ASCII.GetString(data, newline + 1, data.Length - newline - 1));
+                return mesh;
+            }
 
             using (var reader = new BinaryReader(new MemoryStream(data, newline + 1, data.Length - newline - 1)))
             {
@@ -290,6 +295,38 @@ namespace Rbx2Source.Export
                 faces.Add((int[])face.Clone());
             }
             return faces;
+        }
+
+        // Version 1 text meshes (old catalog items): a face count, then [position][normal][uv] for each corner of each
+        // face. They have no skinning or facial data. Version 1.00 positions are stored at twice their size.
+        private void ReadText(string text)
+        {
+            int newline = text.IndexOf('\n');
+            if (newline < 0 || !int.TryParse(text.Substring(0, newline).Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out int faceCount) || faceCount <= 0)
+                throw new InvalidDataException("The text mesh has no face count.");
+            float scale = Version == "1.00" ? 0.5f : 1;
+            var vectors = Regex.Matches(text.Substring(newline + 1), @"\[([^\]]*)\]");
+            if (vectors.Count < faceCount * 9)
+                throw new InvalidDataException("The text mesh is truncated.");
+            float[] Vector(int index)
+            {
+                string[] parts = vectors[index].Groups[1].Value.Split(',');
+                if (parts.Length < 3 || !parts.Take(3).All(part => float.TryParse(part, NumberStyles.Float, CultureInfo.InvariantCulture, out _)))
+                    throw new InvalidDataException("The text mesh has an invalid vector: " + vectors[index].Value);
+                float[] value = parts.Take(3).Select(part => float.Parse(part, NumberStyles.Float, CultureInfo.InvariantCulture)).ToArray();
+                if (value.Any(v => float.IsNaN(v) || float.IsInfinity(v)))
+                    throw new InvalidDataException("The text mesh contains invalid vertex data.");
+                return value;
+            }
+            for (int corner = 0; corner < faceCount * 3; corner++)
+            {
+                float[] p = Vector(corner * 3), n = Vector(corner * 3 + 1), uv = Vector(corner * 3 + 2);
+                Positions.Add(new[] { p[0] * scale, p[1] * scale, p[2] * scale });
+                Normals.Add(n);
+                Texcoords.Add(new[] { uv[0], 1 - uv[1] });
+            }
+            for (int face = 0; face < faceCount; face++)
+                Faces.Add(new[] { face * 3, face * 3 + 1, face * 3 + 2 });
         }
 
         private void ReadVertices(BinaryReader reader, uint count, int stride)

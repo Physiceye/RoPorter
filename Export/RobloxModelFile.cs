@@ -43,6 +43,7 @@ namespace Rbx2Source.Export
             public bool HasWrapLayer;
             public List<string> Attachments = new List<string>();
             public long? MeshId;
+            public long? TextureId;
         }
 
         // Describes an accessory: its attachment names (which decide the body part it is welded to), whether it
@@ -57,7 +58,10 @@ namespace Rbx2Source.Export
                 HasWrapLayer = values.Any(v => v.Property == ClassMarker && v.Class == "WrapLayer"),
                 Attachments = values.Where(v => v.Class == "Attachment" && v.Property == "Name").Select(v => v.Value).ToList(),
                 MeshId = values.Where(v => MeshProperties.Contains(v.Property))
-                    .OrderBy(v => v.Class == "MeshPart" ? 0 : 1).Select(v => ParseId(v.Value)).FirstOrDefault(id => id.HasValue)
+                    .OrderBy(v => v.Class == "MeshPart" ? 0 : 1).Select(v => ParseId(v.Value)).FirstOrDefault(id => id.HasValue),
+                TextureId = values.Where(v => TextureProperties.Contains(v.Property))
+                    .OrderBy(v => v.Class == "SurfaceAppearance" ? 0 : v.Class == "MeshPart" ? 1 : 2)
+                    .Select(v => ParseId(v.Value)).FirstOrDefault(id => id.HasValue)
             };
         }
 

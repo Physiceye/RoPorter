@@ -167,7 +167,7 @@ namespace Rbx2Source.Export
             {
                 if (response.StatusCode == HttpStatusCode.Unauthorized || response.StatusCode == HttpStatusCode.Forbidden)
                     throw new HttpRequestException("Roblox denied access (HTTP " + (int)response.StatusCode + "). " +
-                        "Set \"apiBase\" in RoPorter's settings.json to an API you control. This application cannot bypass " +
+                        "This application cannot bypass " +
                         "Roblox's access restrictions. Never paste account cookies.");
                 if (!response.IsSuccessStatusCode)
                     throw new HttpRequestException("Roblox request failed: HTTP " + (int)response.StatusCode +
@@ -522,6 +522,37 @@ namespace Rbx2Source.Export
             return name;
         }
 
+        // The catalog item's name, made safe for file and Source model names: runs of anything other than letters,
+        // digits, and underscores become one underscore ("Starwisp", "Classic_Fedora").
+        public async Task<string> GetCatalogNameAsync(long itemId, CancellationToken cancellation)
+        {
+            string name = Regex.Replace(await GetCatalogDisplayNameAsync(itemId, cancellation).ConfigureAwait(false),
+                @"[^A-Za-z0-9_]+", "_").Trim('_');
+            if (name.Length > 64)
+                name = name.Substring(0, 64).TrimEnd('_');
+            if (name.Length == 0)
+                throw new InvalidDataException("Roblox returned no usable name for item " + itemId + ".");
+            // Windows reserves these as device names, so they cannot be folder or file names.
+            if (Regex.IsMatch(name, @"\A(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])\z", RegexOptions.IgnoreCase))
+                name += "_" + itemId.ToString(CultureInfo.InvariantCulture);
+            return name;
+        }
+
+        // The catalog item's name as shown on Roblox ("Living Art: User Ads"), from the API's /v1/catalog route.
+        public async Task<string> GetCatalogDisplayNameAsync(long itemId, CancellationToken cancellation)
+        {
+            if (itemId <= 0)
+                throw new ArgumentOutOfRangeException(nameof(itemId), "Roblox IDs must be positive.");
+            JObject item = JObject.Parse(Encoding.UTF8.GetString(await DownloadAsync(new Uri((apiBase ?? "https://api.ocublox.tv") +
+                "/v1/catalog?itemId=" + itemId.ToString(CultureInfo.InvariantCulture)), cancellation).ConfigureAwait(false)));
+            if (item["data"] is JArray batch)
+                item = batch.First as JObject ?? throw new InvalidDataException("Roblox returned no details for item " + itemId + ".");
+            string name = item.Value<string>("name")?.Trim();
+            if (string.IsNullOrEmpty(name))
+                throw new InvalidDataException("Roblox returned no name for item " + itemId + ".");
+            return name;
+        }
+
         private async Task<string> GetDescriptorUrlAsync(long id, bool avatar, IProgress<string> progress, CancellationToken cancellation)
         {
             for (int attempt = 0; attempt < 20; attempt++)
@@ -546,6 +577,54 @@ namespace Rbx2Source.Export
             throw new TimeoutException("Roblox did not finish rendering the model. Try again later.");
         }
 
+        private const string CatalogTextureKey = "__catalog_texture__";
+
+        // Catalog items are built from the item's own model file (its mesh and colour texture), since the API has no
+        // 3D render route for them.
+        private async Task<WavefrontModel> BuildCatalogModelAsync(long id, Dictionary<string, byte[]> localTextures,
+            IProgress<string> progress, CancellationToken cancellation)
+        {
+            progress?.Report("Downloading catalog item " + id + "...");
+            RobloxModelFile.AccessoryModel item = RobloxModelFile.ReadAccessory(
+                await DownloadAssetAsync(id, cancellation, AccessoryAssetFormat).ConfigureAwait(false));
+            if (!item.MeshId.HasValue)
+                throw new InvalidDataException("The catalog item does not reference a mesh.");
+            progress?.Report("Downloading mesh " + item.MeshId.Value + "...");
+            RobloxMesh mesh = RobloxMesh.Parse(await DownloadAssetAsync(item.MeshId.Value, cancellation).ConfigureAwait(false));
+
+            var material = new ObjMaterial { Name = "Item" };
+            if (item.TextureId.HasValue)
+            {
+                try
+                {
+                    localTextures[CatalogTextureKey] = await DownloadAssetAsync(item.TextureId.Value, cancellation).ConfigureAwait(false);
+                    material.Texture = CatalogTextureKey;
+                }
+                catch (Exception error) when (error is AssetAccessException || error is HttpRequestException || error is InvalidDataException)
+                {
+                    progress?.Report("Item texture unavailable (" + error.Message + "); exporting it untextured.");
+                }
+            }
+
+            var model = new WavefrontModel();
+            model.Materials.Add(material.Name, material);
+            model.Positions.AddRange(mesh.Positions);
+            model.Normals.AddRange(mesh.Normals);
+            model.Texcoords.AddRange(mesh.Texcoords);
+            foreach (int[] face in mesh.Faces)
+            {
+                cancellation.ThrowIfCancellationRequested();
+                model.Triangles.Add(new ObjTriangle
+                {
+                    Material = material.Name,
+                    Group = "Handle",
+                    Corners = face.Select(index => new ObjCorner { Position = index, Texture = index, Normal = index }).ToArray()
+                });
+            }
+            progress?.Report("Mesh " + mesh.Version + ": " + model.Triangles.Count + " triangles.");
+            return model;
+        }
+
         // Export scale: 1 is full size (Roblox's proportions at 0.28 m per stud; Garry's Mod's player size), down to MinimumScale.
         public const float MinimumScale = 0.1f;
 
@@ -564,29 +643,38 @@ namespace Rbx2Source.Export
             if (format == ExportFormat.GarrysMod)
             {
                 garrysMod = GarrysModInstall.Find(GarrysModPath) ?? throw new InvalidDataException(
-                    "Garry's Mod was not found. Install it through Steam (its studiomdl compiles the model), or set \"garrysModPath\" in RoPorter's settings.json.");
+                    "Garry's Mod was not found. Install it through Steam (its studiomdl compiles the model).");
                 faceTracking = false;
             }
             GetRequestUrl(id, avatar);
             cancellation.ThrowIfCancellationRequested();
-            progress?.Report("Fetching Roblox's rendered 3D model...");
-            string url = string.IsNullOrWhiteSpace(descriptorUrl)
-                ? await GetDescriptorUrlAsync(id, avatar, progress, cancellation).ConfigureAwait(false)
-                : descriptorUrl.Trim();
-            Uri descriptorUri = ResolveCdnReference(url);
-            JObject descriptor = JObject.Parse(Encoding.UTF8.GetString(await DownloadAsync(descriptorUri, cancellation).ConfigureAwait(false)));
-            string objReference = descriptor.Value<string>("obj");
-            string mtlReference = descriptor.Value<string>("mtl");
-            if (objReference == null || mtlReference == null)
-                throw new InvalidDataException("The URL is not a Roblox OBJ/MTL 3D model descriptor. Copy the 3D request's imageUrl, not a preview image.");
+            WavefrontModel model;
+            JObject descriptor = null;
+            var localTextures = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+            if (!avatar && string.IsNullOrWhiteSpace(descriptorUrl))
+            {
+                model = await BuildCatalogModelAsync(id, localTextures, progress, cancellation).ConfigureAwait(false);
+            }
+            else
+            {
+                progress?.Report("Fetching Roblox's rendered 3D model...");
+                string url = string.IsNullOrWhiteSpace(descriptorUrl)
+                    ? await GetDescriptorUrlAsync(id, avatar, progress, cancellation).ConfigureAwait(false)
+                    : descriptorUrl.Trim();
+                Uri descriptorUri = ResolveCdnReference(url);
+                descriptor = JObject.Parse(Encoding.UTF8.GetString(await DownloadAsync(descriptorUri, cancellation).ConfigureAwait(false)));
+                string objReference = descriptor.Value<string>("obj");
+                string mtlReference = descriptor.Value<string>("mtl");
+                if (objReference == null || mtlReference == null)
+                    throw new InvalidDataException("The URL is not a Roblox OBJ/MTL 3D model descriptor. Copy the 3D request's imageUrl, not a preview image.");
 
-            progress?.Report("Downloading geometry and materials...");
-            string obj = Encoding.UTF8.GetString(await DownloadAsync(ResolveCdnReference(objReference), cancellation).ConfigureAwait(false));
-            string mtl = Encoding.UTF8.GetString(await DownloadAsync(ResolveCdnReference(mtlReference), cancellation).ConfigureAwait(false));
-            WavefrontModel model = WavefrontModel.Parse(obj, mtl, cancellation);
+                progress?.Report("Downloading geometry and materials...");
+                string obj = Encoding.UTF8.GetString(await DownloadAsync(ResolveCdnReference(objReference), cancellation).ConfigureAwait(false));
+                string mtl = Encoding.UTF8.GetString(await DownloadAsync(ResolveCdnReference(mtlReference), cancellation).ConfigureAwait(false));
+                model = WavefrontModel.Parse(obj, mtl, cancellation);
+            }
             AvatarRig rig = null;
             FaceShapes face = null;
-            var localTextures = new Dictionary<string, byte[]>(StringComparer.Ordinal);
             if (avatar)
             {
                 List<JObject> avatarAssets = null;
@@ -623,7 +711,7 @@ namespace Rbx2Source.Export
                     error is AssetAccessException || error is HttpRequestException || error is JsonException)
                 {
                     string hint = error is AssetAccessException && apiBase == null
-                        ? " Set \"apiBase\" in RoPorter's settings.json to an API whose /v1/asset/?id= route can download Roblox assets." : "";
+                        ? " The API needs a /v1/asset/?id= route that can download Roblox assets." : "";
                     progress?.Report("Face shape keys skipped: " + error.Message + hint);
                     if (faceTracking)
                         progress?.Report("Face tracking support needs a dynamic head with facial animation (FACS); none was added.");
@@ -640,7 +728,7 @@ namespace Rbx2Source.Export
             // Body textures (clothing composites) and overlay materials show the part colour through transparent texels.
             var overlayMaterials = new HashSet<string>(model.Triangles.Where(t => bodyGroups.Contains(t.Group)).Select(t => t.Material)
                 .Concat(model.Materials.Values.Where(m => m.Overlay).Select(m => m.Name)), StringComparer.Ordinal);
-            string[] textureReferences = (descriptor["textures"] as JArray)?.Values<string>().ToArray() ?? Array.Empty<string>();
+            string[] textureReferences = (descriptor?["textures"] as JArray)?.Values<string>().ToArray() ?? Array.Empty<string>();
             var availableTextures = new Dictionary<string, Uri>(StringComparer.Ordinal);
             foreach (string reference in textureReferences)
             {
@@ -651,9 +739,9 @@ namespace Rbx2Source.Export
 
             string outputRoot = Path.GetFullPath(outputFolder);
             Directory.CreateDirectory(outputRoot);
-            // Avatars are named after the account's username, items after their ID: the export folder, the model file, the
-            // single-texture files, and the Garry's Mod paths. Exporting the same name again replaces its folder.
-            string username = null;
+            // Avatars are named after the account's username, items after their catalog name: the export folder, the model
+            // file, the single-texture files, and the Garry's Mod paths. Exporting the same name again replaces its folder.
+            string username = null, itemName = null;
             if (avatar)
                 try
                 {
@@ -663,7 +751,16 @@ namespace Rbx2Source.Export
                 {
                     progress?.Report("Username unavailable (" + error.Message + "); the export is named after user ID " + id + ".");
                 }
-            string name = username ?? id.ToString(CultureInfo.InvariantCulture);
+            else
+                try
+                {
+                    itemName = await GetCatalogNameAsync(id, cancellation).ConfigureAwait(false);
+                }
+                catch (Exception error) when (error is HttpRequestException || error is InvalidDataException || error is JsonException)
+                {
+                    progress?.Report("Item name unavailable (" + error.Message + "); the export is named after item ID " + id + ".");
+                }
+            string name = username ?? itemName ?? id.ToString(CultureInfo.InvariantCulture);
             string staging = Path.Combine(outputRoot, ".export-" + Guid.NewGuid().ToString("N"));
             string destination = Path.Combine(outputRoot, name);
             Directory.CreateDirectory(staging);

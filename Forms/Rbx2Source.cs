@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Linq;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
@@ -14,17 +15,16 @@ namespace Rbx2Source
     {
         private readonly ComboBox exportType = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
         private readonly ComboBox exportFormat = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 185 };
-        private readonly TextBox input = new TextBox();
+        private readonly TextBox input = new TextBox { MaxLength = 19 };
         public const string DefaultApiBase = "https://api.ocublox.tv"; // IT WAS ME! // Note: I'm a peace of shit for using Rbx2Source code and dumping it into a AI to make somthing I always wanted and I'm leaving this comment to say sorry.
-        private string apiBase = DefaultApiBase;
-        // Optional Garry's Mod folder (settings.json "garrysModPath"); otherwise it is found through Steam.
-        private string garrysModPath;
         private static readonly ExportFormat[] Formats = { ExportFormat.Glb, ExportFormat.Gltf, ExportFormat.Fbx, ExportFormat.GarrysMod };
         private readonly TextBox outputFolder = new TextBox
         {
             Text = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Roblox Exports")
         };
-        private readonly Button export = new Button { Text = "Export", AutoSize = true };
+        // Export stays disabled until the entered user or item has loaded its preview.
+        private readonly Button export = new Button { Text = "Export", AutoSize = true, Enabled = false };
+        private bool loaded;
         private readonly CheckBox singleTexture = new CheckBox
         {
             Text = "Single texture", AutoSize = true, Margin = new Padding(6, 6, 6, 3)
@@ -90,7 +90,7 @@ namespace Rbx2Source
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             AddRow(layout, 0, "Export:", exportType);
-            AddRow(layout, 1, "Username:", input);
+            AddRow(layout, 1, "User ID:", input);
             AddRow(layout, 2, "Output folder:", outputFolder);
             layout.Controls.Add(browse, 0, 3);
             var scaleRow = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = false, Margin = new Padding(0) };
@@ -125,7 +125,20 @@ namespace Rbx2Source
                 UpdateFaceOptions(false);
                 SchedulePreview();
             };
-            input.TextChanged += (sender, args) => SchedulePreview();
+            // IDs only: typed non-digits are ignored, and pasted text keeps just its digits.
+            input.KeyPress += (sender, args) => args.Handled = !char.IsDigit(args.KeyChar) && !char.IsControl(args.KeyChar);
+            input.TextChanged += (sender, args) =>
+            {
+                string digits = new string(input.Text.Where(char.IsDigit).ToArray());
+                if (digits != input.Text)
+                {
+                    int caret = Math.Min(digits.Length, input.SelectionStart);
+                    input.Text = digits;
+                    input.SelectionStart = caret;
+                    return;
+                }
+                SchedulePreview();
+            };
             exportFormat.SelectedIndexChanged += (sender, args) => UpdateFaceOptions(false);
             previewTimer.Tick += async (sender, args) =>
             {
@@ -149,9 +162,7 @@ namespace Rbx2Source
                     cancellation.Cancel();
                     args.Cancel = true;
                     AppendLog("Cancelling export. Close the window again after cancellation finishes.");
-                    return;
                 }
-                SaveSettings();
             };
             FormClosed += (sender, args) =>
             {
@@ -163,7 +174,6 @@ namespace Rbx2Source
                 foreach (Image icon in typeIcons)
                     icon?.Dispose();
             };
-            LoadSettings();
         }
 
         private static Image LoadImage(string resource)
@@ -197,8 +207,15 @@ namespace Rbx2Source
             args.DrawFocusRectangle();
         }
 
+        private void SetLoaded(bool value)
+        {
+            loaded = value;
+            export.Enabled = loaded && cancellation == null;
+        }
+
         private void SchedulePreview()
         {
+            SetLoaded(false);
             previewCancellation?.Cancel();
             previewTimer.Stop();
             previewTimer.Start();
@@ -220,6 +237,7 @@ namespace Rbx2Source
             var current = previewCancellation = new CancellationTokenSource();
             string text = input.Text.Trim();
             bool avatar = exportType.SelectedIndex == 0;
+            Text = "RoPorter";
             if (text.Length == 0)
             {
                 return;
@@ -228,7 +246,7 @@ namespace Rbx2Source
             {
                 using (var client = CreateClient())
                 {
-                    var downloader = new RobloxModelDownloader(client, apiBase);
+                    var downloader = new RobloxModelDownloader(client, DefaultApiBase);
                     long id = await downloader.ResolveIdAsync(text, avatar, current.Token);
                     byte[] bytes = await downloader.DownloadThumbnailAsync(id, avatar, current.Token);
                     if (current != previewCancellation)
@@ -236,6 +254,8 @@ namespace Rbx2Source
                     using (var stream = new MemoryStream(bytes))
                     using (var image = Image.FromStream(stream))
                         ShowPreview(new Bitmap(image), (avatar ? "User " : "Item ") + id);
+                    SetLoaded(true);
+                    await ShowTitleAsync(downloader, id, avatar, current);
                 }
             }
             catch (OperationCanceledException)
@@ -250,63 +270,21 @@ namespace Rbx2Source
             }
         }
 
-        private static string SettingsFolder(string product) => Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), product);
-
-        private static string SettingsPath => Path.Combine(SettingsFolder("RoPorter"), "settings.json");
-
-        // Settings saved before the rename to RoPorter.
-        private static string LegacySettingsPath => Path.Combine(SettingsFolder("Rbx2Source"), "settings.json");
-
-        private void LoadSettings()
+        // A loaded avatar or catalog item names the window: "RoPorter - <username>" or "RoPorter - <item name>", or its ID
+        // when the name can't be looked up.
+        private async Task ShowTitleAsync(RobloxModelDownloader downloader, long id, bool avatar, CancellationTokenSource current)
         {
+            string title = id.ToString(System.Globalization.CultureInfo.InvariantCulture);
             try
             {
-                string path = File.Exists(SettingsPath) ? SettingsPath : LegacySettingsPath;
-                if (!File.Exists(path))
-                    return;
-                var settings = Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(path));
-                apiBase = settings.Value<string>("apiBase") ?? DefaultApiBase;
-                string folder = settings.Value<string>("outputFolder");
-                if (!string.IsNullOrWhiteSpace(folder))
-                    outputFolder.Text = folder;
-                singleTexture.Checked = settings.Value<bool?>("singleTexture") ?? false;
-                vrchatShapes.Checked = settings.Value<bool?>("vrchatShapes") ?? true;
-                faceTracking.Checked = settings.Value<bool?>("faceTracking") ?? false;
-                if (Enum.TryParse(settings.Value<string>("exportFormat"), true, out ExportFormat saved) && Array.IndexOf(Formats, saved) >= 0)
-                    exportFormat.SelectedIndex = Array.IndexOf(Formats, saved);
-                garrysModPath = settings.Value<string>("garrysModPath");
-                double savedScale = settings.Value<double?>("scale") ?? 1;
-                if (double.IsNaN(savedScale))
-                    savedScale = 1;
-                scale.Value = (int)Math.Round(Math.Max(scale.Minimum, Math.Min(scale.Maximum, savedScale * 100)));
+                title = avatar ? await downloader.GetUsernameAsync(id, current.Token)
+                    : await downloader.GetCatalogDisplayNameAsync(id, current.Token);
             }
-            catch (Exception error) when (error is IOException || error is UnauthorizedAccessException || error is Newtonsoft.Json.JsonException ||
-                error is InvalidCastException || error is FormatException)
+            catch (Exception error) when (error is HttpRequestException || error is InvalidDataException || error is Newtonsoft.Json.JsonException)
             {
-                AppendLog("Saved settings could not be read: " + error.Message);
             }
-        }
-
-        private void SaveSettings()
-        {
-            try
-            {
-                Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath));
-                var settings = new Newtonsoft.Json.Linq.JObject
-                {
-                    ["apiBase"] = apiBase.Trim(), ["outputFolder"] = outputFolder.Text.Trim(), ["singleTexture"] = singleTexture.Checked,
-                    ["vrchatShapes"] = vrchatShapes.Checked, ["faceTracking"] = faceTracking.Checked,
-                    ["exportFormat"] = Formats[exportFormat.SelectedIndex].ToString(), ["scale"] = scale.Value / 100.0
-                };
-                if (!string.IsNullOrWhiteSpace(garrysModPath))
-                    settings["garrysModPath"] = garrysModPath.Trim();
-                File.WriteAllText(SettingsPath, settings.ToString());
-            }
-            catch (Exception error) when (error is IOException || error is UnauthorizedAccessException)
-            {
-                AppendLog("Settings could not be saved: " + error.Message);
-            }
+            if (current == previewCancellation)
+                Text = "RoPorter - " + title;
         }
 
         private static void AddRow(TableLayoutPanel layout, int row, string label, Control control)
@@ -354,8 +332,7 @@ namespace Rbx2Source
                 var progress = new Progress<string>(AppendLog);
                 using (var client = CreateClient())
                 {
-                    var downloader = new RobloxModelDownloader(client, apiBase) { GarrysModPath = garrysModPath };
-                    SaveSettings();
+                    var downloader = new RobloxModelDownloader(client, DefaultApiBase);
                     long id = await downloader.ResolveIdAsync(selection, avatar, cancellation.Token);
                     string path = await downloader.ExportAsync(id, avatar, "", folder, progress, cancellation.Token, format,
                         avatar && faceTracking.Checked, vrchatShapes.Checked, singleTexture.Checked, scale.Value / 100f);
@@ -380,8 +357,9 @@ namespace Rbx2Source
 
         private void SetBusy(bool busy)
         {
-            foreach (Control control in new Control[] { exportType, exportFormat, input, outputFolder, browse, export, singleTexture, scale })
+            foreach (Control control in new Control[] { exportType, exportFormat, input, outputFolder, browse, singleTexture, scale })
                 control.Enabled = !busy;
+            export.Enabled = !busy && loaded;
             UpdateFaceOptions(busy);
             cancel.Enabled = busy;
         }
