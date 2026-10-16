@@ -164,6 +164,7 @@ namespace Rbx2Source
                     AppendLog("Cancelling export. Close the window again after cancellation finishes.");
                 }
             };
+            Shown += async (sender, args) => await CheckForUpdatesAsync();
             FormClosed += (sender, args) =>
             {
                 previewTimer.Dispose();
@@ -286,6 +287,41 @@ namespace Rbx2Source
             if (current == previewCancellation)
                 Text = "RoPorter - " + title;
         }
+
+        private const string ReleasesApi = "https://api.github.com/repos/Physiceye/RoPorter/releases/latest";
+
+        // Compares the latest GitHub release's tag (e.g. "v1.0.1") with this build's AssemblyVersion and offers the
+        // release page when it is newer. A failed check is only logged.
+        private async Task CheckForUpdatesAsync()
+        {
+            try
+            {
+                Newtonsoft.Json.Linq.JObject release;
+                using (var client = new HttpClient { Timeout = TimeSpan.FromSeconds(15) })
+                {
+                    client.DefaultRequestHeaders.UserAgent.ParseAdd("RoPorter");
+                    client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
+                    release = Newtonsoft.Json.Linq.JObject.Parse(await client.GetStringAsync(ReleasesApi));
+                }
+                string tag = release.Value<string>("tag_name") ?? "";
+                Version current = Normalize(typeof(Rbx2Source).Assembly.GetName().Version);
+                if (!Version.TryParse(tag.TrimStart('v', 'V'), out Version latest) || Normalize(latest) <= current)
+                    return;
+                AppendLog("RoPorter " + tag + " is available (this is v" + current.ToString(3) + ").");
+                if (Uri.TryCreate(release.Value<string>("html_url"), UriKind.Absolute, out Uri page) && page.Host == "github.com" &&
+                    MessageBox.Show(this, "RoPorter " + tag + " is available. You have v" + current.ToString(3) +
+                        ".\n\nOpen the download page?", "RoPorter update", MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes)
+                    Open(page.AbsoluteUri);
+            }
+            catch (Exception error) when (error is HttpRequestException || error is TaskCanceledException || error is Newtonsoft.Json.JsonException)
+            {
+                AppendLog("Could not check for updates: " + error.Message);
+            }
+        }
+
+        // Missing version parts count as zero, so "1.0.0" equals AssemblyVersion 1.0.0.0.
+        private static Version Normalize(Version version) =>
+            new Version(version.Major, Math.Max(0, version.Minor), Math.Max(0, version.Build), Math.Max(0, version.Revision));
 
         private static void AddRow(TableLayoutPanel layout, int row, string label, Control control)
         {
