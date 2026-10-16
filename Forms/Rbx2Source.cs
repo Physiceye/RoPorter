@@ -1,919 +1,421 @@
-﻿using Microsoft.Win32;
-using Rbx2Source.Assembler;
-using Rbx2Source.Compiler;
-using Rbx2Source.Resources;
-using Rbx2Source.Web;
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
-using System.Diagnostics.Contracts;
 using System.Drawing;
 using System.IO;
+using System.Net.Http;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using DiscordRPC;
-using DiscordRPC.Logging;
+using Rbx2Source.Export;
 
 namespace Rbx2Source
 {
-    public partial class Rbx2Source : Form
+    public sealed class Rbx2Source : Form
     {
-        private class OutputLog
+        private readonly ComboBox exportType = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
+        private readonly ComboBox exportFormat = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 185 };
+        private readonly TextBox input = new TextBox();
+        public const string DefaultApiBase = "https://api.ocublox.tv"; // IT WAS ME! // Note: I'm a peace of shit for using Rbx2Source code and dumping it into a AI to make somthing I always wanted and I'm leaving this comment to say sorry.
+        private string apiBase = DefaultApiBase;
+        // Optional Garry's Mod folder (settings.json "garrysModPath"); otherwise it is found through Steam.
+        private string garrysModPath;
+        private static readonly ExportFormat[] Formats = { ExportFormat.Glb, ExportFormat.Gltf, ExportFormat.Fbx, ExportFormat.GarrysMod };
+        private readonly TextBox outputFolder = new TextBox
         {
-            public string Message;
-            public FontStyle FontStyle;
-
-            public OutputLog()
-            {
-                Message = "";
-                FontStyle = FontStyle.Regular;
-            }
-
-            public OutputLog(string message, FontStyle style = FontStyle.Regular)
-            {
-                Message = message;
-                FontStyle = style;
-            }
-        }
-
-        public const float MODEL_SCALE = 10;
-        public Launcher baseProcess;
-
-        private UserInfo currentUser;
-        private long currentAssetId = 44113968;
-
-        private GameInfo selectedGame;
-        private string latestCompiledModel;
-        private GameInfo latestCompiledOnGame;
-        private readonly Dictionary<string, GameInfo> sourceGames = new Dictionary<string, GameInfo>();
-
-        private Dictionary<Control, string> Links;
-        private List<Control> CONTROLS_TO_DISABLE_WHEN_COMPILING;
-
-        private static int stackLevel = 0;
-        private static readonly List<OutputLog> outputQueue = new List<OutputLog>();
-        private const string outputDivider = "---------------------------------------------------------------------------";
-
-        private static readonly Dictionary<string, bool> progressQueue = new Dictionary<string, bool>();
-        private static bool updateProgressQueue;
-
-        private static readonly Image loadingImage = Properties.Resources.Loading;
-        private static readonly Image brokenImage = Properties.Resources.BrokenPreview;
-
-        private static Image debugImage;
-        private string assetPreviewImage = "";
+            Text = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Roblox Exports")
+        };
+        private readonly Button export = new Button { Text = "Export", AutoSize = true };
+        private readonly CheckBox singleTexture = new CheckBox
+        {
+            Text = "Single texture", AutoSize = true, Margin = new Padding(6, 6, 6, 3)
+        };
+        private readonly CheckBox vrchatShapes = new CheckBox
+        {
+            Text = "Add VRChat shape keys", AutoSize = true, Checked = true, Margin = new Padding(6, 6, 6, 3)
+        };
+        private readonly CheckBox faceTracking = new CheckBox
+        {
+            Text = "Add FT support", AutoSize = true, Margin = new Padding(6, 6, 6, 3)
+        };
+        // Export scale in hundredths: 100 is full size (the previous default and the maximum), 10 is the minimum (0.1).
+        private readonly TrackBar scale = new TrackBar
+        {
+            Minimum = 10, Maximum = 100, Value = 100, TickFrequency = 10, SmallChange = 1, LargeChange = 10,
+            TickStyle = TickStyle.None, AutoSize = false, Width = 220, Height = 26, Margin = new Padding(3, 6, 3, 0)
+        };
+        private readonly Label scaleValue = new Label { AutoSize = true, Margin = new Padding(0, 9, 3, 0) };
+        private readonly Button cancel = new Button { Text = "Cancel", Enabled = false, AutoSize = true };
+        private readonly Button openFolder = new Button { Text = "Open export folder", AutoSize = true };
+        private readonly Button browse = new Button { Text = "Browse...", AutoSize = true };
+        private readonly TextBox log = new TextBox
+        {
+            Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill
+        };
+        private CancellationTokenSource cancellation;
+        private readonly PictureBox preview = new PictureBox
+        {
+            Size = new Size(128, 128), SizeMode = PictureBoxSizeMode.Zoom, BorderStyle = BorderStyle.FixedSingle,
+            BackColor = Color.White, Margin = new Padding(10, 3, 0, 3)
+        };
+        private readonly ToolTip previewTip = new ToolTip();
+        private readonly Image brokenPreview = LoadImage("RoPorter.BrokenPreview.png");
+        private readonly Image[] typeIcons = { LoadImage("RoPorter.Humanoid_icon.png"), LoadImage("RoPorter.Accoutrement_icon.png") };
+        // Waits for typing to pause before looking up the preview.
+        private readonly System.Windows.Forms.Timer previewTimer = new System.Windows.Forms.Timer { Interval = 600 };
+        private CancellationTokenSource previewCancellation;
 
         public Rbx2Source()
         {
-            UserAvatar defaultAvatar = UserAvatar.FromUserId(62601805);
-            currentUser = defaultAvatar.UserInfo;
+            Text = "RoPorter";
+            using (Stream iconStream = typeof(Rbx2Source).Assembly.GetManifestResourceStream("RoPorter.favicon.ico"))
+                if (iconStream != null)
+                    Icon = new Icon(iconStream);
+            MinimumSize = new Size(680, 540);
+            ClientSize = new Size(900, 580);
+            StartPosition = FormStartPosition.CenterScreen;
+            AutoScaleMode = AutoScaleMode.Font;
 
-            InitializeComponent();
-            InitializeRPC();
-
-            if (!Debugger.IsAttached)
+            exportType.Items.AddRange(new object[] { "Avatar", "Catalog Item" });
+            exportType.DrawMode = DrawMode.OwnerDrawFixed;
+            exportType.ItemHeight = 20;
+            exportType.DrawItem += DrawExportType;
+            exportType.SelectedIndex = 0;
+            exportFormat.Items.AddRange(new object[] { "GLB", "glTF", "FBX", "Garry's Mod" });
+            exportFormat.SelectedIndex = 0;
+            var layout = new TableLayoutPanel
             {
-                quickCompile.Visible = false;
-                MainTab.Controls.Remove(Debug);
-            }
-        }
-        public DiscordRpcClient rpcClient;
-        void InitializeRPC()
-        {
-            rpcClient = new DiscordRpcClient("1012837153757208576");
-            if (!Debugger.IsAttached)
-            {
-                rpcClient.Logger = new ConsoleLogger() { Level = LogLevel.Warning };
-                rpcClient.OnReady += (sender, e) =>
-                {
-                    Console.WriteLine("Received Ready from user {0}", e.User.Username);
-                };
-
-                rpcClient.OnPresenceUpdate += (sender, e) =>
-                {
-                    Console.WriteLine("Received Update! {0}", e.Presence);
-                };
-            }
-            rpcClient.Initialize();
-           
-        }
-        public static void ScheduleTasks(params string[] tasks)
-        {
-            foreach (string task in tasks)
-            {
-                if (!progressQueue.ContainsKey(task))
-                {
-                    progressQueue[task] = false;
-                }
-            }
-        }
-
-        public static void MarkTaskCompleted(string completedTask)
-        {
-            if (progressQueue.ContainsKey(completedTask))
-            {
-                progressQueue[completedTask] = true;
-                updateProgressQueue = true;
-            }
-        }
-
-        public static string GetEnumName<T>(T value)
-        {
-            if (value == null)
-                return "null";
-
-            return Enum.GetName(typeof(T), value);
-        }
-
-        private void WriteLine(string line)
-        {
-            output.AppendText(line + "\r\n");
-        }
-
-        private static void PrintInternal(OutputLog log)
-        {
-            outputQueue.Add(log);
-        }
-
-        public static void IncrementStack()
-        {
-            stackLevel++;
-        }
-
-        public static void DecrementStack()
-        {
-            stackLevel--;
-        }
-
-        public static void Print(string msg)
-        {
-            int s = stackLevel + 1;
-
-            while (s-- > 0)
-                msg = "    " + msg;
-
-            OutputLog log = new OutputLog(msg);
-            PrintInternal(log);
-        }
-
-        public static void PrintHeader(string msg)
-        {
-            Contract.Requires(msg != null);
-            PrintInternal(new OutputLog("[" + msg.ToUpperInvariant() + "]", FontStyle.Bold));
-        }
-
-        public static void Print(string msgFormat, params object[] values)
-        {
-            if (msgFormat == null)
-                throw new ArgumentNullException(nameof(msgFormat));
-
-            for (int i = 0; i < values.Length; i++)
-            {
-                string match = "{" + i + "}";
-                msgFormat = msgFormat.Replace(match, values[i].ToInvariantString());
-            }
-
-            Print(msgFormat);
-        }
-
-        public static void SetDebugImage(Image img)
-        {
-            debugImage = img;
-        }
-
-        private static void showError(string msg, bool fatal = false)
-        {
-            MessageBox.Show(msg, (fatal ? "FATAL " : "") + "ERROR", MessageBoxButtons.OK, MessageBoxIcon.Error);
-
-            if (!fatal)
-                return;
-
-            Application.Exit();
-        }
-
-        private static string[] getStringsInQuotes(string str)
-        {
-            List<int> quoteLocs = new List<int>();
-            char lastChar = '\0';
-
-            for (int i = 0; i < str.Length; i++)
-            {
-                char next = str[i];
-
-                if (next == '"' && lastChar != '\\')
-                    quoteLocs.Add(i);
-
-                lastChar = next;
-            }
-
-            if (quoteLocs.Count % 2 != 0)
-                throw new Exception("Line " + str + " has an unclosed quote! Thanks Obama.");
-
-            List<string> captures = new List<string>();
-
-            for (int i = 0; i < quoteLocs.Count; i += 2)
-            {
-                int j = i + 1;
-
-                int pos0 = quoteLocs[i];
-                int pos1 = quoteLocs[j];
-
-                string captured = str.Substring(pos0 + 1, pos1 - pos0 - 1);
-                captures.Add(captured);
-            }
-
-            return captures.ToArray();
-        }
-
-        private void gatherSourceGames(string steamDir)
-        {
-            string steamPath = Path.Combine(steamDir, "steamapps", "common");
-            //string configDir = ConfigLoader();
-           // string steamPath = Path.Combine(configDir, "steamapps", "common");
-            if (Directory.Exists(steamPath))
-            {
-                foreach (string game in Directory.GetDirectories(steamPath))
-                {
-                    if (!game.Contains("Source SDK"))
-                    {
-                        string bin = Path.Combine(game, "bin");
-                        bool usingAltRoute = false;
-                        if (!Directory.Exists(bin))
-                        {
-                            string altRoute = Path.Combine(game, "game", "bin");
-
-                            if (Directory.Exists(altRoute))
-                            {
-                                // Source Filmmaker
-                                usingAltRoute = true;
-                                bin = altRoute;
-                            }
-                            else
-                            {
-                                // Fistful of Frags
-                                string altRoute2 = Path.Combine(game, "sdk", "bin");
-
-                                if (Directory.Exists(altRoute2))
-                                {
-                                    usingAltRoute = true;
-                                    bin = altRoute2;
-                                }
-                            }
-                        }
-                        if (Directory.Exists(bin))
-                        {
-                            string studioMdl = Path.Combine(bin, "studiomdl.exe");
-                            if (File.Exists(studioMdl))
-                            {
-                                string path = "";
-
-                                if (usingAltRoute)
-                                {
-                                    string userMod = Path.Combine(game, "game", "usermod");
-                                    if (Directory.Exists(userMod))
-                                    {
-                                        path = Path.Combine(userMod, "gameinfo.txt");
-                                    }
-                                }
-
-                                foreach (string gameDir in Directory.GetDirectories(game))
-                                {
-                                    if (!gameDir.Equals(bin, StringComparison.InvariantCulture))
-                                    {
-                                        string gameInfoPath = Path.Combine(gameDir, "gameinfo.txt");
-                                        if (File.Exists(gameInfoPath))
-                                        {
-                                            path = gameInfoPath;
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                try
-                                {
-                                    GameInfo info = new GameInfo(path);
-
-                                    if (info.ReadyToUse)
-                                    {
-                                        string gameName = info.GameName;
-                                        sourceGames[gameName] = info;
-                                    }
-                                }
-                                catch (Exception e)
-                                {
-                                    Console.WriteLine("ERROR GETTING GAMEINFO");
-                                    Console.WriteLine(e.Message);
-                                    Console.WriteLine(e.StackTrace);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        private void updateDisplays()
-        {
-            assetPreview.Image = loadingImage;
-
-            if (compilerTypeSelect.Text == "Avatar")
-            {
-                // assetPreviewImage = "https://www.roblox.com/headshot-thumbnail/json?width=420&height=420&format=png&userId=" + currentUser.Id; // Previous logic
-                assetPreviewImage = "https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=" + currentUser.id + "&size=420x420&format=Png&isCircular=false";
-                compilerInput.Text = "Username:";
-                compilerInputField.Text = currentUser.name;
-                compilerTypeIcon.Image = Properties.Resources.Humanoid_icon;
-                rpcClient.SetPresence(new RichPresence()
-                {
-                    Details = "Converting Avatars",
-                    State = "Converting Roblox Assets to Source Engine",
-                    Assets = new Assets()
-                    {
-                        LargeImageKey = "image_large",
-                        LargeImageText = $"Running Version {Settings.GetString("CurrentVersion")}",
-                        SmallImageKey = "humanoid_icon",
-                    }
-                });
-            }
-            else if (compilerTypeSelect.Text == "Accessory/Gear")
-            {
-                // assetPreviewImage = "https://www.roblox.com/asset-thumbnail/json?width=420&height=420&format=png&assetId=" + currentAssetId; // Previous logic
-                assetPreviewImage = "https://thumbnails.roblox.com/v1/assets?assetIds=" + currentAssetId + "&returnPolicy=PlaceHolder&size=420x420&format=Png&isCircular=false";
-                compilerInput.Text = "AssetId:";
-                compilerInputField.Text = currentAssetId.ToInvariantString();
-                compilerTypeIcon.Image = Properties.Resources.Accoutrement_icon;
-                rpcClient.SetPresence(new RichPresence()
-                {
-                    Details = "Converting Accessories/Gear",
-                    State = "Converting Roblox Assets to Source Engine",
-                    Assets = new Assets()
-                    {
-                        LargeImageKey = "image_large",
-                        LargeImageText = $"Running Version {Settings.GetString("CurrentVersion")}",
-                        SmallImageKey = "accoutrement_icon"
-                    }
-                });
-            }
-        }
-
-        private bool TrySetUsername(string userName)
-        {
-            UserAvatar avatar = UserAvatar.FromUsername(userName);
-
-            if (avatar.UserExists)
-            {
-                Settings.SaveSetting("Username", userName);
-                assetPreview.Image = loadingImage; // Set the image to Loading.gif
-                currentUser = avatar.UserInfo;
-                return true;
-            }
-            else
-            {
-                showError("An error occurred while trying to fetch this user!\n" +
-                          "Either the user does not exist, is banned or something went wrong with the request.");
-
-                return false;
-            }
-        }
-
-        private bool TrySetAssetId(object value)
-        {
-            string text = value.ToString();
-
-            if (long.TryParse(text, out long assetId))
-            {
-                Asset asset = null;
-
-                try
-                {
-                    asset = Asset.Get(assetId);
-                }
-                catch
-                {
-                    showError("This AssetId isn't configured correctly on Roblox's end.\n\n" +
-                              "This error usually happens if you input a very old AssetId that doesn't exist on their servers.\n\n" +
-                              "Try something else!");
-                }
-
-                if (asset != null)
-                {
-                    AssetType assetType = asset.ProductInfo.AssetTypeId;
-                    bool isAccessory = AssetGroups.IsTypeInGroup(assetType, AssetGroup.Accessories);
-
-                    if (isAccessory || assetType == AssetType.Gear || assetType == AssetType.Model)
-                    {
-                        assetPreview.Image = loadingImage;
-                        currentAssetId = assetId;
-
-                        Settings.SaveSetting("AssetId", assetId.ToInvariantString());
-                        return true;
-                    }
-                    else
-                    {
-                        showError("AssetType received: " + GetEnumName(assetType) + "\n\nExpected one of the following asset types:\n* Accessory\n* Gear\n\nTry again!");
-                    }
-                }
-            }
-            else
-            {
-                showError("Invalid AssetId!");
-            }
-
-            return false;
-        }
-
-        private void compilerInputField_Enter(object sender, EventArgs e)
-        {
-            compilerInputField.Clear();
-        }
-
-        private async void compilerInputField_Leave(object sender = null, EventArgs e = null)
-        {
-            if (compilerInputField.Enabled)
-            {
-                compilerInputField.Enabled = false;
-                compilerTypeSelect.Enabled = false;
-
-                if (compilerTypeSelect.Text == "Avatar")
-                    TrySetUsername(compilerInputField.Text);
-                else if (compilerTypeSelect.Text == "Accessory/Gear")
-                    TrySetAssetId(compilerInputField.Text);
-
-                updateDisplays();
-                await Task.Delay(100);
-
-                compilerTypeSelect.Enabled = true;
-                compilerInputField.Enabled = true;
-            }
-        }
-
-        private void compilerInputField_KeyDown(object sender, KeyEventArgs e)
-        {
-            if (e.KeyCode == Keys.Enter)
-            {
-                e.Handled = true;
-                e.SuppressKeyPress = true;
-                ActiveControl = null;
-            }
-        }
-
-        private async Task UpdateCompilerState()
-        {
-            while (outputQueue.Count > 0)
-            {
-                OutputLog next = outputQueue[0];
-                outputQueue.RemoveAt(0);
-
-                if (!output.IsDisposed) // Prevents a crash if the user quits during the compilation.
-                {
-                    output.SelectionFont = new Font(output.Font, next.FontStyle);
-                    WriteLine(next.Message);
-                }
-            }
-
-            if (updateProgressQueue)
-            {
-                int tasksDone = 0;
-                int totalTasks = progressQueue.Keys.Count;
-
-                foreach (string task in progressQueue.Keys)
-                {
-                    bool completed = progressQueue[task];
-                    tasksDone += (completed ? 1 : 0);
-                }
-
-                double progress = ((double)tasksDone / totalTasks) * 100.0;
-                compileProgress.Value = (int)progress;
-                updateProgressQueue = false;
-            }
-
-            await Task.Delay(100);
-        }
-
-        private async void LogException(Task brokenTask, string context)
-        {
-            string baseErrorMsg = "Failed to " + context + " model!";
-
-            string errorMsg = baseErrorMsg;
-            string exceptionMsg = "No message was given.";
-
-            AggregateException aException = brokenTask.Exception;
-
-            if (aException != null)
-            {
-                Exception exception = aException.InnerException;
-                if (exception != null)
-                {
-                    exceptionMsg = exception.Message;
-                    errorMsg += "\nError Message: " + exceptionMsg + "\n\n" +
-                                "If this error message has happened multiple times, and doesn't seem deliberate, you should totally send a screenshot of this error message to @qfoxbRBLX on Twitter.\n\n" +
-                                "STACK TRACE:\n" + outputDivider + "\n" + exception.StackTrace + "\n" + outputDivider;
-                }
-            }
-
-            Print(baseErrorMsg);
-            Print("Message:" + exceptionMsg);
-
-            await UpdateCompilerState();
-            showError(errorMsg);
-
-            if (Debugger.IsAttached)
-                Debugger.Break();
-
-            compileProgress.Value = 0;
-        }
-
-        private async void compile_Click(object sender, EventArgs e)
-        {
-            Stopwatch trackCompileTime = new Stopwatch();
-            trackCompileTime.Start();
-
-            output.Text = "";
-            outputQueue.Clear();
-            compileProgress.Value = 0;
-
-            foreach (Control control in CONTROLS_TO_DISABLE_WHEN_COMPILING)
-                control.Enabled = false;
-
-            Compiler.UseWaitCursor = true;
-            ModelCompiler.PreScheduleTasks();
-
-            Func<AssemblerData> assemble;
-
-            if (compilerTypeSelect.Text == "Avatar")
-            {
-                var assembler = new CharacterAssembler();
-                var userAvatar = UserAvatar.FromUsername(currentUser.name);
-                assemble = new Func<AssemblerData>(() => assembler.Assemble(userAvatar));
-            }
-            else
-            {
-                var assembler = new CatalogItemAssembler();
-                assemble = new Func<AssemblerData>(() => assembler.Assemble(currentAssetId));
-            }
-
-            Task<AssemblerData> buildModel = Task.Run(assemble);
-
-            while (!buildModel.IsCompleted)
-                await UpdateCompilerState();
-
-            if (buildModel.IsFaulted)
-            {
-                LogException(buildModel, "assemble");
-            }
-            else
-            {
-                AssemblerData data = buildModel.Result;
-                Task<string> compileModel = ModelCompiler.Compile(selectedGame, data);
-
-                while (!compileModel.IsCompleted)
-                    await UpdateCompilerState();
-
-                if (compileModel.IsFaulted)
-                {
-                    LogException(compileModel, "compile");
-                }
-                else
-                {
-                    PrintHeader("FINISHED MODEL!");
-                    trackCompileTime.Stop();
-
-                    Print("Assembled in {0} seconds.", trackCompileTime.Elapsed.TotalSeconds);
-
-                    await UpdateCompilerState();
-                    compileModel.Wait();
-
-                    latestCompiledModel = compileModel.Result;
-                    latestCompiledOnGame = selectedGame;
-                }
-            }
-
-            foreach (Control control in CONTROLS_TO_DISABLE_WHEN_COMPILING)
-                control.Enabled = true;
-
-            if (trackCompileTime.IsRunning)
-                trackCompileTime.Stop();
-
-            Compiler.UseWaitCursor = false;
-            progressQueue.Clear();
-        }
-
-        private void viewCompiledModel_Click(object sender, EventArgs e)
-        {
-            if (latestCompiledOnGame != null)
-            {
-                string hlmvPath = latestCompiledOnGame.HLMVPath;
-
-                if (File.Exists(hlmvPath))
-                {
-                    ThirdPartyUtility hlmv = new ThirdPartyUtility(hlmvPath);
-                    hlmv.AddParameter("game", latestCompiledOnGame.GameDirectory);
-                    hlmv.AddParameter("model", latestCompiledModel);
-                    hlmv.Run();
-                }
-                else
-                {
-                    showError("This Source Engine game doesn't have a model viewer for some reason :P");
-                }
-            }
-            else
-            {
-                showError("No model has compiled successfully yet!");
-                viewCompiledModel.Enabled = false;
-            }
-        }
-
-        private static void loadComboBox(ComboBox comboBox, string settingsKey, int defaultValue = 0)
-        {
-            string value = Settings.GetString(settingsKey);
-
-            if (value != null && comboBox.Items.Contains(value))
-            {
-                comboBox.Text = value;
-            }
-            else
-            {
-                comboBox.SelectedIndex = defaultValue;
-            }
-        }
-
-        private void compilerTypeSelect_SelectedIndexChanged(object sender, EventArgs e)
-        {
-            Settings.SaveSetting("CompilerType", compilerTypeSelect.Text);
-            updateDisplays();
-        }
-
-        private void gameSelect_SelectedIndexChanged(object sender, EventArgs e)
-        {
-            GameInfo game = sourceGames[gameSelect.Text];
-            selectedGame = game;
-
-            if (game.GameIcon != null)
-                gameIcon.Image = game.GameIcon.ToBitmap();
-            else
-                gameIcon.Image = gameIcon.InitialImage;
-
-            Settings.SaveSetting("SelectedGame", gameSelect.Text);
-        }
-
-        private void onLinkClicked(object sender, EventArgs e)
-        {
-            Control control = (Control)sender;
-
-            if (control != null && Links.ContainsKey(control))
-            {
-                string link = Links[control];
-                Process.Start(link);
-            }
-        }
-
-        private void Rbx2Source_Load(object sender, EventArgs e)
-        {
-            string steamDir = null;
-            Process[] steamProcesses = Process.GetProcessesByName("Steam");
-
-            if (steamProcesses.Length > 0)
-            {
-                foreach (Process process in steamProcesses)
-                {
-                    try
-                    {
-                        ProcessModule module = process.MainModule;
-                        string exePath = module.FileName;
-
-                        FileInfo info = new FileInfo(exePath);
-                        string directory = info.DirectoryName;
-
-                        if (info.Name == "Steam.exe")
-                        {
-                            string apps = Path.Combine(directory, "steamapps");
-                            if (Directory.Exists(apps))
-                            {
-                                steamDir = directory;
-                            }
-                        }
-                    }
-                    catch
-                    {
-                        Console.WriteLine("Can't access this steam process.");
-                    }
-                }
-            }
-
-            if (steamDir == null)
-            {
-                try
-                {
-                    RegistryKey currentUser = Registry.CurrentUser;
-                    RegistryKey steam = currentUser.OpenSubKey(@"SOFTWARE\Valve\Steam");
-                    steamDir = steam.GetValue("SteamPath") as string;
-                }
-                catch
-                {
-                    string programFilesX86 = Environment.GetEnvironmentVariable("ProgramFiles(x86)");
-                    steamDir = Path.Combine(programFilesX86, "Steam");
-                    if (!Directory.Exists(steamDir))
-                    {
-                        string programFiles = Environment.GetEnvironmentVariable("ProgramFiles");
-                        steamDir = Path.Combine(programFiles, "Steam");
-                        if (!Directory.Exists(steamDir))
-                        {
-                            showError("Cannot find Steam on this PC!\nTry running Steam so Rbx2Source can detect it.", true);
-                        }
-                    }
-                }
-            }
-
-            string steamPath = steamDir.Replace('/', '\\');
-            gatherSourceGames(steamPath);
-
-            string steamApps = Path.Combine(steamPath, "steamapps");
-
-            if (Directory.Exists(steamApps))
-            {
-                string libraryFolders = Path.Combine(steamApps, "libraryfolders.vdf");
-
-                if (File.Exists(libraryFolders))
-                {
-                    string file = File.ReadAllText(libraryFolders);
-
-                    string[] newlines = new string[] { "\r\n", "\n" };                   
-                    string[] lines = file.Split(newlines, StringSplitOptions.None);
-                    
-                    foreach (string line in lines)
-                    {
-                        string[] kvPair = getStringsInQuotes(line);
-
-                        if (kvPair.Length == 2 && kvPair[0] == "path")
-                        {
-                            string value = kvPair[1];
-                            value = value.Replace("\\\\", "\\");
-                            gatherSourceGames(value);
-                        }
-
-                    }
-                }
-            }
-
-            string savedGameSelection = Settings.GetString("SelectedGame");
-
-            int gameCount = 0;
-            gameSelect.Items.Clear();
-
-            foreach (string key in sourceGames.Keys)
-            {
-                gameSelect.Items.Add(key);
-                gameCount++;
-            }
-
-            if (gameCount == 0)
-                showError("No Source Engine games were found on this PC!", true);
-
-            gameSelect.Enabled = true;
-            compile.Enabled = true;
-
-            loadComboBox(gameSelect, "SelectedGame");
-            loadComboBox(compilerTypeSelect, "CompilerType", 1);
-
-            string userName = Settings.GetString("Username");
-            if (userName != null)
-                TrySetUsername(userName);
-
-            string assetId = Settings.GetString("AssetId");
-            TrySetAssetId(assetId);
-
-            selectedGame = sourceGames[gameSelect.Text];
-            updateDisplays();
-
-            CONTROLS_TO_DISABLE_WHEN_COMPILING = new List<Control>() { compile, compilerInputField, gameSelect, viewCompiledModel, compilerTypeSelect, quickCompile };
-
-            Links = new Dictionary<Control, string>()
-            {
-                {cloneTwitter,  "https://www.twitter.com/MaximumADHD"},
-                {qfoxb,         "https://www.github.com/qfoxb"},
-                {AJLink,        "https://www.github.com/RedTopper"},
-                {egoMooseLink,  "https://www.github.com/EgoMoose"},
-                {rileyLink,     "https://www.github.com/Rilinium"},
-                {timelessLink,  "https://www.github.com/timelessnesses"},
-                {nemsTools,     "https://web.archive.org/web/20200201044259/http://nemesis.thewavelength.net:80/index.php?p=40"}
+                Dock = DockStyle.Fill, Padding = new Padding(12), ColumnCount = 3, RowCount = 7
             };
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            AddRow(layout, 0, "Export:", exportType);
+            AddRow(layout, 1, "Username:", input);
+            AddRow(layout, 2, "Output folder:", outputFolder);
+            layout.Controls.Add(browse, 0, 3);
+            var scaleRow = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = false, Margin = new Padding(0) };
+            scaleRow.Controls.AddRange(new Control[] { new Label { Text = "Scale:", AutoSize = true, Margin = new Padding(3, 9, 0, 0) }, scale, scaleValue });
+            layout.Controls.Add(scaleRow, 1, 3);
+            new ToolTip().SetToolTip(scale, "Scales the exported model down. 1 is full size (the default); 0.1 is the smallest.");
+            scale.ValueChanged += (sender, args) => scaleValue.Text = (scale.Value / 100.0).ToString("0.00", System.Globalization.CultureInfo.CurrentCulture);
+            scaleValue.Text = (1.0).ToString("0.00", System.Globalization.CultureInfo.CurrentCulture);
+            layout.Controls.Add(new Label { Text = "Export format:", AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Bottom, Margin = new Padding(3, 8, 3, 0) }, 0, 4);
+            preview.Image = brokenPreview;
+            layout.Controls.Add(preview, 2, 0);
+            layout.SetRowSpan(preview, 5);
+            var actions = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
+            actions.Controls.AddRange(new Control[] { exportFormat, singleTexture, vrchatShapes, faceTracking, export, cancel, openFolder });
+            new ToolTip().SetToolTip(singleTexture, "Merges every material into one material and one texture.");
+            new ToolTip().SetToolTip(vrchatShapes, "Adds VRChat visemes.");
+            new ToolTip().SetToolTip(faceTracking, "Adds Unified Expressions face shapes for VRCFaceTracking.");
+            new ToolTip().SetToolTip(exportFormat, "Garry's Mod builds an addon folder: avatars become a playermodel that also works as a ragdoll, catalog items become props.");
+            layout.Controls.Add(actions, 0, 5);
+            layout.SetColumnSpan(actions, 3);
+            layout.Controls.Add(log, 0, 6);
+            layout.SetColumnSpan(log, 3);
+            for (int row = 0; row < 6; row++)
+                layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            Controls.Add(layout);
 
-            foreach (Control link in Links.Keys)
-                link.Click += new EventHandler(onLinkClicked);
-
-            Task.Run(async () =>
+            exportType.SelectedIndexChanged += (sender, args) =>
             {
-                while (!IsDisposed)
+                ((Label)layout.GetControlFromPosition(0, 1)).Text =
+                    exportType.SelectedIndex == 0 ? "User ID:" : "Item ID:";
+                UpdateFaceOptions(false);
+                SchedulePreview();
+            };
+            input.TextChanged += (sender, args) => SchedulePreview();
+            exportFormat.SelectedIndexChanged += (sender, args) => UpdateFaceOptions(false);
+            previewTimer.Tick += async (sender, args) =>
+            {
+                previewTimer.Stop();
+                await UpdatePreviewAsync();
+            };
+            browse.Click += Browse_Click;
+            export.Click += Export_Click;
+            cancel.Click += (sender, args) => cancellation?.Cancel();
+            openFolder.Click += (sender, args) =>
+            {
+                if (Directory.Exists(outputFolder.Text))
+                    Open(outputFolder.Text);
+                else
+                    ShowError("The export folder does not exist yet.");
+            };
+            FormClosing += (sender, args) =>
+            {
+                if (cancellation != null)
                 {
-                    if (assetPreview.ImageLocation != assetPreviewImage)
-                    {
-                        CdnPender check = WebUtility.DownloadJSON<CdnPender>(assetPreviewImage);
-
-                        if (check.Data[0].State == "Completed")
-                        {
-                            //final = pender.Data[0].State == "Final";
-                            //result = pender.Data[0].ImageUrl.ToString();
-                            assetPreviewImage = check.Data[0].ImageUrl.ToString();
-                            assetPreview.ImageLocation = check.Data[0].ImageUrl.ToString();
-                        }
-                        else
-                        {
-                            string currentPending = assetPreviewImage; // localize this in case it changes.
-                            assetPreview.Image = loadingImage;
-
-                            Task<string> pend = Task.Run(() => WebUtility.PendCdn(currentPending, false));
-
-                            while (!pend.IsCompleted)
-                            {
-                                if (assetPreviewImage != currentPending)
-                                    break;
-
-                                if (pend.IsFaulted)
-                                    break;
-
-                                await Task.Delay(100);
-                            }
-
-                            if (assetPreviewImage == currentPending)
-                            {
-                                if (pend.IsFaulted) // mark the preview as broken.
-                                {
-                                    assetPreviewImage = "";
-                                    assetPreview.ImageLocation = "";
-                                    assetPreview.Image = brokenImage;
-                                }
-                                else
-                                {
-                                    string result = pend.Result;
-                                    assetPreviewImage = result;
-                                    assetPreview.ImageLocation = result;
-                                }
-                            }
-                        }
-                    }
-
-                    if (Debugger.IsAttached && debugImg.Image != debugImage)
-                        debugImg.Image = debugImage;
-
-                    await Task.Delay(10);
+                    cancellation.Cancel();
+                    args.Cancel = true;
+                    AppendLog("Cancelling export. Close the window again after cancellation finishes.");
+                    return;
                 }
-            });
+                SaveSettings();
+            };
+            FormClosed += (sender, args) =>
+            {
+                previewTimer.Dispose();
+                previewCancellation?.Cancel();
+                if (preview.Image != brokenPreview)
+                    preview.Image?.Dispose();
+                brokenPreview?.Dispose();
+                foreach (Image icon in typeIcons)
+                    icon?.Dispose();
+            };
+            LoadSettings();
         }
 
-        private void Rbx2Source_FormClosed(object sender, FormClosedEventArgs e)
+        private static Image LoadImage(string resource)
         {
-            baseProcess?.Dispose();
-            rpcClient.Dispose();
+            using (Stream stream = typeof(Rbx2Source).Assembly.GetManifestResourceStream(resource))
+            {
+                if (stream == null)
+                    return null;
+                using (var image = Image.FromStream(stream))
+                    return new Bitmap(image);
+            }
         }
 
-        private void quickCompile_CheckedChanged(object sender, EventArgs e)
+        // Export type dropdown entries with their icons.
+        private void DrawExportType(object sender, DrawItemEventArgs args)
         {
-            CharacterAssembler.DEBUG_RAPID_ASSEMBLY = quickCompile.Checked;
+            args.DrawBackground();
+            if (args.Index >= 0)
+            {
+                Image icon = typeIcons[args.Index];
+                int x = args.Bounds.X + 3;
+                if (icon != null)
+                {
+                    args.Graphics.DrawImage(icon, x, args.Bounds.Y + (args.Bounds.Height - icon.Height) / 2, icon.Width, icon.Height);
+                    x += icon.Width + 5;
+                }
+                TextRenderer.DrawText(args.Graphics, exportType.Items[args.Index].ToString(), args.Font,
+                    new Rectangle(x, args.Bounds.Y, args.Bounds.Right - x, args.Bounds.Height), args.ForeColor,
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis);
+            }
+            args.DrawFocusRectangle();
         }
 
-        private void pictureBox1_Click(object sender, EventArgs e)
+        private void SchedulePreview()
         {
-
+            previewCancellation?.Cancel();
+            previewTimer.Stop();
+            previewTimer.Start();
         }
 
-        private void qfoxb_LinkClicked(object sender, LinkLabelLinkClickedEventArgs e)
+        private void ShowPreview(Image image, string description)
         {
-            
+            Image old = preview.Image;
+            preview.Image = image ?? brokenPreview;
+            if (old != null && old != brokenPreview && old != preview.Image)
+                old.Dispose();
+            previewTip.SetToolTip(preview, description);
         }
 
-        private void TwitterIcon_Click(object sender, EventArgs e)
+        // Shows the avatar's headshot or the item's thumbnail; anything that can't be loaded shows the broken preview.
+        private async Task UpdatePreviewAsync()
         {
-
+            previewCancellation?.Cancel();
+            var current = previewCancellation = new CancellationTokenSource();
+            string text = input.Text.Trim();
+            bool avatar = exportType.SelectedIndex == 0;
+            if (text.Length == 0)
+            {
+                return;
+            }
+            try
+            {
+                using (var client = CreateClient())
+                {
+                    var downloader = new RobloxModelDownloader(client, apiBase);
+                    long id = await downloader.ResolveIdAsync(text, avatar, current.Token);
+                    byte[] bytes = await downloader.DownloadThumbnailAsync(id, avatar, current.Token);
+                    if (current != previewCancellation)
+                        return;
+                    using (var stream = new MemoryStream(bytes))
+                    using (var image = Image.FromStream(stream))
+                        ShowPreview(new Bitmap(image), (avatar ? "User " : "Item ") + id);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                if (current == previewCancellation && !current.IsCancellationRequested)
+                    ShowPreview(null, "The preview timed out.");
+            }
+            catch (Exception error)
+            {
+                if (current == previewCancellation)
+                    ShowPreview(null, "No preview: " + error.Message);
+            }
         }
 
-        private void linkLabel1_LinkClicked(object sender, LinkLabelLinkClickedEventArgs e)
-        {
+        private static string SettingsFolder(string product) => Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), product);
 
+        private static string SettingsPath => Path.Combine(SettingsFolder("RoPorter"), "settings.json");
+
+        // Settings saved before the rename to RoPorter.
+        private static string LegacySettingsPath => Path.Combine(SettingsFolder("Rbx2Source"), "settings.json");
+
+        private void LoadSettings()
+        {
+            try
+            {
+                string path = File.Exists(SettingsPath) ? SettingsPath : LegacySettingsPath;
+                if (!File.Exists(path))
+                    return;
+                var settings = Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(path));
+                apiBase = settings.Value<string>("apiBase") ?? DefaultApiBase;
+                string folder = settings.Value<string>("outputFolder");
+                if (!string.IsNullOrWhiteSpace(folder))
+                    outputFolder.Text = folder;
+                singleTexture.Checked = settings.Value<bool?>("singleTexture") ?? false;
+                vrchatShapes.Checked = settings.Value<bool?>("vrchatShapes") ?? true;
+                faceTracking.Checked = settings.Value<bool?>("faceTracking") ?? false;
+                if (Enum.TryParse(settings.Value<string>("exportFormat"), true, out ExportFormat saved) && Array.IndexOf(Formats, saved) >= 0)
+                    exportFormat.SelectedIndex = Array.IndexOf(Formats, saved);
+                garrysModPath = settings.Value<string>("garrysModPath");
+                double savedScale = settings.Value<double?>("scale") ?? 1;
+                if (double.IsNaN(savedScale))
+                    savedScale = 1;
+                scale.Value = (int)Math.Round(Math.Max(scale.Minimum, Math.Min(scale.Maximum, savedScale * 100)));
+            }
+            catch (Exception error) when (error is IOException || error is UnauthorizedAccessException || error is Newtonsoft.Json.JsonException ||
+                error is InvalidCastException || error is FormatException)
+            {
+                AppendLog("Saved settings could not be read: " + error.Message);
+            }
         }
 
-        private void pictureBox3_Click(object sender, EventArgs e)
+        private void SaveSettings()
         {
-
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath));
+                var settings = new Newtonsoft.Json.Linq.JObject
+                {
+                    ["apiBase"] = apiBase.Trim(), ["outputFolder"] = outputFolder.Text.Trim(), ["singleTexture"] = singleTexture.Checked,
+                    ["vrchatShapes"] = vrchatShapes.Checked, ["faceTracking"] = faceTracking.Checked,
+                    ["exportFormat"] = Formats[exportFormat.SelectedIndex].ToString(), ["scale"] = scale.Value / 100.0
+                };
+                if (!string.IsNullOrWhiteSpace(garrysModPath))
+                    settings["garrysModPath"] = garrysModPath.Trim();
+                File.WriteAllText(SettingsPath, settings.ToString());
+            }
+            catch (Exception error) when (error is IOException || error is UnauthorizedAccessException)
+            {
+                AppendLog("Settings could not be saved: " + error.Message);
+            }
         }
 
-        private void label1_Click(object sender, EventArgs e)
+        private static void AddRow(TableLayoutPanel layout, int row, string label, Control control)
         {
-
+            layout.Controls.Add(new Label { Text = label, AutoSize = true, Anchor = AnchorStyles.Left }, 0, row);
+            control.Dock = DockStyle.Fill;
+            layout.Controls.Add(control, 1, row);
         }
 
-        private void linkLabel1_LinkClicked_1(object sender, LinkLabelLinkClickedEventArgs e)
+        private void Browse_Click(object sender, EventArgs args)
         {
-
+            using (var dialog = new FolderBrowserDialog { Description = "Choose the export folder" })
+            {
+                if (Directory.Exists(outputFolder.Text))
+                    dialog.SelectedPath = outputFolder.Text;
+                if (dialog.ShowDialog(this) == DialogResult.OK)
+                    outputFolder.Text = dialog.SelectedPath;
+            }
         }
 
-        private void linkLabel1_LinkClicked_2(object sender, LinkLabelLinkClickedEventArgs e)
+        private static HttpClient CreateClient()
         {
-
+            return new HttpClient(new HttpClientHandler
+            {
+                AllowAutoRedirect = false,
+                UseCookies = false,
+                AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate
+            })
+            {
+                Timeout = TimeSpan.FromSeconds(60)
+            };
         }
 
-        private void label1_Click_1(object sender, EventArgs e)
+        private async void Export_Click(object sender, EventArgs args)
         {
+            cancellation = new CancellationTokenSource();
+            SetBusy(true);
+            log.Clear();
+            try
+            {
+                bool avatar = exportType.SelectedIndex == 0;
+                string selection = input.Text;
+                ExportFormat format = Formats[exportFormat.SelectedIndex];
+                string folder = Path.GetFullPath(outputFolder.Text);
+                var progress = new Progress<string>(AppendLog);
+                using (var client = CreateClient())
+                {
+                    var downloader = new RobloxModelDownloader(client, apiBase) { GarrysModPath = garrysModPath };
+                    SaveSettings();
+                    long id = await downloader.ResolveIdAsync(selection, avatar, cancellation.Token);
+                    string path = await downloader.ExportAsync(id, avatar, "", folder, progress, cancellation.Token, format,
+                        avatar && faceTracking.Checked, vrchatShapes.Checked, singleTexture.Checked, scale.Value / 100f);
+                    AppendLog("Export complete: " + path);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                ShowError(cancellation.IsCancellationRequested ? "Export cancelled." : "The Roblox request timed out. Try again.");
+            }
+            catch (Exception error)
+            {
+                ShowError(error.Message);
+            }
+            finally
+            {
+                cancellation.Dispose();
+                cancellation = null;
+                SetBusy(false);
+            }
+        }
 
+        private void SetBusy(bool busy)
+        {
+            foreach (Control control in new Control[] { exportType, exportFormat, input, outputFolder, browse, export, singleTexture, scale })
+                control.Enabled = !busy;
+            UpdateFaceOptions(busy);
+            cancel.Enabled = busy;
+        }
+
+        // Face shape options apply to avatars outside Garry's Mod (Source models get no shape keys).
+        // Face tracking and the VRChat shape keys are independent.
+        private void UpdateFaceOptions(bool busy)
+        {
+            bool avatar = exportType.SelectedIndex == 0 && Formats[Math.Max(0, exportFormat.SelectedIndex)] != ExportFormat.GarrysMod;
+            vrchatShapes.Enabled = !busy && avatar;
+            faceTracking.Enabled = !busy && avatar;
+        }
+
+        private void AppendLog(string message)
+        {
+            log.AppendText(message + Environment.NewLine);
+        }
+
+        private void ShowError(string message)
+        {
+            AppendLog(message);
+            MessageBox.Show(this, message, "RoPorter", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
+        private void Open(string target)
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
+            }
+            catch (Exception error)
+            {
+                ShowError("Could not open the browser or folder: " + error.Message);
+            }
         }
     }
 }

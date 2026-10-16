@@ -1,4 +1,4 @@
-name: Build Rbx2Source
+name: Build RoPorter
 on:
   push:
     branches: [ "main" ]
@@ -9,30 +9,26 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-    - uses: actions/checkout@v3
-    - name: Clone Dependency Repository
-      run: |
-         cd ..
-          git clone https://github.com/MaximumADHD/Roblox-File-Format.git
-          cd Roblox-File-Format
-          nuget restore
-
-    - name: Restore dependencies
-      run: nuget restore
+    - uses: actions/checkout@v4
+    - uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x'
     - name: Add msbuild to PATH
-      uses: microsoft/setup-msbuild@v1.1
+      uses: microsoft/setup-msbuild@v2
     - name: Build
-      run: msbuild Rbx2Source.sln
+      run: msbuild Rbx2Source.sln /restore /p:Configuration=Release
+    - name: Test GLB and glTF export
+      run: dotnet test Tests\Rbx2Source.Tests.csproj --configuration Release
     - name: VirusTotal Scan
       continue-on-error: true
       uses: crazy-max/ghaction-virustotal@v3
       with:
         vt_api_key: ${{ secrets.VT_APIKEY}}
         request_rate: 4
-        files: bin/debug/Rbx2Source.exe  
-    -  name: Upload Artifact  
-       uses: actions/upload-artifact@v3
-       with:
-         name: Rbx2Source
-         path: bin/Debug/Rbx2Source.exe
-         if-no-files-found: error
+        files: bin/Release/RoPorter.exe
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: RoPorter
+        path: bin/Release/RoPorter.exe
+        if-no-files-found: error

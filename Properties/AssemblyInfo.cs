@@ -6,11 +6,11 @@ using System.Resources;
 // General Information about an assembly is controlled through the following 
 // set of attributes. Change these attribute values to modify the information
 // associated with an assembly.
-[assembly: AssemblyTitle("Rbx2Source")]
-[assembly: AssemblyDescription("A utility tool that automatically assembles Roblox assets into geometry data, which is then compiled into the Source Engine.")]
+[assembly: AssemblyTitle("RoPorter")]
+[assembly: AssemblyDescription("Download textured Roblox avatars and catalog items as GLB / glTF models.")]
 [assembly: AssemblyConfiguration("")]
 [assembly: AssemblyCompany("")]
-[assembly: AssemblyProduct("Rbx2Source")]
+[assembly: AssemblyProduct("RoPorter")]
 [assembly: AssemblyCopyright("")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
