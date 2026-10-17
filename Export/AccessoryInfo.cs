@@ -25,6 +25,11 @@ namespace Rbx2Source.Export
         private static readonly HashSet<int> LayeredTypes = new HashSet<int> { 64, 65, 66, 67, 68, 69, 70, 71, 72 };
 
         public static bool IsAccessoryType(int typeId) => RigidTypes.Contains(typeId) || LayeredTypes.Contains(typeId);
+
+        // Gear (asset type 19): a tool the avatar holds in its right hand. Roblox's render includes it, so it is matched to
+        // its render group like an accessory, and that group is then left out of the export.
+        public const int GearType = 19;
+        public bool IsGear => TypeId == GearType;
         public static bool IsLayeredType(int typeId) => LayeredTypes.Contains(typeId);
 
         // R15 parts that hold each accessory attachment. Accessories are welded to the part with the matching attachment.
@@ -49,7 +54,7 @@ namespace Rbx2Source.Export
             [57] = "FaceFrontAttachment", [58] = "FaceFrontAttachment",
             [64] = "BodyFrontAttachment", [65] = "BodyFrontAttachment", [67] = "BodyFrontAttachment", [68] = "BodyFrontAttachment",
             [66] = "WaistCenterAttachment", [69] = "WaistCenterAttachment", [72] = "WaistCenterAttachment",
-            [70] = "LeftFootAttachment", [71] = "RightFootAttachment"
+            [70] = "LeftFootAttachment", [71] = "RightFootAttachment", [GearType] = "RightGripAttachment"
         };
 
         public static bool TryGetPart(string attachment, out BodyPart part) =>

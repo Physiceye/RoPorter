@@ -379,6 +379,7 @@ namespace Rbx2Source.Export
         public static double[] Subtract(double[] a, double[] b) => new[] { a[0] - b[0], a[1] - b[1], a[2] - b[2] };
         public static double[] Scale(double[] a, double s) => new[] { a[0] * s, a[1] * s, a[2] * s };
         public static double Length(double[] a) => Math.Sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+        public static double Dot(double[] a, double[] b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 
         // Source's RadianEuler / SMD rotation (x, y, z), where the matrix is Rz * Ry * Rx.
         public static double[] ToEuler(double[] m)

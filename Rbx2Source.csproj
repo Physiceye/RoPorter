@@ -19,6 +19,7 @@
     <Compile Include="Forms\Rbx2Source.cs" />
     <Compile Include="Export\*.cs" />
     <EmbeddedResource Include="favicon.ico" LogicalName="RoPorter.favicon.ico" />
+    <EmbeddedResource Include="Resources\Images\favicon.png" LogicalName="RoPorter.favicon.png" />
     <EmbeddedResource Include="Resources\Images\BrokenPreview.png" LogicalName="RoPorter.BrokenPreview.png" />
     <EmbeddedResource Include="Resources\Images\Humanoid_icon.png" LogicalName="RoPorter.Humanoid_icon.png" />
     <EmbeddedResource Include="Resources\Images\Accoutrement_icon.png" LogicalName="RoPorter.Accoutrement_icon.png" />

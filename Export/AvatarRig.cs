@@ -110,6 +110,10 @@ namespace Rbx2Source.Export
         // Render groups identified as worn accessories, and which groups are weighted as layered clothing.
         public Dictionary<string, AccessoryInfo> AccessoryGroups { get; } = new Dictionary<string, AccessoryInfo>(StringComparer.Ordinal);
         public HashSet<string> LayeredGroups { get; } = new HashSet<string>(StringComparer.Ordinal);
+
+        // Render groups held in a hand: gear, and items that matched no worn accessory but sit at a hand's grip (such as UGC
+        // "clothing" Roblox renders in the hand). They are rigid on that hand.
+        public HashSet<string> HeldGroups { get; } = new HashSet<string>(StringComparer.Ordinal);
         private Dictionary<BodyPart, PartBounds> PartBoxes { get; } = new Dictionary<BodyPart, PartBounds>();
         private IReadOnlyList<AccessoryInfo> accessories;
         public int[][] Joints { get; private set; }
@@ -664,6 +668,34 @@ namespace Rbx2Source.Export
                     layered = group.Hug >= 0.6;
                     bone = group.Majority;
                 }
+                // Gear, or an unmatched item that doesn't wrap the body but holds a hand's grip point, is held in that hand.
+                // Held items: gear, or an unmatched item that doesn't wrap the body and holds a hand's grip point. An unmatched
+                // item floating out beside the torso (UGC "clothing" without skin weights, which Roblox's cage keeps next to the
+                // body) is put in the hand on that side, hanging from the grip point. Either way it is rigid on that hand.
+                if (group.Accessory?.IsGear == true || (group.Accessory == null && !layered))
+                {
+                    int hand = HoldingHand(group.Bounds, height);
+                    bool moved = false;
+                    if (hand < 0 && group.Accessory == null && group.Hug < 0.2)
+                    {
+                        hand = BesideHand(group.Bounds);
+                        moved = hand >= 0;
+                    }
+                    if (hand >= 0)
+                    {
+                        HeldGroups.Add(group.Name);
+                        layered = false;
+                        bone = hand;
+                        // Every vertex of the item's triangles moves and follows the hand, including any its vertex list missed.
+                        foreach (int index in model.Triangles.Where(t => t.Group == group.Name).SelectMany(t => t.Corners).Select(c => c.Position))
+                            if (Joints[index] == null && !group.Nearest.ContainsKey(index))
+                                group.Nearest[index] = new List<KeyValuePair<int, double>>();
+                        if (moved)
+                            HangFromGrip(model, group, hand);
+                        Notes.Add(group.Name + " is held in the " + (hand == LeftHand ? "left" : "right") + " hand" +
+                            (moved ? " (moved there from beside the body)." : "."));
+                    }
+                }
                 if (layered)
                     LayeredGroups.Add(group.Name);
                 HashSet<int> allowed = Within(bone, 3);
@@ -700,6 +732,50 @@ namespace Rbx2Source.Export
                     Joints[i] = new[] { Hips, 0, 0, 0 };
                     Weights[i] = new[] { 1f, 0, 0, 0 };
                 }
+        }
+
+        // The hand whose grip point lies inside (or within 4% of the avatar's height of) the group's box, or -1.
+        private int HoldingHand(PartBounds bounds, double height)
+        {
+            int best = -1;
+            double closest = 0.04 * height;
+            foreach (var hand in new[] { (BodyPart.RightHand, "RightGripAttachment", RightHand), (BodyPart.LeftHand, "LeftGripAttachment", LeftHand) })
+            {
+                if (!PartBoxes.TryGetValue(hand.Item1, out PartBounds box))
+                    continue;
+                double distance = DistanceToBox(AccessoryInfo.AttachmentPoint(hand.Item2, box), bounds);
+                if (distance <= closest)
+                {
+                    closest = distance;
+                    best = hand.Item3;
+                }
+            }
+            return best;
+        }
+
+        // The hand on the side an item floats out to, past the upper torso's width (render space: character right is +X); -1
+        // for items over the body (halos, wings, ...).
+        private int BesideHand(PartBounds bounds)
+        {
+            if (!PartBoxes.TryGetValue(BodyPart.UpperTorso, out PartBounds torso))
+                return -1;
+            double x = bounds.Center(0);
+            return x > torso.Max[0] ? RightHand : x < torso.Min[0] ? LeftHand : -1;
+        }
+
+        // Moves an item so its top centre sits at the hand's grip point, as if held by its top.
+        private void HangFromGrip(WavefrontModel model, AccessoryGroup group, int hand)
+        {
+            BodyPart part = hand == LeftHand ? BodyPart.LeftHand : BodyPart.RightHand;
+            if (!PartBoxes.TryGetValue(part, out PartBounds box))
+                return;
+            double[] grip = AccessoryInfo.AttachmentPoint(hand == LeftHand ? "LeftGripAttachment" : "RightGripAttachment", box);
+            var offset = new[] { (float)(grip[0] - group.Bounds.Center(0)), (float)(grip[1] - group.Bounds.Max[1]), (float)(grip[2] - group.Bounds.Center(2)) };
+            foreach (int index in group.Nearest.Keys)
+            {
+                float[] p = model.Positions[index];
+                model.Positions[index] = new[] { p[0] + offset[0], p[1] + offset[1], p[2] + offset[2] };
+            }
         }
 
         private sealed class AccessoryGroup

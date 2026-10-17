@@ -71,9 +71,12 @@ namespace Rbx2Source.Export
         private static string V(double[] v) => F(v[0]) + " " + F(v[1]) + " " + F(v[2]);
 
         public static string Export(ExportScene scene, IReadOnlyDictionary<string, string> textures, IReadOnlyDictionary<string, MaterialMaps> maps,
-            string folder, string name, GarrysModInstall install, IProgress<string> progress, CancellationToken cancellation, string playerName = null)
+            string folder, string name, GarrysModInstall install, IProgress<string> progress, CancellationToken cancellation, string playerName = null,
+            string itemLabel = null, string itemType = null, ISet<string> gearGroups = null)
         {
             WavefrontModel model = scene.Model;
+            // Held gear goes in its own optional bodygroup instead of the body (and the first-person arms).
+            bool IsBody(ObjTriangle triangle) => gearGroups == null || !gearGroups.Contains(triangle.Group);
             AvatarRig rig = scene.Rig;
             ValvePlayer valve = rig != null ? install.Player : null;
             bool player = rig != null;
@@ -110,7 +113,13 @@ namespace Rbx2Source.Export
             var materialNames = WriteMaterials(model, textures, maps, folder, materialDir, cancellation);
 
             progress?.Report("Writing Source model (" + model.Triangles.Count + " triangles, " + bones.Count + " bones)...");
-            File.WriteAllText(Path.Combine(src, "reference.smd"), Smd(bones, model, scene, units, boneOf, materialNames, cancellation), Encoding.ASCII);
+            File.WriteAllText(Path.Combine(src, "reference.smd"), Smd(bones, model, scene, units, boneOf, materialNames, IsBody, cancellation), Encoding.ASCII);
+            bool hasGear = player && model.Triangles.Any(triangle => !IsBody(triangle));
+            if (hasGear)
+                File.WriteAllText(Path.Combine(src, "gear.smd"), Smd(bones, model, scene, units, boneOf, materialNames, t => !IsBody(t), cancellation), Encoding.ASCII);
+            List<string> flexes = player ? WriteFlexes(Path.Combine(src, "face.vta"), bones, model, scene, units, IsBody, cancellation) : null;
+            if (flexes != null)
+                progress?.Report("Face: " + flexes.Count + " flexes for posing, with blinking" + (flexes.Contains(JawDropFlex) ? " and voice chat mouth movement." : "."));
             File.WriteAllText(Path.Combine(src, "physics.smd"), PhysicsSmd(bones, model, scene, units, boneOf, rig, valve), Encoding.ASCII);
             if (player)
             {
@@ -123,21 +132,30 @@ namespace Rbx2Source.Export
             }
 
             string modelName = player ? "player/roporter/" + id + ".mdl" : "roporter/items/" + id + ".mdl";
-            File.WriteAllText(Path.Combine(src, "model.qc"), Qc(modelName, materialDir, bones, rig, valve, player, scene, units), Encoding.ASCII);
-            string title = player && !string.IsNullOrWhiteSpace(playerName) ? playerName.Trim() : "RoPorter " + id;
+            File.WriteAllText(Path.Combine(src, "model.qc"), Qc(modelName, materialDir, bones, rig, valve, player, scene, units, flexes, hasGear), Encoding.ASCII);
+            // The addon's (and Workshop item's) title and description: "RoPorter - " and the username for avatars or the
+            // catalog name for items.
+            string displayName = player && !string.IsNullOrWhiteSpace(playerName) ? playerName.Trim()
+                : !player && !string.IsNullOrWhiteSpace(itemLabel) ? itemLabel.Trim() : id;
+            string title = "RoPorter - " + displayName;
+            // Steam BBCode: a linked heading on the Workshop page.
+            const string description = "[url=https://github.com/Physiceye/RoPorter/releases][h2]Made with RoPorter[/h2][/url]";
             File.WriteAllText(Path.Combine(folder, "addon.json"), "{\n\t\"title\": " + Newtonsoft.Json.JsonConvert.ToString(title) +
-                ",\n\t\"type\": \"model\",\n\t\"tags\": [\"fun\"],\n\t\"ignore\": [\"src/*\"]\n}\n", Encoding.UTF8);
+                ",\n\t\"description\": " + Newtonsoft.Json.JsonConvert.ToString(description) +
+                ",\n\t\"type\": \"model\",\n\t\"tags\": [\"fun\"],\n\t\"ignore\": [\"src/*\", \"" + Workshop.IconFile + "\", \"" + Workshop.PreviewFile + "\"]\n}\n",
+                new UTF8Encoding(false)); // gmad cannot parse addon.json with a byte order mark
 
             progress?.Report("Compiling with Garry's Mod's studiomdl...");
             Compile(install, folder, Path.Combine(src, "model.qc"), modelName, progress, cancellation);
             if (!player)
             {
-                WriteSpawnMenu(folder, id, name.Replace('_', ' ').Trim(), "models/" + modelName);
+                WriteSpawnMenu(folder, "item_" + id, string.IsNullOrWhiteSpace(itemLabel) ? name.Replace('_', ' ').Trim() : itemLabel.Trim(),
+                    string.IsNullOrWhiteSpace(itemType) ? "Other" : itemType.Trim(), "models/" + modelName);
                 return Path.Combine("models", modelName.Replace('/', Path.DirectorySeparatorChar));
             }
 
             string hands = "models/weapons/c_arms_citizen.mdl";
-            string armsSmd = ArmsSmd(bones, model, scene, units, boneOf, valve, materialNames, out int armTriangles, cancellation);
+            string armsSmd = ArmsSmd(bones, model, scene, units, boneOf, valve, materialNames, IsBody, out int armTriangles, cancellation);
             if (armsSmd == null)
                 progress?.Report("No arm geometry was found; the playermodel uses the citizen first-person arms.");
             else
@@ -160,35 +178,59 @@ namespace Rbx2Source.Export
 
             string lua = Path.Combine(folder, "lua", "autorun");
             Directory.CreateDirectory(lua);
-            string label = LuaString(title), path = LuaString("models/" + modelName);
+            // In game the playermodel is listed by its plain name, without the Workshop title's "RoPorter - ".
+            string label = LuaString(displayName), path = LuaString("models/" + modelName);
             File.WriteAllText(Path.Combine(lua, "roporter_" + id + ".lua"),
                 "player_manager.AddValidModel( " + label + ", " + path + " )\n" +
                 "list.Set( \"PlayerOptionsModel\", " + label + ", " + path + " )\n" +
-                "player_manager.AddValidHands( " + label + ", " + LuaString(hands) + ", 0, \"00000000\" )\n", Encoding.UTF8);
+                "player_manager.AddValidHands( " + label + ", " + LuaString(hands) + ", 0, \"00000000\" )\n", new UTF8Encoding(false));
+            // The playermodel is also listed in the spawn menu, where it spawns as a ragdoll.
+            WriteSpawnMenu(folder, "avatar_" + id, displayName, "Avatars", "models/" + modelName);
             return Path.Combine("models", modelName.Replace('/', Path.DirectorySeparatorChar));
         }
 
-        // Lists a prop in the spawn menu's "RoPorter" category. Every exported item's addon adds itself to the shared
-        // RoPorterItems table and installs the same hook, so all of them appear together, sorted by name, each under a header.
-        private static void WriteSpawnMenu(string folder, string id, string label, string model)
+        // Lists a model in the spawn menu under "RoPorter", in a sub-category: "Avatars", or the Roblox item type ("Full Masks",
+        // "Head Accessories"). Every exported addon adds itself to the shared RoPorterCatalog table and installs the same
+        // hook, so all of them are grouped together. Items from older exports (RoPorterItems, name only) go under "Other".
+        private static void WriteSpawnMenu(string folder, string id, string label, string type, string model)
         {
+            // Category icons, shared by every RoPorter addon: the app icon, Accoutrement_icon for item types, Humanoid_icon for avatars.
+            string icons = Path.Combine(folder, "materials", "roporter", "spawnmenu");
+            Directory.CreateDirectory(icons);
+            foreach (var icon in new[] { ("favicon.png", "roporter.png"), ("Accoutrement_icon.png", "catalog.png"), ("Humanoid_icon.png", "avatars.png") })
+                using (Stream source = typeof(SourceExporter).Assembly.GetManifestResourceStream("RoPorter." + icon.Item1))
+                using (FileStream target = File.Create(Path.Combine(icons, icon.Item2)))
+                    (source ?? throw new InvalidDataException("The spawn menu icon " + icon.Item1 + " is missing from RoPorter.")).CopyTo(target);
+
             string lua = Path.Combine(folder, "lua", "autorun", "client");
             Directory.CreateDirectory(lua);
-            File.WriteAllText(Path.Combine(lua, "roporter_item_" + id + ".lua"),
+            File.WriteAllText(Path.Combine(lua, "roporter_" + id + ".lua"),
                 "-- Generated by RoPorter\n" +
-                "RoPorterItems = RoPorterItems or {}\n" +
-                "RoPorterItems[ " + LuaString(model) + " ] = " + LuaString(label) + "\n\n" +
+                "RoPorterCatalog = RoPorterCatalog or {}\n" +
+                "RoPorterCatalog[ " + LuaString(model) + " ] = { name = " + LuaString(label) + ", type = " + LuaString(type) + " }\n\n" +
                 "hook.Add( \"PopulatePropMenu\", \"RoPorterItems\", function()\n" +
-                "\tlocal models = table.GetKeys( RoPorterItems )\n" +
-                "\ttable.sort( models, function( a, b ) return RoPorterItems[ a ]:lower() < RoPorterItems[ b ]:lower() end )\n" +
-                "\tlocal contents = {}\n" +
-                "\tfor _, model in ipairs( models ) do\n" +
-                "\t\tcontents[ #contents + 1 ] = { type = \"header\", text = RoPorterItems[ model ] }\n" +
-                "\t\tcontents[ #contents + 1 ] = { type = \"model\", model = model }\n" +
+                "\tlocal items = {}\n" +
+                "\tfor model, name in pairs( RoPorterItems or {} ) do items[ model ] = { name = name, type = \"Other\" } end\n" +
+                "\tfor model, item in pairs( RoPorterCatalog ) do items[ model ] = item end\n" +
+                "\tlocal types = {}\n" +
+                "\tfor model, item in pairs( items ) do\n" +
+                "\t\ttypes[ item.type ] = types[ item.type ] or {}\n" +
+                "\t\ttable.insert( types[ item.type ], model )\n" +
                 "\tend\n" +
-                "\tspawnmenu.AddPropCategory( \"RoPorterItems\", \"RoPorter\", contents, \"icon16/brick.png\", 7672767, 0 )\n" +
-                "end )\n", Encoding.UTF8);
+                "\tspawnmenu.AddPropCategory( \"RoPorterItems\", \"RoPorter\", {}, \"roporter/spawnmenu/roporter.png\", 7672767, 0 )\n" +
+                "\tfor name, models in SortedPairs( types ) do\n" +
+                "\t\ttable.sort( models, function( a, b ) return items[ a ].name:lower() < items[ b ].name:lower() end )\n" +
+                "\t\tlocal contents = {}\n" +
+                "\t\tfor _, model in ipairs( models ) do contents[ #contents + 1 ] = { type = \"model\", model = model } end\n" +
+                "\t\tlocal icon = name == \"Avatars\" and \"roporter/spawnmenu/avatars.png\" or \"roporter/spawnmenu/catalog.png\"\n" +
+                "\t\tspawnmenu.AddPropCategory( \"RoPorterItems/\" .. name, name, contents, icon,\n" +
+                "\t\t\t7672768 + tonumber( util.CRC( name ) ) % 1000000, 7672767 )\n" +
+                "\tend\n" +
+                "end )\n", new UTF8Encoding(false));
         }
+
+        // First-person arm radius as a share of Valve's shoulder-to-wrist length (about 2 units on a 23-unit citizen arm).
+        private const double ArmRadius = 0.085;
 
         private static string LuaString(string text) => "\"" + text.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "") + "\"";
 
@@ -196,7 +238,7 @@ namespace Rbx2Source.Export
         // those bones mainly carry. Garry's Mod bonemerges the arms onto each weapon's viewmodel by bone name, so every bone
         // takes the viewmodel's position; each arm is scaled to Valve's arm length so its pieces meet at the viewmodel's joints.
         private static string ArmsSmd(List<Bone> bones, WavefrontModel model, ExportScene scene, double units, int[] boneOf, ValvePlayer valve,
-            Dictionary<string, string> materials, out int triangles, CancellationToken cancellation)
+            Dictionary<string, string> materials, Func<ObjTriangle, bool> include, out int triangles, CancellationToken cancellation)
         {
             triangles = 0;
             var armBone = new Regex("^" + Regex.Escape(Prefix) + "([LR])_(Clavicle|UpperArm|Forearm|Hand|Finger[0-9]+)$");
@@ -222,6 +264,107 @@ namespace Rbx2Source.Export
             }
             double[] Fit(double[] p, char side) => Matrix.Add(pivot[side], Matrix.Scale(Matrix.Subtract(p, pivot[side]), scale[side]));
 
+            // Roblox arms are much thicker for their length than Valve's (a blocky arm is half as wide as it is long), so a
+            // uniformly fitted arm fills the bottom of the first-person view. Across the arm, each side is instead scaled to
+            // about Valve's thickness: the offset from the upper arm or forearm axis shrinks; arms already that thin keep it.
+            double[] Across(double[] p, char side, string part)
+            {
+                double[] Ours(string bone) => bones.First(b => b.Name == Prefix + side + "_" + bone).Position;
+                double[] start = part == "UpperArm" ? Ours("UpperArm") : Ours("Forearm");
+                double[] axis = Matrix.Subtract(part == "UpperArm" ? Ours("Forearm") : Ours("Hand"), start);
+                double length = Matrix.Length(axis);
+                if (length < 1e-6)
+                    return new double[3];
+                axis = Matrix.Scale(axis, 1 / length);
+                double[] offset = Matrix.Subtract(p, start);
+                return Matrix.Subtract(offset, Matrix.Scale(axis, Matrix.Dot(offset, axis)));
+            }
+            // The arm bone a vertex mostly follows: its side and name ("UpperArm", "Forearm", "Hand", "Finger1", ...).
+            string PartOf(int bone, out char side)
+            {
+                Match match = armBone.Match(bones[bone].Name);
+                side = match.Success ? match.Groups[1].Value[0] : 'L';
+                return match.Success ? match.Groups[2].Value : null;
+            }
+            // The arm's own thickness: the 90th-percentile distance of upper arm and forearm vertices from their axis.
+            var radii = new Dictionary<char, List<double>> { ['L'] = new List<double>(), ['R'] = new List<double>() };
+            foreach (int position in model.Triangles.Where(include).SelectMany(t => t.Corners).Select(c => c.Position).Distinct())
+            {
+                var links = Links(position, scene.Rig, boneOf).Where(l => l.Key != spine && map.ContainsKey(l.Key)).ToList();
+                if (links.Sum(l => l.Value) < 0.5)
+                    continue;
+                string part = PartOf(links.OrderByDescending(l => l.Value).First().Key, out char side);
+                if (part == "UpperArm" || part == "Forearm")
+                    radii[side].Add(Matrix.Length(Across(ToSource(scene.Point(model.Positions[position]), units), side, part)));
+            }
+            var thin = new Dictionary<char, double>();
+            foreach (char side in new[] { 'L', 'R' })
+            {
+                double[] Valve(string bone) => valve.Find(Prefix + side + "_" + bone).WorldPosition;
+                double valveLength = Matrix.Length(Matrix.Subtract(Valve("Forearm"), Valve("UpperArm"))) + Matrix.Length(Matrix.Subtract(Valve("Hand"), Valve("Forearm")));
+                List<double> sorted = radii[side].OrderBy(r => r).ToList();
+                double radius = sorted.Count > 0 ? sorted[Math.Min(sorted.Count - 1, (int)(sorted.Count * 0.9))] : 0;
+                thin[side] = radius > 1e-6 ? Math.Min(scale[side], ArmRadius * valveLength / radius) : scale[side];
+            }
+            // Fitted to Valve's length, then thinned across the upper arm or forearm axis (hands and fingers use the forearm's).
+            // Roblox hands reach much further past the wrist than Valve's (13-19 units once fitted, against about 7), so the
+            // arm looks long and the hand pokes past the weapon. Whatever lies past the wrist is shortened along the forearm
+            // to Valve's hand reach (its wrist to fingertips); the squeeze starts at nothing at the wrist, so there is no seam.
+            var wrist = new Dictionary<char, double[]>();
+            var forearmAxis = new Dictionary<char, double[]>();
+            var shorten = new Dictionary<char, double>();
+            foreach (char side in new[] { 'L', 'R' })
+            {
+                double[] Ours(string bone) => bones.First(b => b.Name == Prefix + side + "_" + bone).Position;
+                double[] axis = Matrix.Subtract(Ours("Hand"), Ours("Forearm"));
+                double axisLength = Matrix.Length(axis);
+                forearmAxis[side] = axisLength > 1e-6 ? Matrix.Scale(axis, 1 / axisLength) : new double[] { 0, 0, -1 };
+                wrist[side] = Fit(Ours("Hand"), side);
+
+                double[] valveHand = valve.Find(Prefix + side + "_Hand").WorldPosition;
+                double[] valveAxis = Matrix.Subtract(valveHand, valve.Find(Prefix + side + "_Forearm").WorldPosition);
+                valveAxis = Matrix.Scale(valveAxis, 1 / Math.Max(1e-6, Matrix.Length(valveAxis)));
+                // The last finger joints, plus about an inch for the fingertips past them.
+                var fingers = valve.Bones.Where(b => b.Name.StartsWith(Prefix + side + "_Finger", StringComparison.Ordinal)).ToList();
+                double valveReach = fingers.Count > 0 ? fingers.Max(b => Matrix.Dot(Matrix.Subtract(b.WorldPosition, valveHand), valveAxis)) + 1 : 7;
+
+                var reaches = new List<double>();
+                foreach (int position in model.Triangles.Where(include).SelectMany(t => t.Corners).Select(c => c.Position).Distinct())
+                {
+                    var links = Links(position, scene.Rig, boneOf).Where(l => l.Key != spine && map.ContainsKey(l.Key)).ToList();
+                    if (links.Sum(l => l.Value) < 0.5)
+                        continue;
+                    string part = PartOf(links.OrderByDescending(l => l.Value).First().Key, out char linkSide);
+                    if (linkSide == side && part != null && (part == "Hand" || part.StartsWith("Finger", StringComparison.Ordinal)))
+                        reaches.Add(Matrix.Dot(Matrix.Subtract(Fit(ToSource(scene.Point(model.Positions[position]), units), side), wrist[side]), forearmAxis[side]));
+                }
+                // The 95th percentile, so a held item or stray vertex doesn't decide the hand's length.
+                List<double> sorted = reaches.OrderBy(r => r).ToList();
+                double reach = sorted.Count > 0 ? sorted[Math.Min(sorted.Count - 1, (int)(sorted.Count * 0.95))] : 0;
+                shorten[side] = reach > valveReach ? valveReach / reach : 1;
+            }
+
+            // The thinning is blended by the vertex's skin weights, so it changes smoothly across the elbow and wrist instead of
+            // switching axis where neighbouring vertices follow different bones (which sheared the mesh at the joints).
+            double[] Shape(double[] p, List<KeyValuePair<int, double>> links)
+            {
+                PartOf(links.OrderByDescending(l => l.Value).First().Key, out char side);
+                double[] result = Fit(p, side);
+                double total = links.Sum(l => l.Value);
+                foreach (var link in links)
+                {
+                    string part = PartOf(link.Key, out char linkSide);
+                    if (part == null || part == "Clavicle")
+                        continue;
+                    double[] across = Across(p, linkSide, part == "UpperArm" ? "UpperArm" : "Forearm");
+                    result = Matrix.Add(result, Matrix.Scale(across, (thin[linkSide] - scale[linkSide]) * link.Value / total));
+                }
+                double past = Matrix.Dot(Matrix.Subtract(result, wrist[side]), forearmAxis[side]);
+                if (past > 0)
+                    result = Matrix.Subtract(result, Matrix.Scale(forearmAxis[side], past * (1 - shorten[side])));
+                return result;
+            }
+
             var arms = new List<Bone>();
             foreach (int i in keep)
             {
@@ -235,7 +378,7 @@ namespace Rbx2Source.Export
             }
 
             var text = new StringBuilder(Nodes(arms)).Append(Skeleton(arms.Select(b => Local(b, arms)).ToList())).Append("triangles\n");
-            foreach (ObjTriangle triangle in model.Triangles)
+            foreach (ObjTriangle triangle in model.Triangles.Where(include))
             {
                 cancellation.ThrowIfCancellationRequested();
                 var corners = triangle.Corners.Select(c => Links(c.Position, scene.Rig, boneOf).Where(l => l.Key != spine && map.ContainsKey(l.Key)).ToList()).ToList();
@@ -248,8 +391,7 @@ namespace Rbx2Source.Export
                     ObjCorner corner = triangle.Corners[c];
                     var links = corners[c];
                     double total = links.Sum(l => l.Value);
-                    char side = armBone.Match(bones[links.OrderByDescending(l => l.Value).First().Key].Name).Groups[1].Value[0];
-                    double[] p = Fit(ToSource(scene.Point(model.Positions[corner.Position]), units), side);
+                    double[] p = Shape(ToSource(scene.Point(model.Positions[corner.Position]), units), links);
                     double[] n = DirectionToSource(ExportScene.Direction(model.Normals[corner.Normal]));
                     double length = Matrix.Length(n);
                     n = length > 0 ? Matrix.Scale(n, 1 / length) : new double[] { 0, 0, 1 };
@@ -384,10 +526,10 @@ namespace Rbx2Source.Export
         private static string SkeletonSmd(List<Bone> bones, List<(double[] Position, double[] Rotation)> locals) => Nodes(bones) + Skeleton(locals);
 
         private static string Smd(List<Bone> bones, WavefrontModel model, ExportScene scene, double units, int[] boneOf,
-            Dictionary<string, string> materials, CancellationToken cancellation)
+            Dictionary<string, string> materials, Func<ObjTriangle, bool> include, CancellationToken cancellation)
         {
             var text = new StringBuilder(Nodes(bones)).Append(Skeleton(bones.Select(b => Local(b, bones)).ToList())).Append("triangles\n");
-            foreach (ObjTriangle triangle in model.Triangles)
+            foreach (ObjTriangle triangle in model.Triangles.Where(include))
             {
                 cancellation.ThrowIfCancellationRequested();
                 text.Append(materials[triangle.Material]).Append('\n');
@@ -407,6 +549,89 @@ namespace Rbx2Source.Export
                 }
             }
             return text.Append("end\n").ToString();
+        }
+
+        // Flex controllers Garry's Mod drives itself: "blink" for automatic blinking, "jaw_drop" for the mouth while a player talks.
+        private const string BlinkFlex = "blink", JawDropFlex = "jaw_drop";
+
+        // studiomdl's limit on flex controllers.
+        private const int MaxFlexes = 96;
+
+        // Source flexes for a dynamic head with FACS facial animation (face.vta): one vertex-animation frame per FACS control,
+        // plus "blink" (both eyes closed) and "jaw_drop" (JawDrop). Frame 0 lists every reference vertex, one per triangle
+        // corner in reference.smd's order; studiomdl matches them to the model by position. The mood is already baked into
+        // the mesh, and the VRChat shapes are left out. Returns the flex names in frame order (frame = index + 1), or null.
+        private static List<string> WriteFlexes(string path, List<Bone> bones, WavefrontModel model, ExportScene scene, double units,
+            Func<ObjTriangle, bool> include, CancellationToken cancellation)
+        {
+            FaceShapes face = scene.Face;
+            if (face == null)
+                return null;
+            var shapes = new List<KeyValuePair<string, Dictionary<int, float[]>>>();
+            Dictionary<int, float[]> Find(string name) => face.Shapes.FirstOrDefault(s => s.Name == name && s.Deltas.Count > 0)?.Deltas;
+            Dictionary<int, float[]> left = Find("LeftEyeClosed"), right = Find("RightEyeClosed"), jaw = Find("JawDrop");
+            if (left != null && right != null)
+            {
+                var both = new Dictionary<int, float[]>(left);
+                foreach (var pair in right)
+                    both[pair.Key] = both.TryGetValue(pair.Key, out float[] d) ? new[] { d[0] + pair.Value[0], d[1] + pair.Value[1], d[2] + pair.Value[2] } : pair.Value;
+                shapes.Add(new KeyValuePair<string, Dictionary<int, float[]>>(BlinkFlex, both));
+            }
+            if (jaw != null)
+                shapes.Add(new KeyValuePair<string, Dictionary<int, float[]>>(JawDropFlex, jaw));
+            foreach (FaceShape shape in face.Shapes)
+            {
+                if (shape.Name == FaceShapeBuilder.MoodShapeName || shape.Name.StartsWith("vrc.", StringComparison.Ordinal) || shape.Deltas.Count == 0)
+                    continue;
+                string name = Regex.Replace(shape.Name, "[^A-Za-z0-9_]", "_");
+                if (shapes.All(s => s.Key != name))
+                    shapes.Add(new KeyValuePair<string, Dictionary<int, float[]>>(name, shape.Deltas));
+            }
+            if (shapes.Count == 0)
+                return null;
+            if (shapes.Count > MaxFlexes)
+                shapes = shapes.Take(MaxFlexes).ToList();
+
+            var text = new StringBuilder(Nodes(bones)).Append("skeleton\n");
+            string pose = Skeleton(bones.Select(b => Local(b, bones)).ToList());
+            pose = pose.Substring(pose.IndexOf('\n', pose.IndexOf("time 0", StringComparison.Ordinal)) + 1);
+            pose = pose.Substring(0, pose.LastIndexOf("end", StringComparison.Ordinal));
+            for (int frame = 0; frame <= shapes.Count; frame++)
+                text.Append("time ").Append(frame).Append('\n').Append(pose);
+            text.Append("end\nvertexanimation\ntime 0\n");
+
+            var corners = new List<(int Position, double[] Point, double[] Normal)>();
+            foreach (ObjTriangle triangle in model.Triangles.Where(include))
+                foreach (ObjCorner corner in triangle.Corners)
+                {
+                    double[] n = DirectionToSource(ExportScene.Direction(model.Normals[corner.Normal]));
+                    double length = Matrix.Length(n);
+                    corners.Add((corner.Position, ToSource(scene.Point(model.Positions[corner.Position]), units),
+                        length > 0 ? Matrix.Scale(n, 1 / length) : new double[] { 0, 0, 1 }));
+                }
+            for (int i = 0; i < corners.Count; i++)
+                text.Append(i).Append(' ').Append(V(corners[i].Point)).Append(' ').Append(V(corners[i].Normal)).Append('\n');
+            for (int s = 0; s < shapes.Count; s++)
+            {
+                cancellation.ThrowIfCancellationRequested();
+                text.Append("time ").Append(s + 1).Append('\n');
+                var moved = new Dictionary<int, double[]>();
+                for (int i = 0; i < corners.Count; i++)
+                {
+                    int position = corners[i].Position;
+                    if (!shapes[s].Value.TryGetValue(position, out float[] delta))
+                        continue;
+                    if (!moved.TryGetValue(position, out double[] point))
+                    {
+                        float[] p = model.Positions[position];
+                        moved[position] = point = ToSource(scene.Point(new[] { p[0] + delta[0], p[1] + delta[1], p[2] + delta[2] }), units);
+                    }
+                    if (Matrix.Length(Matrix.Subtract(point, corners[i].Point)) > 1e-4)
+                        text.Append(i).Append(' ').Append(V(point)).Append(' ').Append(V(corners[i].Normal)).Append('\n');
+                }
+            }
+            File.WriteAllText(path, text.Append("end\n").ToString(), Encoding.ASCII);
+            return shapes.Select(s => s.Key).ToList();
         }
 
         // Source vertices take at most three bones.
@@ -446,6 +671,30 @@ namespace Rbx2Source.Export
                     groups[bone] = list = new List<double[]>();
                 list.Add(ToSource(scene.Point(model.Positions[position]), units));
             }
+            // Every ragdoll bone needs a collision piece, or studiomdl rejects the joint limits of the bones below it ("rotation
+            // constraint on bone ... which has no parent"). Bundles often leave whole limbs out of the render, so a bone with
+            // too little geometry gets a box spanning it to its ragdoll children instead.
+            var padded = new HashSet<int>();
+            if (physical != null)
+                for (int i = 0; i < bones.Count; i++)
+                {
+                    if (!physical.Contains(bones[i].Name) || (groups.TryGetValue(i, out List<double[]> list) && list.Count >= 4))
+                        continue;
+                    var points = list ?? new List<double[]>();
+                    points.Add(bones[i].Position);
+                    for (int j = 0; j < bones.Count; j++)
+                    {
+                        int parent = bones[j].Parent;
+                        while (parent >= 0 && !physical.Contains(bones[parent].Name))
+                            parent = bones[parent].Parent;
+                        if (parent == i && physical.Contains(bones[j].Name))
+                            points.Add(bones[j].Position);
+                    }
+                    while (points.Count < 4)
+                        points.Add(bones[i].Position);
+                    groups[i] = points;
+                    padded.Add(i);
+                }
             var text = new StringBuilder(Nodes(bones)).Append(Skeleton(bones.Select(b => Local(b, bones)).ToList())).Append("triangles\n");
             int[][] faces = { new[] { 0, 2, 3, 1 }, new[] { 4, 5, 7, 6 }, new[] { 0, 1, 5, 4 }, new[] { 2, 6, 7, 3 }, new[] { 0, 4, 6, 2 }, new[] { 1, 3, 7, 5 } };
             foreach (var group in groups.Where(g => g.Value.Count >= 4).OrderBy(g => g.Key))
@@ -455,11 +704,14 @@ namespace Rbx2Source.Export
                 var local = group.Value.Select(p => Matrix.Apply(inverse, Matrix.Subtract(p, bone.Position))).ToList();
                 double[] min = { local.Min(p => p[0]), local.Min(p => p[1]), local.Min(p => p[2]) };
                 double[] max = { local.Max(p => p[0]), local.Max(p => p[1]), local.Max(p => p[2]) };
+                // Boxes built from bone positions alone are a line or a point; give them a limb's thickness.
+                double least = padded.Contains(group.Key) ? 3 * scene.Scale : 0.5;
                 for (int axis = 0; axis < 3; axis++)
-                    if (max[axis] - min[axis] < 0.5)
+                    if (max[axis] - min[axis] < least)
                     {
-                        min[axis] -= 0.25;
-                        max[axis] += 0.25;
+                        double grow = padded.Contains(group.Key) ? (least - (max[axis] - min[axis])) / 2 : 0.25;
+                        min[axis] -= grow;
+                        max[axis] += grow;
                     }
                 var corners = Enumerable.Range(0, 8).Select(c => Matrix.Add(bone.Position, Matrix.Apply(bone.Rotation,
                     new[] { (c & 1) != 0 ? max[0] : min[0], (c & 2) != 0 ? max[1] : min[1], (c & 4) != 0 ? max[2] : min[2] }))).ToList();
@@ -475,12 +727,31 @@ namespace Rbx2Source.Export
         }
 
         private static string Qc(string modelName, string materialDir, List<Bone> bones, AvatarRig rig, ValvePlayer valve, bool player,
-            ExportScene scene, double units)
+            ExportScene scene, double units, List<string> flexes = null, bool hasGear = false)
         {
             var qc = new StringBuilder();
             qc.Append("// Generated by RoPorter\n");
             qc.Append("$modelname \"").Append(modelName).Append("\"\n");
-            qc.Append("$model \"body\" \"reference.smd\"\n");
+            if (flexes == null)
+                qc.Append("$model \"body\" \"reference.smd\"\n");
+            else
+            {
+                // Each flex has a controller of the same name (listed by the Face Poser tool) driving it directly. studiomdl
+                // needs $model's and flexfile's opening braces on the same line.
+                qc.Append("$model \"body\" \"reference.smd\" {\n\tflexfile \"face.vta\" {\n\t\tdefaultflex frame 0\n");
+                for (int i = 0; i < flexes.Count; i++)
+                    qc.Append("\t\tflex \"").Append(flexes[i]).Append("\" frame ").Append(i + 1).Append('\n');
+                qc.Append("\t}\n");
+                foreach (string flex in flexes)
+                    qc.Append("\tflexcontroller ").Append(flex == BlinkFlex ? "eyes" : flex == JawDropFlex ? "phoneme" : "face")
+                        .Append(" range 0 1 \"").Append(flex).Append("\"\n");
+                foreach (string flex in flexes)
+                    qc.Append("\t%").Append(flex).Append(" = ").Append(flex).Append('\n');
+                qc.Append("}\n");
+            }
+            // Held gear: an optional part, hidden by default.
+            if (hasGear)
+                qc.Append("$bodygroup \"gear\"\n{\n\tblank\n\tstudio \"gear.smd\"\n}\n");
             qc.Append("$cdmaterials \"").Append(materialDir).Append("\"\n");
             qc.Append("$surfaceprop \"").Append(rig != null ? "flesh" : "plastic").Append("\"\n");
             qc.Append("$contents \"solid\"\n");

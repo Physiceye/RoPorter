@@ -25,6 +25,9 @@ namespace Rbx2Source
         // Export stays disabled until the entered user or item has loaded its preview.
         private readonly Button export = new Button { Text = "Export", AutoSize = true, Enabled = false };
         private bool loaded;
+        // Enabled once a Garry's Mod export of the loaded avatar or item has finished; uploads that addon folder.
+        private readonly Button upload = new Button { Text = "Upload to Workshop", AutoSize = true, Enabled = false };
+        private string exportedAddon;
         private readonly CheckBox singleTexture = new CheckBox
         {
             Text = "Single texture", AutoSize = true, Margin = new Padding(6, 6, 6, 3)
@@ -104,7 +107,8 @@ namespace Rbx2Source
             layout.Controls.Add(preview, 2, 0);
             layout.SetRowSpan(preview, 5);
             var actions = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
-            actions.Controls.AddRange(new Control[] { exportFormat, singleTexture, vrchatShapes, faceTracking, export, cancel, openFolder });
+            actions.Controls.AddRange(new Control[] { exportFormat, singleTexture, vrchatShapes, faceTracking, export, upload, cancel, openFolder });
+            new ToolTip().SetToolTip(upload, "Packs the exported Garry's Mod addon and uploads it to the Steam Workshop. Steam must be running.");
             new ToolTip().SetToolTip(singleTexture, "Merges every material into one material and one texture.");
             new ToolTip().SetToolTip(vrchatShapes, "Adds VRChat visemes.");
             new ToolTip().SetToolTip(faceTracking, "Adds Unified Expressions face shapes for VRCFaceTracking.");
@@ -139,7 +143,12 @@ namespace Rbx2Source
                 }
                 SchedulePreview();
             };
-            exportFormat.SelectedIndexChanged += (sender, args) => UpdateFaceOptions(false);
+            exportFormat.SelectedIndexChanged += (sender, args) =>
+            {
+                UpdateFaceOptions(false);
+                UpdateUpload();
+            };
+            upload.Click += Upload_Click;
             previewTimer.Tick += async (sender, args) =>
             {
                 previewTimer.Stop();
@@ -212,7 +221,14 @@ namespace Rbx2Source
         {
             loaded = value;
             export.Enabled = loaded && cancellation == null;
+            // A different avatar or item no longer matches the exported addon.
+            if (!value)
+                exportedAddon = null;
+            UpdateUpload();
         }
+
+        private void UpdateUpload() =>
+            upload.Enabled = cancellation == null && exportedAddon != null && Formats[Math.Max(0, exportFormat.SelectedIndex)] == ExportFormat.GarrysMod;
 
         private void SchedulePreview()
         {
@@ -357,6 +373,7 @@ namespace Rbx2Source
         private async void Export_Click(object sender, EventArgs args)
         {
             cancellation = new CancellationTokenSource();
+            exportedAddon = null;
             SetBusy(true);
             log.Clear();
             try
@@ -373,6 +390,8 @@ namespace Rbx2Source
                     string path = await downloader.ExportAsync(id, avatar, "", folder, progress, cancellation.Token, format,
                         avatar && faceTracking.Checked, vrchatShapes.Checked, singleTexture.Checked, scale.Value / 100f);
                     AppendLog("Export complete: " + path);
+                    if (format == ExportFormat.GarrysMod && Workshop.IsAddon(downloader.ExportFolder))
+                        exportedAddon = downloader.ExportFolder;
                 }
             }
             catch (OperationCanceledException)
@@ -397,7 +416,48 @@ namespace Rbx2Source
                 control.Enabled = !busy;
             export.Enabled = !busy && loaded;
             UpdateFaceOptions(busy);
+            UpdateUpload();
             cancel.Enabled = busy;
+        }
+
+        private async void Upload_Click(object sender, EventArgs args)
+        {
+            string folder = exportedAddon;
+            if (folder == null)
+                return;
+            long? existing = Workshop.PublishedId(folder);
+            string question = existing.HasValue
+                ? "Update Workshop item " + existing.Value + " with this export of " + Path.GetFileName(folder) + "?"
+                : "Upload " + Path.GetFileName(folder) + " to the Steam Workshop as a new item?\n\nIt starts hidden; you can make it public from its Workshop page.";
+            if (MessageBox.Show(this, question + "\n\nSteam must be running and signed in to an account that owns Garry's Mod.", "Upload to Workshop",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+                return;
+            cancellation = new CancellationTokenSource();
+            SetBusy(true);
+            try
+            {
+                var progress = new Progress<string>(AppendLog);
+                long id = await Task.Run(() => Workshop.PublishAsync(folder, progress, cancellation.Token));
+                string page = "https://steamcommunity.com/sharedfiles/filedetails/?id=" + id;
+                AppendLog((existing.HasValue ? "Workshop item updated: " : "Uploaded to the Workshop: ") + page);
+                if (MessageBox.Show(this, (existing.HasValue ? "The Workshop item was updated." : "The addon was uploaded.") + "\n\nOpen its Workshop page?",
+                    "Upload to Workshop", MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes)
+                    Open(page);
+            }
+            catch (OperationCanceledException)
+            {
+                ShowError("Upload cancelled.");
+            }
+            catch (Exception error)
+            {
+                ShowError(error.Message);
+            }
+            finally
+            {
+                cancellation.Dispose();
+                cancellation = null;
+                SetBusy(false);
+            }
         }
 
         // Face shape options apply to avatars outside Garry's Mod (Source models get no shape keys).

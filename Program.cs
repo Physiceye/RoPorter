@@ -14,8 +14,12 @@ namespace Rbx2Source
         }
 
         [STAThread]
-        static void Main()
+        static int Main(string[] args)
         {
+            // Run by RoPorter itself to set a Workshop item's description and page image (see Export.SteamPreview).
+            if (args.Length > 0 && args[0] == Export.Workshop.DetailsArgument)
+                return Export.SteamPreview.Run(args);
+
             var httpsValidator = new RemoteCertificateValidationCallback(validateCert);
             ServicePointManager.ServerCertificateValidationCallback += httpsValidator;
             ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
@@ -23,6 +27,7 @@ namespace Rbx2Source
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new Rbx2Source());
+            return 0;
         }
     }
 }
