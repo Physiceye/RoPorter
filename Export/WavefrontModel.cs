@@ -30,6 +30,8 @@ namespace Rbx2Source.Export
 
         // Roblox's "overlay" alpha mode blends the texture over the part colour instead of making it see-through.
         public bool Overlay;
+        // The material named an alpha mode (rbx_alphamode); without one, the texture's own alpha decides.
+        public bool AlphaModeGiven;
 
         // PBR maps from Roblox SurfaceAppearances: a tangent-space normal map (map_Bump), a packed map (map_Ns:
         // R = metalness, G = roughness, B = emissive mask), and the emissive colour (map_Ke) scaled by Ke.
@@ -138,6 +140,7 @@ namespace Rbx2Source.Export
                             break;
                         case "rbx_alphamode":
                             material.Overlay = line.Value.Equals("overlay", StringComparison.OrdinalIgnoreCase);
+                            material.AlphaModeGiven = true;
                             break;
                         case "map_Bump": case "map_bump": case "bump": case "norm":
                             material.NormalTexture = MapFile(line.Value);

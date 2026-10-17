@@ -23,7 +23,7 @@ namespace Rbx2Source
         // Settings are remembered between runs in "littlefart" next to the exe, as "name=value" lines anyone can edit.
         private static readonly string SettingsFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "littlefart");
         private const string FolderSetting = "folder", DarkModeSetting = "darkmode";
-        private static readonly string[] SettingNames = { FolderSetting, DarkModeSetting, "singletexture", "vrchat", "facetracking" };
+        private static readonly string[] SettingNames = { FolderSetting, DarkModeSetting, "singletexture", "vrchat", "facetracking", "connectjoints" };
         private static readonly Dictionary<string, string> Saved = LoadSettings();
         private readonly TextBox outputFolder = new TextBox { Text = LoadOutputFolder() };
         private readonly CheckBox darkMode = new CheckBox { Text = "Dark mode", AutoSize = true, Margin = new Padding(3, 3, 3, 6) };
@@ -31,6 +31,8 @@ namespace Rbx2Source
         private readonly Button settingsTab = new Button { Text = "Settings", AutoSize = true, Margin = new Padding(0) };
         private readonly Button github = new Button { Text = "GitHub", AutoSize = true, Margin = new Padding(0) };
         private const string GitHubPage = "https://github.com/Physiceye/RoPorter";
+        private readonly Button reportBug = new Button { Text = "Report a bug", AutoSize = true, Margin = new Padding(0, 0, 6, 0) };
+        private const string IssuesPage = "https://github.com/Physiceye/RoPorter/issues";
         // Export stays disabled until the entered user or item has loaded its preview.
         private readonly Button export = new Button { Text = "Export", AutoSize = true, Enabled = false };
         private bool loaded;
@@ -49,6 +51,10 @@ namespace Rbx2Source
         private readonly CheckBox faceTracking = new CheckBox
         {
             Text = "Add FT support", AutoSize = true, Margin = new Padding(3, 3, 3, 6)
+        };
+        private readonly CheckBox connectJoints = new CheckBox
+        {
+            Text = "Connect body joints", AutoSize = true, Margin = new Padding(3, 3, 3, 6)
         };
         // Export scale in hundredths: 100 is full size (the maximum), 10 is the minimum (0.1), 80 is the default.
         private readonly TrackBar scale = new TrackBar
@@ -137,18 +143,33 @@ namespace Rbx2Source
             };
             settingsPage.Controls.Add(darkMode);
             settingsPage.Controls.Add(new Label { Text = "Export options", AutoSize = true, Font = new Font(Font, FontStyle.Bold), Margin = new Padding(3, 12, 3, 6) });
-            settingsPage.Controls.AddRange(new Control[] { singleTexture, vrchatShapes, faceTracking });
+            settingsPage.Controls.AddRange(new Control[] { singleTexture, vrchatShapes, faceTracking, connectJoints });
             BindSetting(singleTexture, "singletexture");
             BindSetting(vrchatShapes, "vrchat");
             BindSetting(faceTracking, "facetracking");
+            BindSetting(connectJoints, "connectjoints");
+            new ToolTip().SetToolTip(connectJoints, "Blends the body's weights across its joints so the surface stretches when they bend, instead of each " +
+                "part moving on its own. For UGC bundles modelled as one connected body; R6 avatars stay blocky.");
             var tabs = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, WrapContents = false, Padding = new Padding(12, 8, 12, 0) };
             tabs.Controls.AddRange(new Control[] { exportTab, settingsTab });
-            var bottom = new FlowLayoutPanel
+            // Bottom bar: the app version on the left, GitHub in the right corner with the bug report button beside it.
+            var bottom = new TableLayoutPanel
             {
-                Dock = DockStyle.Bottom, AutoSize = true, WrapContents = false, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(12, 0, 12, 10)
+                Dock = DockStyle.Bottom, AutoSize = true, ColumnCount = 2, RowCount = 1, Padding = new Padding(12, 0, 12, 10)
             };
-            bottom.Controls.Add(github);
+            bottom.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            bottom.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            var links = new FlowLayoutPanel { AutoSize = true, WrapContents = false, FlowDirection = FlowDirection.RightToLeft, Margin = new Padding(0) };
+            links.Controls.Add(github);
+            links.Controls.Add(reportBug);
+            bottom.Controls.Add(new Label
+            {
+                Text = "v" + typeof(Rbx2Source).Assembly.GetName().Version.ToString(3), AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0)
+            }, 0, 0);
+            bottom.Controls.Add(links, 1, 0);
             new ToolTip().SetToolTip(github, "Opens RoPorter's GitHub page.");
+            new ToolTip().SetToolTip(reportBug, "Opens RoPorter's GitHub issues page to report a bug.");
+            reportBug.Click += (sender, args) => Open(IssuesPage);
             // Docking runs from the last added control, so the tab strip and the bottom bar take their space before the pages fill the rest.
             Controls.Add(layout);
             Controls.Add(settingsPage);
@@ -505,9 +526,33 @@ namespace Rbx2Source
             {
                 control.BackColor = dark ? DarkBack : SystemColors.Control;
                 control.ForeColor = dark ? DarkText : SystemColors.ControlText;
+                if (control is CheckBox check && themedChecks.Add(check))
+                {
+                    check.Paint += PaintDisabledCheck;
+                    check.EnabledChanged += (sender, args) => check.Invalidate();
+                }
             }
             foreach (Control child in control.Controls)
                 Theme(child, dark);
+        }
+
+        private readonly HashSet<CheckBox> themedChecks = new HashSet<CheckBox>();
+        private static readonly Color DarkDisabledText = Color.FromArgb(128, 128, 128);
+
+        // Windows draws a disabled checkbox's text in a fixed dark grey that is hard to see on the dark background, so in
+        // dark mode its text is drawn again in a lighter grey.
+        private void PaintDisabledCheck(object sender, PaintEventArgs args)
+        {
+            var check = (CheckBox)sender;
+            if (check.Enabled || !darkMode.Checked)
+                return;
+            int glyph = CheckBoxRenderer.GetGlyphSize(args.Graphics, System.Windows.Forms.VisualStyles.CheckBoxState.UncheckedDisabled).Width;
+            var area = new Rectangle(check.Padding.Left + glyph + 1, 0, Math.Max(0, check.Width - glyph - 1 - check.Padding.Left), check.Height);
+            using (var background = new SolidBrush(check.BackColor))
+                args.Graphics.FillRectangle(background, area);
+            var text = new Rectangle(area.X + 3, 0, Math.Max(0, area.Width - 3), area.Height);
+            TextRenderer.DrawText(args.Graphics, check.Text, check.Font, text, DarkDisabledText, check.BackColor,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
         }
 
         protected override void OnHandleCreated(EventArgs args)
@@ -566,7 +611,7 @@ namespace Rbx2Source
                     var downloader = new RobloxModelDownloader(client, DefaultApiBase);
                     long id = await downloader.ResolveIdAsync(selection, avatar, cancellation.Token);
                     string path = await downloader.ExportAsync(id, avatar, "", folder, progress, cancellation.Token, format,
-                        avatar && faceTracking.Checked, vrchatShapes.Checked, singleTexture.Checked, scale.Value / 100f);
+                        avatar && faceTracking.Checked, vrchatShapes.Checked, singleTexture.Checked, scale.Value / 100f, avatar && connectJoints.Checked);
                     AppendLog("Export complete: " + path);
                     if (format == ExportFormat.GarrysMod && Workshop.IsAddon(downloader.ExportFolder))
                         exportedAddon = downloader.ExportFolder;
@@ -645,6 +690,8 @@ namespace Rbx2Source
             bool avatar = exportType.SelectedIndex == 0 && Formats[Math.Max(0, exportFormat.SelectedIndex)] != ExportFormat.GarrysMod;
             vrchatShapes.Enabled = !busy && avatar;
             faceTracking.Enabled = !busy && avatar;
+            // Joint blending applies to avatars in every format.
+            connectJoints.Enabled = !busy && exportType.SelectedIndex == 0;
         }
 
         private void AppendLog(string message)

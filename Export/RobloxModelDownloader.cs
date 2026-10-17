@@ -358,7 +358,9 @@ namespace Rbx2Source.Export
                             return;
                         byte[] data = await DownloadAssetAsync(accessory.Id, cancellation, AccessoryAssetFormat).ConfigureAwait(false);
                         accessory.Apply(RobloxModelFile.ReadAccessory(data));
-                        if (accessory.Layered && accessory.MeshId.HasValue)
+                        // Layered clothing keeps its mesh's skin weights; every accessory's mesh also tells which rendered
+                        // group is that accessory (see AvatarRig.MatchAccessories).
+                        if (accessory.MeshId.HasValue)
                         {
                             try
                             {
@@ -366,7 +368,8 @@ namespace Rbx2Source.Export
                             }
                             catch (Exception error) when (!(error is OperationCanceledException) && !(error is OutOfMemoryException))
                             {
-                                progress?.Report(accessory.Name + ": its mesh could not be read (" + error.Message + "); it will be auto-weighted.");
+                                progress?.Report(accessory.Name + ": its mesh could not be read (" + error.Message + ")" +
+                                    (accessory.Layered ? "; it will be auto-weighted." : "; it is matched by position."));
                             }
                         }
                     }
@@ -452,19 +455,55 @@ namespace Rbx2Source.Export
                     texture = null;
                 }
             }
+            FaceShapes face;
             if (texture != null)
             {
                 // Swap in the neutral head mesh: the render may show the head with a mood expression already applied.
                 FaceShapeBuilder.HeadFit fit = FaceShapeBuilder.Fit(mesh, model, headGroup, cancellation);
                 localTextures[HeadTextureKey] = texture;
-                return FaceShapeBuilder.ReplaceHead(mesh, shapes, fit, model, rig, headGroup, "DynamicHeadMtl", HeadTextureKey);
+                face = FaceShapeBuilder.ReplaceHead(mesh, shapes, fit, model, rig, headGroup, "DynamicHeadMtl", HeadTextureKey);
             }
-            progress?.Report("Face shapes were matched onto the rendered head, which may include a mood expression.");
-            var notes = new List<string>();
-            FaceShapes face = FaceShapeBuilder.Transfer(mesh, shapes, model, headGroup, notes, cancellation);
-            foreach (string note in notes)
-                progress?.Report(note);
+            else
+            {
+                progress?.Report("Face shapes were matched onto the rendered head, which may include a mood expression.");
+                var notes = new List<string>();
+                face = FaceShapeBuilder.Transfer(mesh, shapes, model, headGroup, notes, cancellation);
+                foreach (string note in notes)
+                    progress?.Report(note);
+            }
+            foreach (string layer in rig.HeadLayers.ToList())
+                CopyFaceShapes(face, model, headGroup, layer);
             return face;
+        }
+
+        // Face makeup layers move with the face: each layer vertex takes the shape deltas of the nearest head vertex.
+        private static void CopyFaceShapes(FaceShapes face, WavefrontModel model, string headGroup, string layer)
+        {
+            if (face == null)
+                return;
+            List<int> Positions(string group) => model.Triangles.Where(t => t.Group == group).SelectMany(t => t.Corners).Select(c => c.Position).Distinct().ToList();
+            List<int> head = Positions(headGroup);
+            if (head.Count == 0)
+                return;
+            foreach (int index in Positions(layer))
+            {
+                float[] p = model.Positions[index];
+                int nearest = head[0];
+                double best = double.MaxValue;
+                foreach (int candidate in head)
+                {
+                    float[] q = model.Positions[candidate];
+                    double d = (p[0] - q[0]) * (p[0] - q[0]) + (p[1] - q[1]) * (p[1] - q[1]) + (p[2] - q[2]) * (p[2] - q[2]);
+                    if (d < best)
+                    {
+                        best = d;
+                        nearest = candidate;
+                    }
+                }
+                foreach (FaceShape shape in face.Shapes)
+                    if (shape.Deltas.TryGetValue(nearest, out float[] delta))
+                        shape.Deltas[index] = delta;
+            }
         }
 
         // Roblox packs PBR as R = metalness, G = roughness, B = emissive mask; glTF wants G = roughness, B = metalness.
@@ -526,6 +565,69 @@ namespace Rbx2Source.Export
                 {
                     image.UnlockBits(data);
                 }
+            }
+        }
+
+        // Some render textures (layered clothing, hair) carry about 40% alpha over every texel although Roblox draws them
+        // solid; read as transparency, the whole accessory turns see-through. A texture with no solid texels is treated that
+        // way. Real translucent or cutout textures (hair cards, glasses) always have solid texels.
+        private static bool NeverOpaque(string path)
+        {
+            using (var image = new Bitmap(path))
+            {
+                if (!Image.IsAlphaPixelFormat(image.PixelFormat))
+                    return false;
+                BitmapData data = image.LockBits(new Rectangle(0, 0, image.Width, image.Height), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+                try
+                {
+                    var row = new byte[image.Width * 4];
+                    long opaque = 0, partial = 0;
+                    for (int y = 0; y < image.Height; y++)
+                    {
+                        System.Runtime.InteropServices.Marshal.Copy(data.Scan0 + y * data.Stride, row, 0, row.Length);
+                        for (int x = 3; x < row.Length; x += 4)
+                        {
+                            if (row[x] >= 250)
+                                opaque++;
+                            else if (row[x] > 5)
+                                partial++;
+                        }
+                    }
+                    return partial > 0 && opaque < 0.01 * (opaque + partial);
+                }
+                finally
+                {
+                    image.UnlockBits(data);
+                }
+            }
+        }
+
+        // Keeps the colour and makes every texel solid, except fully clear ones, which stay cut out.
+        private static void Solidify(string source, string destination)
+        {
+            using (var image = new Bitmap(source))
+            using (var output = new Bitmap(image.Width, image.Height, PixelFormat.Format32bppArgb))
+            {
+                var rectangle = new Rectangle(0, 0, image.Width, image.Height);
+                BitmapData input = image.LockBits(rectangle, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+                BitmapData result = output.LockBits(rectangle, ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+                try
+                {
+                    var row = new byte[image.Width * 4];
+                    for (int y = 0; y < image.Height; y++)
+                    {
+                        System.Runtime.InteropServices.Marshal.Copy(input.Scan0 + y * input.Stride, row, 0, row.Length);
+                        for (int x = 3; x < row.Length; x += 4)
+                            row[x] = row[x] > 5 ? (byte)255 : (byte)0;
+                        System.Runtime.InteropServices.Marshal.Copy(row, 0, result.Scan0 + y * result.Stride, row.Length);
+                    }
+                }
+                finally
+                {
+                    image.UnlockBits(input);
+                    output.UnlockBits(result);
+                }
+                output.Save(destination, ImageFormat.Png);
             }
         }
 
@@ -702,7 +804,7 @@ namespace Rbx2Source.Export
 
         public async Task<string> ExportAsync(long id, bool avatar, string descriptorUrl, string outputFolder,
             IProgress<string> progress, CancellationToken cancellation, ExportFormat format = ExportFormat.Glb, bool faceTracking = false,
-            bool vrchatShapes = true, bool singleTexture = false, float scale = 1)
+            bool vrchatShapes = true, bool singleTexture = false, float scale = 1, bool connectJoints = false)
         {
             if (format != ExportFormat.Glb && format != ExportFormat.Gltf && format != ExportFormat.Fbx && format != ExportFormat.GarrysMod)
                 throw new ArgumentOutOfRangeException(nameof(format));
@@ -762,7 +864,7 @@ namespace Rbx2Source.Export
                     progress?.Report("Avatar details unavailable (" + error.Message + "); accessories are weighted from their shape.");
                 }
                 progress?.Report("Building humanoid rig...");
-                rig = AvatarRig.Build(model, accessories, cancellation);
+                rig = AvatarRig.Build(model, accessories, cancellation, connectJoints);
                 progress?.Report("Rig parts: " + rig.Describe());
                 // Items held in a hand (gear, or UGC items Roblox renders in the hand) are in Roblox's render but are not part
                 // of the avatar. Garry's Mod keeps them as a bodygroup that starts hidden; other formats leave them out.
@@ -809,11 +911,15 @@ namespace Rbx2Source.Export
                 rig.AnchorHelperBones(model);
                 progress?.Report("Posed in a T-pose with a full humanoid skeleton (" + AvatarRig.BoneNames.Length + " bones).");
             }
-            var bodyGroups = new HashSet<string>(rig != null ? rig.Parts.Keys :
+            // Face makeup layers (extra copies of the head) are decals: their texture's transparency is kept as it is.
+            var headLayers = new HashSet<string>(rig?.HeadLayers ?? Enumerable.Empty<string>(), StringComparer.Ordinal);
+            var decalMaterials = new HashSet<string>(model.Triangles.Where(t => headLayers.Contains(t.Group)).Select(t => t.Material), StringComparer.Ordinal);
+            var bodyGroups = new HashSet<string>(rig != null ? rig.Parts.Keys.Where(g => !headLayers.Contains(g)) :
                 model.Triangles.Select(t => t.Group).Where(g => g.StartsWith("Player", StringComparison.OrdinalIgnoreCase)), StringComparer.Ordinal);
             // Body textures (clothing composites) and overlay materials show the part colour through transparent texels.
             var overlayMaterials = new HashSet<string>(model.Triangles.Where(t => bodyGroups.Contains(t.Group)).Select(t => t.Material)
                 .Concat(model.Materials.Values.Where(m => m.Overlay).Select(m => m.Name)), StringComparer.Ordinal);
+            overlayMaterials.ExceptWith(decalMaterials);
             string[] textureReferences = (descriptor?["textures"] as JArray)?.Values<string>().ToArray() ?? Array.Empty<string>();
             var availableTextures = new Dictionary<string, Uri>(StringComparer.Ordinal);
             foreach (string reference in textureReferences)
@@ -926,6 +1032,17 @@ namespace Rbx2Source.Export
                     if (material.Texture != null)
                     {
                         string relativePath = await FetchAsync(material.Texture).ConfigureAwait(false);
+                        if (!overlayMaterials.Contains(material.Name) && !decalMaterials.Contains(material.Name) && !material.AlphaModeGiven &&
+                            NeverOpaque(Full(relativePath)))
+                        {
+                            if (!converted.TryGetValue(relativePath + "|solid", out string solid))
+                            {
+                                solid = "textures/material-" + textures.Count + "-solid.png";
+                                Solidify(Full(relativePath), Full(solid));
+                                converted[relativePath + "|solid"] = solid;
+                            }
+                            relativePath = solid;
+                        }
                         if (overlayMaterials.Contains(material.Name))
                         {
                             string key = relativePath + "|" + string.Join(",", material.Diffuse);
@@ -1030,12 +1147,12 @@ namespace Rbx2Source.Export
                         }
                     // A re-export keeps the Workshop item of the last upload (and whether its page image was added), so
                     // uploading again updates it.
-                    foreach (string kept in new[] { Workshop.IdFile, Workshop.PreviewAddedFile })
-                    {
-                        string previous = Path.Combine(destination, kept.Replace('/', Path.DirectorySeparatorChar));
-                        if (File.Exists(previous))
-                            File.Copy(previous, Path.Combine(staging, kept.Replace('/', Path.DirectorySeparatorChar)), true);
-                    }
+                    long? published = Workshop.IsAddon(destination) ? Workshop.PublishedId(destination) : null;
+                    if (published.HasValue)
+                        Workshop.SetPublishedId(staging, published.Value);
+                    string previewAdded = Path.Combine(destination, Workshop.PreviewAddedFile.Replace('/', Path.DirectorySeparatorChar));
+                    if (File.Exists(previewAdded))
+                        File.Copy(previewAdded, Path.Combine(staging, Workshop.PreviewAddedFile.Replace('/', Path.DirectorySeparatorChar)), true);
                 }
                 else if (format == ExportFormat.Fbx)
                     FbxWriter.Write(new ExportScene(model, rig, face, scale), textures, maps, Path.Combine(staging, fileName), cancellation);

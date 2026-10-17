@@ -21,7 +21,7 @@ namespace Rbx2Source.Export
         // Kept in the addon folder but left out of the .gma (addon.json ignores it).
         public const string IconFile = "workshop_icon.jpg";
 
-        // The Workshop item from an earlier upload; uploading the same addon again updates it instead of making a new one.
+        // Where earlier versions kept the Workshop item from an upload (now in addon.json); still read for those addons.
         public const string IdFile = "src/workshop_id.txt";
 
         private const int IconSize = 512;
@@ -166,11 +166,34 @@ namespace Rbx2Source.Export
         public static bool IsAddon(string folder) =>
             !string.IsNullOrEmpty(folder) && File.Exists(Path.Combine(folder, "addon.json")) && Directory.Exists(Path.Combine(folder, "models"));
 
+        // The Workshop item is kept in addon.json ("workshopid"), so it stays with the addon wherever it is copied; gmad
+        // ignores the extra key. Addons uploaded before that have it in src/workshop_id.txt instead.
+        private const string IdKey = "workshopid";
+
         public static long? PublishedId(string folder)
         {
+            try
+            {
+                string json = Path.Combine(folder, "addon.json");
+                if (File.Exists(json) && Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(json))[IdKey] is Newtonsoft.Json.Linq.JToken token &&
+                    long.TryParse(token.ToString(), NumberStyles.None, CultureInfo.InvariantCulture, out long stored) && stored > 0)
+                    return stored;
+            }
+            catch (Exception error) when (error is IOException || error is Newtonsoft.Json.JsonException)
+            {
+            }
             string file = Path.Combine(folder, IdFile.Replace('/', Path.DirectorySeparatorChar));
             return File.Exists(file) && long.TryParse(File.ReadAllText(file).Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out long id) && id > 0
                 ? id : (long?)null;
+        }
+
+        public static void SetPublishedId(string folder, long id)
+        {
+            string json = Path.Combine(folder, "addon.json");
+            var addon = Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(json));
+            addon[IdKey] = id;
+            string text = addon.ToString(Newtonsoft.Json.Formatting.Indented).Replace("  ", "\t");
+            File.WriteAllText(json, text + "\n", new UTF8Encoding(false)); // gmad cannot parse addon.json with a byte order mark
         }
 
         // Packs and uploads the addon; returns its Workshop item ID. New items start hidden on the Workshop.
@@ -209,6 +232,7 @@ namespace Rbx2Source.Export
                 {
                     if (published.Key != 0)
                         throw new InvalidDataException("gmpublish could not update the addon:\n" + Tail(output));
+                    SetPublishedId(folder, existing.Value);
                     await UpdateDetailsAsync(folder, existing.Value, progress, cancellation).ConfigureAwait(false);
                     return existing.Value;
                 }
@@ -217,9 +241,7 @@ namespace Rbx2Source.Export
                     uid = Regex.Matches(output, @"\b(\d{6,})\b").Cast<Match>().LastOrDefault() ?? uid;
                 if (!uid.Success || !long.TryParse(uid.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out long id))
                     throw new InvalidDataException("gmpublish did not report a Workshop item ID (is Steam running and signed in?):\n" + Tail(output));
-                string idFile = Path.Combine(folder, IdFile.Replace('/', Path.DirectorySeparatorChar));
-                Directory.CreateDirectory(Path.GetDirectoryName(idFile));
-                File.WriteAllText(idFile, id.ToString(CultureInfo.InvariantCulture));
+                SetPublishedId(folder, id);
                 await UpdateDetailsAsync(folder, id, progress, cancellation).ConfigureAwait(false);
                 return id;
             }

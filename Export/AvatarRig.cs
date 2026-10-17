@@ -52,8 +52,9 @@ namespace Rbx2Source.Export
     }
 
     // Builds a Unity/VRChat-style humanoid skeleton for Roblox's rendered (already posed) R15 avatar geometry.
-    // Every Unity humanoid bone is present (names match HumanBodyBones). Only the R15 part bones carry skin
-    // weights; the others (UpperChest, shoulders, toes, eyes, jaw, fingers) exist for humanoid mapping.
+    // Every Unity humanoid bone is present (names match HumanBodyBones). The R15 part bones carry the skin weights, plus
+    // UpperChest for long hair down the back (see Drape); the others (shoulders, toes, eyes, jaw, fingers) exist for
+    // humanoid mapping.
     public sealed class AvatarRig
     {
         public const int Hips = 0, Spine = 1, Chest = 2, Neck = 3, HeadBone = 4,
@@ -118,7 +119,41 @@ namespace Rbx2Source.Export
         private IReadOnlyList<AccessoryInfo> accessories;
         public int[][] Joints { get; private set; }
         public float[][] Weights { get; private set; }
-        public string HeadGroup => Parts.Where(pair => pair.Value == BodyPart.Head).Select(pair => pair.Key).FirstOrDefault();
+        public string HeadGroup => primaryHead ?? Parts.Where(pair => pair.Value == BodyPart.Head).Select(pair => pair.Key).FirstOrDefault();
+        private string primaryHead;
+
+        // Other copies of the head: face makeup layers, which follow the head and its face shapes.
+        public IEnumerable<string> HeadLayers => Parts.Where(pair => pair.Value == BodyPart.Head && pair.Key != HeadGroup).Select(pair => pair.Key);
+
+        // With makeup the render has several copies of the head. The head itself has the skin colour; makeup layers are
+        // white. Layers are pushed out by 1% so they don't flicker against the head they cover.
+        private void ChooseHead(WavefrontModel model, Dictionary<string, HashSet<int>> groupPositions)
+        {
+            var heads = Parts.Where(pair => pair.Value == BodyPart.Head).Select(pair => pair.Key).ToList();
+            if (heads.Count < 2)
+                return;
+            bool White(string group)
+            {
+                ObjTriangle triangle = model.Triangles.FirstOrDefault(t => t.Group == group);
+                return triangle != null && model.Materials[triangle.Material].Diffuse.All(value => value > 0.99f);
+            }
+            primaryHead = heads.OrderBy(group => White(group) ? 1 : 0)
+                .ThenBy(group => int.TryParse(Regex.Match(group, @"\d+$").Value, out int number) ? number : int.MaxValue).First();
+            var box = new PartBounds();
+            foreach (int index in groupPositions[primaryHead])
+                box.Add(model.Positions[index]);
+            foreach (string layer in heads.Where(group => group != primaryHead))
+                foreach (int index in groupPositions[layer])
+                {
+                    float[] p = model.Positions[index];
+                    model.Positions[index] = new[]
+                    {
+                        (float)(box.Center(0) + 1.01 * (p[0] - box.Center(0))), (float)(box.Center(1) + 1.01 * (p[1] - box.Center(1))),
+                        (float)(box.Center(2) + 1.01 * (p[2] - box.Center(2)))
+                    };
+                }
+            Notes.Add(primaryHead + " is the head; " + string.Join(", ", heads.Where(group => group != primaryHead)) + " (face makeup) follows it.");
+        }
         public List<string> Notes { get; } = new List<string>();
 
         public static int BoneFor(BodyPart part) => PartBone[part];
@@ -139,9 +174,11 @@ namespace Rbx2Source.Export
         }
 
         // Accessories (from the avatar API) let rigid items follow their real attachment bone and mark layered clothing.
-        public static AvatarRig Build(WavefrontModel model, IReadOnlyList<AccessoryInfo> accessories, CancellationToken cancellation = default)
+        // connectJoints blends the body's weights across its joints (see ConnectJoints).
+        public static AvatarRig Build(WavefrontModel model, IReadOnlyList<AccessoryInfo> accessories, CancellationToken cancellation = default,
+            bool connectJoints = false)
         {
-            var rig = new AvatarRig { accessories = accessories };
+            var rig = new AvatarRig { accessories = accessories, connectJoints = connectJoints };
             var groupBounds = new Dictionary<string, PartBounds>(StringComparer.Ordinal);
             var groupPositions = new Dictionary<string, HashSet<int>>(StringComparer.Ordinal);
             var positionGroup = new Dictionary<int, string>();
@@ -161,6 +198,7 @@ namespace Rbx2Source.Export
                 }
             }
 
+            rig.MatchSkins(model, groupPositions);
             rig.Classify(groupBounds);
             // An avatar holding a tool is rendered with that arm raised straight forward. It is lowered (with the tool) and
             // the parts are classified again, since bones are placed for hanging arms.
@@ -176,6 +214,7 @@ namespace Rbx2Source.Export
                 rig.Parts.Clear();
                 rig.Classify(groupBounds);
             }
+            rig.ChooseHead(model, groupPositions);
             cancellation.ThrowIfCancellationRequested();
 
             var all = new PartBounds();
@@ -200,6 +239,14 @@ namespace Rbx2Source.Export
             var parts = new Dictionary<BodyPart, PartBounds>();
             foreach (var pair in rig.Parts)
                 parts[pair.Value] = groupBounds[pair.Key];
+            // Body parts Roblox deleted under layered clothing (feet inside boots, forearms inside sleeves) are where the
+            // clothing's own skin weights put them.
+            foreach (BodyPart part in Enum.GetValues(typeof(BodyPart)))
+                if (!parts.ContainsKey(part) && rig.skinnedBoxes.TryGetValue(PartBone[part], out PartBounds covered) && !covered.IsEmpty)
+                {
+                    parts[part] = covered;
+                    rig.Notes.Add(part + " is hidden by layered clothing; it is placed from the clothing's skin weights.");
+                }
             rig.PlaceBones(parts, body);
             cancellation.ThrowIfCancellationRequested();
             rig.ComputeWeights(model, groupPositions, positionGroup, parts, body, cancellation);
@@ -225,14 +272,23 @@ namespace Rbx2Source.Export
 
             double minX = body.Values.Min(b => b.Min[0]), maxX = body.Values.Max(b => b.Max[0]);
             double centerX = (minX + maxX) / 2, width = Math.Max(maxX - minX, 1e-6);
-            var central = body.Where(pair => pair.Value.Min[0] < centerX - 0.02 * width && pair.Value.Max[0] > centerX + 0.02 * width)
+            // Head and torso parts are centred on the body, not just across its centre line (big legs can reach across it).
+            var central = body.Where(pair => pair.Value.Min[0] < centerX - 0.02 * width && pair.Value.Max[0] > centerX + 0.02 * width &&
+                    Math.Abs(pair.Value.Center(0) - centerX) < 0.1 * width)
                 .OrderByDescending(pair => pair.Value.Max[1]).Select(pair => pair.Key).ToList();
             var sides = body.Keys.Except(central).ToList();
 
             if (central.Count > 0)
             {
-                Parts[central[0]] = BodyPart.Head;
-                var torso = central.Skip(1).OrderByDescending(group => body[group].Center(1)).ToList();
+                // Face makeup is rendered as another copy of the head; every copy is part of the head.
+                PartBounds top = body[central[0]];
+                double tolerance = 0.05 * Math.Max(top.Size(0), Math.Max(top.Size(1), top.Size(2)));
+                bool SameBox(PartBounds box) => Enumerable.Range(0, 3).All(axis =>
+                    Math.Abs(box.Min[axis] - top.Min[axis]) <= tolerance && Math.Abs(box.Max[axis] - top.Max[axis]) <= tolerance);
+                var heads = central.Where(group => SameBox(body[group])).ToList();
+                foreach (string head in heads)
+                    Parts[head] = BodyPart.Head;
+                var torso = central.Except(heads).OrderByDescending(group => body[group].Center(1)).ToList();
                 if (torso.Count >= 2)
                 {
                     Parts[torso[0]] = BodyPart.UpperTorso;
@@ -259,11 +315,52 @@ namespace Rbx2Source.Export
                 threshold = upperTorso != null ? body[upperTorso].Size(0) / 2 * 0.95 : width * 0.33;
             }
 
+            // A part entirely above the middle of the lower torso is an arm, however close to the centre line it hangs (posed
+            // renders and short-armed bodies put upper arms as close in as the legs).
+            string lowerTorso = Parts.Where(pair => pair.Value == BodyPart.LowerTorso).Select(pair => pair.Key).FirstOrDefault();
+            double hipLine = lowerTorso != null ? body[lowerTorso].Center(1) : double.PositiveInfinity;
+            // Legs stand on the floor: each side's leg is the chain of touching parts climbing from the part on the floor to
+            // the one that meets the hips. Whatever else is on that side is its arm, however close it hangs to the legs
+            // (posed renders, short arms resting on big legs). Sides with nothing on the floor fall back to the distances.
+            double floor = body.Values.Min(b => b.Min[1]), reach = 0.03 * Math.Max(body.Values.Max(b => b.Max[1]) - floor, 1e-6);
+            bool Touch(PartBounds a, PartBounds b) => Enumerable.Range(0, 3).All(axis => a.Min[axis] - reach <= b.Max[axis] && b.Min[axis] - reach <= a.Max[axis]);
+            double Overlap(PartBounds a, PartBounds b)
+            {
+                double x = Math.Max(0, Math.Min(a.Max[0], b.Max[0]) - Math.Max(a.Min[0], b.Min[0]));
+                double z = Math.Max(0, Math.Min(a.Max[2], b.Max[2]) - Math.Max(a.Min[2], b.Min[2]));
+                return x * z / Math.Max(Math.Min(a.Size(0) * a.Size(2), b.Size(0) * b.Size(2)), 1e-9);
+            }
+            string upperTorsoGroup = Parts.Where(pair => pair.Value == BodyPart.UpperTorso).Select(pair => pair.Key).FirstOrDefault();
+            PartBounds hips = lowerTorso != null ? body[lowerTorso] : upperTorsoGroup != null ? body[upperTorsoGroup] : null;
+            var legChains = new Dictionary<int, List<string>>();
+            foreach (int sign in new[] { -1, 1 })
+            {
+                var mine = sides.Where(group => Math.Sign(body[group].Center(0) - centerX) == sign).ToList();
+                string start = mine.Where(group => body[group].Min[1] <= floor + reach).OrderBy(group => body[group].Min[1]).FirstOrDefault();
+                if (start == null || hips == null)
+                    continue;
+                var chain = new List<string> { start };
+                while (chain.Count < 3 && !Touch(body[chain[chain.Count - 1]], hips))
+                {
+                    PartBounds last = body[chain[chain.Count - 1]];
+                    string next = mine.Where(group => !chain.Contains(group) && Touch(body[group], last) && body[group].Center(1) > last.Center(1))
+                        .OrderByDescending(group => Overlap(body[group], last)).FirstOrDefault();
+                    if (next == null)
+                        break;
+                    chain.Add(next);
+                }
+                // A chain that never reaches the hips is not a leg (an arm hanging to the floor); use the distances instead.
+                if (Touch(body[chain[chain.Count - 1]], hips))
+                    legChains[sign] = chain;
+            }
+
             var limbs = new Dictionary<string, List<string>>();
             foreach (string group in sides)
             {
                 double dx = body[group].Center(0) - centerX;
-                string key = (dx > 0 ? "Right" : "Left") + (Math.Abs(dx) > threshold ? "Arm" : "Leg");
+                bool arm = legChains.TryGetValue(Math.Sign(dx), out List<string> leg) ? !leg.Contains(group)
+                    : Math.Abs(dx) > threshold || body[group].Min[1] > hipLine;
+                string key = (dx > 0 ? "Right" : "Left") + (arm ? "Arm" : "Leg");
                 if (!limbs.ContainsKey(key))
                     limbs[key] = new List<string>();
                 limbs[key].Add(group);
@@ -307,6 +404,10 @@ namespace Rbx2Source.Export
                     if (ordered.Count > 3)
                         ordered = ordered.Take(3).ToList();
                     double top = ordered.Max(g => body[g].Max[1]), bottom = ordered.Min(g => body[g].Min[1]);
+                    // Layered clothing over the limb's hidden end (boots over the shins and feet) shows where the limb ends.
+                    foreach (BodyPart hidden in labels)
+                        if (skinnedBoxes.TryGetValue(PartBone[hidden], out PartBounds covered) && !covered.IsEmpty)
+                            bottom = Math.Min(bottom, covered.Min[1]);
                     double[] expected = { 0.2, 0.55, 0.88 };
                     int next = 0;
                     foreach (string group in ordered)
@@ -336,6 +437,14 @@ namespace Rbx2Source.Export
                 default: return new[] { BodyPart.RightUpperLeg, BodyPart.RightLowerLeg, BodyPart.RightFoot };
             }
         }
+
+        // The point of a part's box closest to a point.
+        private static double[] Nearest(PartBounds part, double[] point) => new[]
+        {
+            Math.Max(part.Min[0], Math.Min(part.Max[0], point[0])),
+            Math.Max(part.Min[1], Math.Min(part.Max[1], point[1])),
+            Math.Max(part.Min[2], Math.Min(part.Max[2], point[2]))
+        };
 
         private static double EndOffset(PartBounds part) => Math.Min(0.5 * part.Size(0), 0.25 * part.Size(1));
 
@@ -408,6 +517,13 @@ namespace Rbx2Source.Export
                     : Template(0.61, sign, 0.34);
                 position[LeftLowerArm + offset] = Joint(upperArm, lowerArm) ?? Template(0.52, sign, 0.38);
                 position[LeftHand + offset] = Joint(lowerArm, hand) ?? Template(0.42, sign, 0.40);
+                // A forearm hidden under a sleeve is missing from the render: the wrist is where the hand comes closest to
+                // the elbow (a posed hand can point sideways, so its top middle is not the wrist).
+                if (lowerArm == null && upperArm != null && hand != null)
+                {
+                    position[LeftLowerArm + offset] = new[] { upperArm.Center(0), upperArm.Min[1], upperArm.Center(2) };
+                    position[LeftHand + offset] = Nearest(hand, position[LeftLowerArm + offset]);
+                }
                 double[] shoulderJoint = position[LeftUpperArm + offset];
                 position[side == "Left" ? LeftShoulder : RightShoulder] = new[]
                 {
@@ -422,6 +538,11 @@ namespace Rbx2Source.Export
                     : Template(0.37, sign, 0.12);
                 position[LeftLowerLeg + offset] = Joint(upperLeg, lowerLeg) ?? Template(0.14, sign, 0.13);
                 position[LeftFoot + offset] = Joint(lowerLeg, foot) ?? Template(0.07, sign, 0.13);
+                if (lowerLeg == null && upperLeg != null && foot != null)
+                {
+                    position[LeftLowerLeg + offset] = new[] { upperLeg.Center(0), upperLeg.Min[1], upperLeg.Center(2) };
+                    position[LeftFoot + offset] = Nearest(foot, position[LeftLowerLeg + offset]);
+                }
 
                 // R6 limbs are one block (found as the middle part). Their joints go along the block, and its vertices are
                 // split between the limb's three bones at them (see WholeLimbBone), so the limb bends at the elbow or knee.
@@ -492,7 +613,15 @@ namespace Rbx2Source.Export
         {
             int handBone = left ? LeftHand : RightHand;
             double[] wrist = position[handBone], elbow = position[left ? LeftLowerArm : RightLowerArm];
+            // Fingers run from the wrist through the hand (a posed hand need not continue the forearm's line).
             double[] along = Normalize(Subtract(wrist, elbow));
+            if (hand != null)
+            {
+                double[] center = { hand.Center(0), hand.Center(1), hand.Center(2) };
+                double[] through = Subtract(center, wrist);
+                if (Math.Sqrt(Dot(through, through)) > 0.2 * Math.Max(hand.Size(0), Math.Max(hand.Size(1), hand.Size(2))))
+                    along = Normalize(through) ?? along;
+            }
             if (along == null)
                 along = new double[] { 0, -1, 0 };
             // Thumbs point forward (-Z), towards the front of the character.
@@ -582,6 +711,92 @@ namespace Rbx2Source.Export
             return Math.Sqrt(x * x + y * y + z * z);
         }
 
+        // Body parts that meet at a joint, parent first. The neck is left out: the dynamic head is replaced by its own mesh
+        // after weighting.
+        private bool connectJoints;
+
+        private static readonly BodyPart[][] JointedParts =
+        {
+            new[] { BodyPart.LowerTorso, BodyPart.UpperTorso },
+            new[] { BodyPart.UpperTorso, BodyPart.LeftUpperArm }, new[] { BodyPart.LeftUpperArm, BodyPart.LeftLowerArm }, new[] { BodyPart.LeftLowerArm, BodyPart.LeftHand },
+            new[] { BodyPart.UpperTorso, BodyPart.RightUpperArm }, new[] { BodyPart.RightUpperArm, BodyPart.RightLowerArm }, new[] { BodyPart.RightLowerArm, BodyPart.RightHand },
+            new[] { BodyPart.LowerTorso, BodyPart.LeftUpperLeg }, new[] { BodyPart.LeftUpperLeg, BodyPart.LeftLowerLeg }, new[] { BodyPart.LeftLowerLeg, BodyPart.LeftFoot },
+            new[] { BodyPart.LowerTorso, BodyPart.RightUpperLeg }, new[] { BodyPart.RightUpperLeg, BodyPart.RightLowerLeg }, new[] { BodyPart.RightLowerLeg, BodyPart.RightFoot }
+        };
+
+        // "Connect joints": UGC bodies are often modelled as one surface cut into parts, so rigid parts open a gap when a
+        // joint bends. Near each joint, a vertex close to the neighbouring part shares its weight with that part's bone:
+        // half and half where the parts meet, fading to rigid a short way in, so the surface stretches across the joint.
+        // Only vertices around the joint are blended (an arm hanging against the torso side stays separate), and R6
+        // blocks stay rigid.
+        private void ConnectJoints(WavefrontModel model, Dictionary<string, HashSet<int>> groupPositions, Dictionary<BodyPart, PartBounds> actual, double height)
+        {
+            double seam = 0.04 * height;
+            var groupsOf = Parts.GroupBy(pair => pair.Value).ToDictionary(g => g.Key, g => g.Select(pair => pair.Key).ToList());
+            var blends = new Dictionary<int, Dictionary<int, double>>();
+            int connected = 0;
+            foreach (BodyPart[] pair in JointedParts)
+            {
+                BodyPart parent = pair[0], child = pair[1];
+                if (!groupsOf.TryGetValue(parent, out List<string> parentGroups) || !groupsOf.TryGetValue(child, out List<string> childGroups) ||
+                    wholeLimbs.Contains(parent) || wholeLimbs.Contains(child) || !actual.TryGetValue(child, out PartBounds childBox))
+                    continue;
+                int parentBone = PartBone[parent], childBone = PartBone[child];
+                double[] joint = child == BodyPart.UpperTorso && actual.TryGetValue(parent, out PartBounds lowerBox)
+                    ? Joint(lowerBox, childBox) : Bones[childBone].Position;
+                if (joint == null)
+                    continue;
+                // The joint's reach: the child part's cross-section (the waist uses the torso's depth, not its width).
+                double radius = (child == BodyPart.UpperTorso ? 0.5 * childBox.Size(2) : 0.5 * Math.Max(childBox.Size(0), childBox.Size(2))) + seam;
+                float[] center = { (float)joint[0], (float)joint[1], (float)joint[2] };
+                List<int> Near(List<string> groups) => groups.SelectMany(g => groupPositions[g]).Distinct()
+                    .Where(i => Distance(model.Positions[i], center) <= radius + seam).ToList();
+                List<int> parents = Near(parentGroups), children = Near(childGroups);
+                if (parents.Count == 0 || children.Count == 0)
+                    continue;
+                bool any = false;
+                void Blend(List<int> from, List<int> to, int otherBone)
+                {
+                    foreach (int vertex in from)
+                    {
+                        float[] p = model.Positions[vertex];
+                        double nearest = double.MaxValue;
+                        foreach (int other in to)
+                            nearest = Math.Min(nearest, Distance(p, model.Positions[other]));
+                        if (nearest >= seam)
+                            continue;
+                        double t = nearest / seam, weight = 0.5 * (1 - t * t * (3 - 2 * t));
+                        if (!blends.TryGetValue(vertex, out var shares))
+                            blends[vertex] = shares = new Dictionary<int, double>();
+                        shares[otherBone] = Math.Max(shares.TryGetValue(otherBone, out double existing) ? existing : 0, weight);
+                        any = true;
+                    }
+                }
+                Blend(parents, children, childBone);
+                Blend(children, parents, parentBone);
+                if (any)
+                    connected++;
+            }
+            foreach (var entry in blends)
+            {
+                int own = Joints[entry.Key][0];
+                var shares = entry.Value.Where(s => s.Key != own).OrderByDescending(s => s.Value).Take(3).ToList();
+                double others = shares.Sum(s => s.Value), scale = others > 0.75 ? 0.75 / others : 1;
+                var joints = new int[4];
+                var weights = new float[4];
+                joints[0] = own;
+                weights[0] = (float)(1 - others * scale);
+                for (int k = 0; k < shares.Count; k++)
+                {
+                    joints[k + 1] = shares[k].Key;
+                    weights[k + 1] = (float)(shares[k].Value * scale);
+                }
+                Joints[entry.Key] = joints;
+                Weights[entry.Key] = weights;
+            }
+            Notes.Add(connected > 0 ? "Connected " + connected + " body joints (" + blends.Count + " vertices blended)." : "No connected body joints were found.");
+        }
+
         private void ComputeWeights(WavefrontModel model, Dictionary<string, HashSet<int>> groupPositions,
             Dictionary<int, string> positionGroup, Dictionary<BodyPart, PartBounds> actual, PartBounds body, CancellationToken cancellation)
         {
@@ -606,6 +821,8 @@ namespace Rbx2Source.Export
                     cloudBones.Add(WholeLimbBone(pair.Value, p[1]));
                 }
             }
+            if (connectJoints)
+                ConnectJoints(model, groupPositions, actual, height);
 
             // Body parts hidden by layered clothing still need influence volumes for the clothing that covers them.
             double centerX = body.Center(0);
@@ -683,8 +900,8 @@ namespace Rbx2Source.Export
                 groups.Add(group);
             }
 
-            MatchSkinnedClothing(model, groups);
-            MatchAccessories(groups.Where(group => group.Accessory == null).ToList(), height,
+            MatchSkinnedClothing(groups);
+            MatchAccessories(model, groups.Where(group => group.Accessory == null).ToList(), height,
                 accessories?.Where(accessory => groups.All(group => group.Accessory != accessory)).ToList());
             foreach (AccessoryGroup group in groups)
             {
@@ -746,8 +963,14 @@ namespace Rbx2Source.Export
                     }
                     continue;
                 }
+                bool drape = !layered && bone == HeadBone && !HeldGroups.Contains(group.Name) && PartBoxes.ContainsKey(BodyPart.Head);
                 foreach (var entry in group.Nearest)
                 {
+                    if (drape)
+                    {
+                        Drape(entry.Key, model.Positions[entry.Key][1], height);
+                        continue;
+                    }
                     if (!layered || entry.Value.Count == 0)
                     {
                         Joints[entry.Key] = new[] { bone, 0, 0, 0 };
@@ -766,6 +989,17 @@ namespace Rbx2Source.Export
                     Joints[i] = new[] { Hips, 0, 0, 0 };
                     Weights[i] = new[] { 1f, 0, 0, 0 };
                 }
+        }
+
+        // Head accessories are rigid on the head down to the bottom of the head. Below it (long hair down the back) they blend
+        // into the upper chest, following it fully 15% of the avatar's height lower. Roblox keeps them rigid, but its heads
+        // barely move; Valve's animations turn the head a lot, which swung long hair out from the back and through the body.
+        private void Drape(int vertex, float y, double height)
+        {
+            double below = PartBoxes[BodyPart.Head].Min[1] - y, t = Math.Max(0, Math.Min(1, below / (0.15 * height)));
+            float chest = (float)(t * t * (3 - 2 * t));
+            Joints[vertex] = chest > 0 ? new[] { HeadBone, UpperChest, 0, 0 } : new[] { HeadBone, 0, 0, 0 };
+            Weights[vertex] = new[] { 1 - chest, chest, 0, 0 };
         }
 
         // The hand whose grip point lies inside (or within 4% of the avatar's height of) the group's box, or -1.
@@ -890,23 +1124,61 @@ namespace Rbx2Source.Export
             public Dictionary<int, int> Skin;
         }
 
-        // Layered clothing whose own mesh matches a rendered group (same triangles and UVs) keeps Roblox's weights.
-        private void MatchSkinnedClothing(WavefrontModel model, List<AccessoryGroup> groups)
+        // Layered clothing matched to its rendered group (see MatchSkins), and per rig bone the box of rendered clothing
+        // vertices that mostly follow it.
+        private readonly Dictionary<string, KeyValuePair<AccessoryInfo, Dictionary<int, int>>> skinMatches =
+            new Dictionary<string, KeyValuePair<AccessoryInfo, Dictionary<int, int>>>(StringComparer.Ordinal);
+        private readonly Dictionary<int, PartBounds> skinnedBoxes = new Dictionary<int, PartBounds>();
+
+        // Layered clothing whose own mesh matches a rendered group (same triangles and UVs) keeps Roblox's weights. This
+        // runs before the body parts are classified, since the weights also show where hidden body parts are.
+        private void MatchSkins(WavefrontModel model, Dictionary<string, HashSet<int>> groupPositions)
         {
             if (accessories == null)
                 return;
             var triangles = model.Triangles.ToLookup(t => t.Group, StringComparer.Ordinal);
+            var candidates = groupPositions.Keys.Where(g => !g.StartsWith("Player", StringComparison.OrdinalIgnoreCase)).ToList();
+            var bodyPositions = groupPositions.Where(pair => pair.Key.StartsWith("Player", StringComparison.OrdinalIgnoreCase)).SelectMany(pair => pair.Value).ToList();
+            double centerX = bodyPositions.Count > 0 ? (bodyPositions.Min(i => model.Positions[i][0]) + bodyPositions.Max(i => model.Positions[i][0])) / 2 : 0;
+
+            // Share of side-weighted vertices that sit on that side (character right is +X in the render). Left and right
+            // shoes are mirror twins with the same triangles and UVs, so both match either rendered shoe equally; only
+            // their weights tell which one is which.
+            double SideAgreement(Dictionary<int, int> map, RobloxMesh mesh)
+            {
+                int agree = 0, total = 0;
+                foreach (var pair in map)
+                {
+                    var influence = SkinTransfer.Influence(mesh, pair.Value);
+                    if (influence.Count == 0)
+                        continue;
+                    string bone = BoneNames[influence.OrderByDescending(entry => entry.Value).First().Key];
+                    int side = bone.StartsWith("Left", StringComparison.Ordinal) ? -1 : bone.StartsWith("Right", StringComparison.Ordinal) ? 1 : 0;
+                    if (side == 0)
+                        continue;
+                    total++;
+                    if (Math.Sign(model.Positions[pair.Key][0] - centerX) == side)
+                        agree++;
+                }
+                return total == 0 ? 1 : (double)agree / total;
+            }
+
             foreach (AccessoryInfo accessory in accessories.Where(a => a.Layered && a.HasSkinWeights))
             {
-                AccessoryGroup best = null;
+                string best = null;
                 Dictionary<int, int> bestMap = null;
-                foreach (AccessoryGroup group in groups.Where(g => g.Accessory == null))
+                double bestScore = 0;
+                foreach (string group in candidates.Where(g => !skinMatches.ContainsKey(g)))
                 {
-                    Dictionary<int, int> map = SkinTransfer.Match(model, triangles[group.Name].ToList(), accessory.Mesh);
-                    if (map != null && (bestMap == null || (double)map.Count / group.Nearest.Count > (double)bestMap.Count / best.Nearest.Count))
+                    Dictionary<int, int> map = SkinTransfer.Match(model, triangles[group].ToList(), accessory.Mesh);
+                    if (map == null)
+                        continue;
+                    double score = (double)map.Count / groupPositions[group].Count * (0.5 + 0.5 * SideAgreement(map, accessory.Mesh));
+                    if (bestMap == null || score > bestScore)
                     {
                         best = group;
                         bestMap = map;
+                        bestScore = score;
                     }
                 }
                 if (best == null)
@@ -914,10 +1186,27 @@ namespace Rbx2Source.Export
                     Notes.Add(accessory.Name + ": its mesh did not match the render; it is auto-weighted.");
                     continue;
                 }
-                best.Accessory = accessory;
-                best.Skin = bestMap;
-                Notes.Add(best.Name + " = " + accessory.Name + " (layered, Roblox skin weights)");
+                skinMatches[best] = new KeyValuePair<AccessoryInfo, Dictionary<int, int>>(accessory, bestMap);
+                foreach (var pair in bestMap)
+                    foreach (var influence in SkinTransfer.Influence(accessory.Mesh, pair.Value))
+                        if (influence.Value >= 0.6)
+                        {
+                            if (!skinnedBoxes.TryGetValue(influence.Key, out PartBounds box))
+                                skinnedBoxes[influence.Key] = box = new PartBounds();
+                            box.Add(model.Positions[pair.Key]);
+                        }
             }
+        }
+
+        private void MatchSkinnedClothing(List<AccessoryGroup> groups)
+        {
+            foreach (AccessoryGroup group in groups)
+                if (skinMatches.TryGetValue(group.Name, out var match))
+                {
+                    group.Accessory = match.Key;
+                    group.Skin = match.Value;
+                    Notes.Add(group.Name + " = " + match.Key.Name + " (layered, Roblox skin weights)");
+                }
         }
 
         // Full body-part volumes for skinning layered clothing. Roblox deletes body geometry hidden under layered
@@ -1030,20 +1319,34 @@ namespace Rbx2Source.Export
 
         // Pairs rendered accessory groups with the avatar's accessories. Each accessory's attachment point must lie
         // on or near its group, and layered clothing must wrap the body. Groups left unmatched use geometry alone.
-        private void MatchAccessories(List<AccessoryGroup> groups, double height, List<AccessoryInfo> accessories)
+        // Positions alone can mislead: long hair reaching the hips sits mostly at chest height, and an aura around the head
+        // at head height. An accessory whose own mesh matches a rendered group (same triangles and UVs) is that group; one
+        // whose mesh matches a different group is penalised, so the two are not swapped.
+        private const double MeshMismatch = 0.8;
+
+        private void MatchAccessories(WavefrontModel model, List<AccessoryGroup> groups, double height, List<AccessoryInfo> accessories)
         {
             if (accessories == null || accessories.Count == 0 || groups.Count == 0)
                 return;
             const double Unmatched = 1.0;
+            var triangles = model.Triangles.ToLookup(t => t.Group, StringComparer.Ordinal);
+            var meshMatch = new bool[groups.Count, accessories.Count];
             var cost = new double[groups.Count, accessories.Count + groups.Count];
             for (int g = 0; g < groups.Count; g++)
             {
+                List<ObjTriangle> groupTriangles = triangles[groups[g].Name].ToList();
                 for (int a = 0; a < accessories.Count; a++)
                 {
                     AccessoryInfo accessory = accessories[a];
                     double[] point = AccessoryInfo.AttachmentPoint(accessory.Attachment, PartBoxes[accessory.Part]);
                     double distance = DistanceToBox(point, groups[g].Bounds) / height;
                     cost[g, a] = 3 * distance + (accessory.Layered ? 1 - groups[g].Hug : 0.5 * groups[g].Hug);
+                    if (accessory.Mesh != null)
+                    {
+                        meshMatch[g, a] = SkinTransfer.Match(model, groupTriangles, accessory.Mesh) != null;
+                        if (!meshMatch[g, a])
+                            cost[g, a] += MeshMismatch;
+                    }
                 }
                 for (int d = 0; d < groups.Count; d++)
                     cost[g, accessories.Count + d] = Unmatched;
@@ -1055,9 +1358,10 @@ namespace Rbx2Source.Export
                 {
                     AccessoryInfo match = accessories[assignment[g]];
                     groups[g].Accessory = match;
-                    // Accessories with the same attachment rig identically, so the render cannot tell them apart.
+                    // Accessories with the same attachment rig identically, so the render cannot tell them apart (unless
+                    // the accessory's own mesh identified it).
                     var alike = accessories.Where(a => a.Layered == match.Layered && a.Attachment == match.Attachment).ToList();
-                    string label = alike.Count == 1 ? match.Name : "one of " + string.Join(" / ", alike.Select(a => a.Name));
+                    string label = alike.Count == 1 || meshMatch[g, assignment[g]] ? match.Name : "one of " + string.Join(" / ", alike.Select(a => a.Name));
                     Notes.Add(groups[g].Name + " = " + label + " (" +
                         (match.Layered ? "layered, auto-weighted" : "rigid on " + BoneNames[PartBone[match.Part]]) + ")");
                 }
