@@ -162,6 +162,20 @@ namespace Rbx2Source.Export
             }
 
             rig.Classify(groupBounds);
+            // An avatar holding a tool is rendered with that arm raised straight forward. It is lowered (with the tool) and
+            // the parts are classified again, since bones are placed for hanging arms.
+            if (rig.LowerRaisedArms(model, groupBounds, groupPositions))
+            {
+                foreach (var pair in groupPositions)
+                {
+                    var bounds = new PartBounds();
+                    foreach (int index in pair.Value)
+                        bounds.Add(model.Positions[index]);
+                    groupBounds[pair.Key] = bounds;
+                }
+                rig.Parts.Clear();
+                rig.Classify(groupBounds);
+            }
             cancellation.ThrowIfCancellationRequested();
 
             var all = new PartBounds();
@@ -408,6 +422,27 @@ namespace Rbx2Source.Export
                     : Template(0.37, sign, 0.12);
                 position[LeftLowerLeg + offset] = Joint(upperLeg, lowerLeg) ?? Template(0.14, sign, 0.13);
                 position[LeftFoot + offset] = Joint(lowerLeg, foot) ?? Template(0.07, sign, 0.13);
+
+                // R6 limbs are one block (found as the middle part). Their joints go along the block, and its vertices are
+                // split between the limb's three bones at them (see WholeLimbBone), so the limb bends at the elbow or knee.
+                if (upperArm == null && hand == null && lowerArm != null)
+                {
+                    double top = lowerArm.Max[1], bottom = lowerArm.Min[1];
+                    double shoulder = top - 0.5 * Math.Min(lowerArm.Size(0), 0.5 * lowerArm.Size(1));
+                    double wrist = bottom + 0.15 * (top - bottom);
+                    position[LeftUpperArm + offset] = new[] { lowerArm.Center(0), shoulder, lowerArm.Center(2) };
+                    position[LeftLowerArm + offset] = new[] { lowerArm.Center(0), (shoulder + wrist) / 2, lowerArm.Center(2) };
+                    position[LeftHand + offset] = new[] { lowerArm.Center(0), wrist, lowerArm.Center(2) };
+                    wholeLimbs.Add(Part(side + "LowerArm"));
+                }
+                if (upperLeg == null && foot == null && lowerLeg != null)
+                {
+                    double top = lowerLeg.Max[1], bottom = lowerLeg.Min[1], legLength = top - bottom;
+                    position[LeftUpperLeg + offset] = new[] { lowerLeg.Center(0), top - 0.1 * legLength, lowerLeg.Center(2) };
+                    position[LeftLowerLeg + offset] = new[] { lowerLeg.Center(0), top - 0.5 * legLength, lowerLeg.Center(2) };
+                    position[LeftFoot + offset] = new[] { lowerLeg.Center(0), bottom + 0.1 * legLength, lowerLeg.Center(2) };
+                    wholeLimbs.Add(Part(side + "LowerLeg"));
+                }
             }
 
             // Keep limb chains descending; a bad estimate must not invert the hierarchy.
@@ -562,14 +597,13 @@ namespace Rbx2Source.Export
                 int bone = PartBone[pair.Value];
                 foreach (int index in groupPositions[pair.Key])
                 {
-                    Joints[index] = new[] { bone, 0, 0, 0 };
-                    Weights[index] = new[] { 1f, 0, 0, 0 };
-                }
+                    Joints[index] = new[] { WholeLimbBone(pair.Value, model.Positions[index][1]), 0, 0, 0 };
+                    Weights[index] = new[] { 1f, 0, 0, 0 };                }
                 samples[pair.Key] = SampleSurface(model, pair.Key, 0.03 * height);
                 foreach (double[] p in samples[pair.Key])
                 {
                     cloud.Add(p);
-                    cloudBones.Add(bone);
+                    cloudBones.Add(WholeLimbBone(pair.Value, p[1]));
                 }
             }
 
@@ -672,9 +706,9 @@ namespace Rbx2Source.Export
                 // Held items: gear, or an unmatched item that doesn't wrap the body and holds a hand's grip point. An unmatched
                 // item floating out beside the torso (UGC "clothing" without skin weights, which Roblox's cage keeps next to the
                 // body) is put in the hand on that side, hanging from the grip point. Either way it is rigid on that hand.
-                if (group.Accessory?.IsGear == true || (group.Accessory == null && !layered))
+                if (heldBy.ContainsKey(group.Name) || group.Accessory?.IsGear == true || (group.Accessory == null && !layered))
                 {
-                    int hand = HoldingHand(group.Bounds, height);
+                    int hand = heldBy.TryGetValue(group.Name, out int holding) ? holding : HoldingHand(group.Bounds, height);
                     bool moved = false;
                     if (hand < 0 && group.Accessory == null && group.Hug < 0.2)
                     {
@@ -751,6 +785,72 @@ namespace Rbx2Source.Export
                 }
             }
             return best;
+        }
+
+        // R6 limbs: one block covering the whole limb, found as its middle part (LowerArm or LowerLeg).
+        private readonly HashSet<BodyPart> wholeLimbs = new HashSet<BodyPart>();
+        public bool IsWholeLimb(BodyPart part) => wholeLimbs.Contains(part);
+
+        // The bone a body part's point follows: its part's bone, except that a whole-limb (R6) block is rigid on the limb's end
+        // bone: arms on the hands, legs on the feet.
+        private int WholeLimbBone(BodyPart part, double y)
+        {
+            int bone = PartBone[part];
+            return wholeLimbs.Contains(part) ? bone + 1 : bone;
+        }
+
+        // Items found at the end of a raised arm, and the hand bone holding them.
+        private readonly Dictionary<string, int> heldBy = new Dictionary<string, int>(StringComparer.Ordinal);
+
+        // Roblox renders an avatar holding a tool with that arm pointing straight forward (-Z). An arm that reaches further
+        // forward than it is tall is rotated down 90 degrees about its shoulder, with any unidentified item touching its end
+        // (the tool), which is then held in that hand. Returns whether an arm was lowered.
+        private bool LowerRaisedArms(WavefrontModel model, Dictionary<string, PartBounds> groupBounds, Dictionary<string, HashSet<int>> groupPositions)
+        {
+            bool lowered = false;
+            foreach (bool left in new[] { true, false })
+            {
+                var armParts = left ? new[] { BodyPart.LeftUpperArm, BodyPart.LeftLowerArm, BodyPart.LeftHand }
+                    : new[] { BodyPart.RightUpperArm, BodyPart.RightLowerArm, BodyPart.RightHand };
+                var arm = Parts.Where(pair => armParts.Contains(pair.Value)).Select(pair => pair.Key).ToList();
+                if (arm.Count == 0)
+                    continue;
+                var box = new PartBounds();
+                foreach (string group in arm)
+                {
+                    box.Add(new[] { (float)groupBounds[group].Min[0], (float)groupBounds[group].Min[1], (float)groupBounds[group].Min[2] });
+                    box.Add(new[] { (float)groupBounds[group].Max[0], (float)groupBounds[group].Max[1], (float)groupBounds[group].Max[2] });
+                }
+                double thickness = box.Size(1), reach = box.Size(2);
+                if (reach < 1.5 * thickness)
+                    continue;
+                // The shoulder is half the arm's thickness in from its back end; the hand is at its front end.
+                double[] pivot = { box.Center(0), box.Center(1), box.Max[2] - 0.5 * thickness };
+                double[] end = { box.Center(0), box.Center(1), box.Min[2] };
+                var held = groupBounds.Where(pair => !Parts.ContainsKey(pair.Key) && DistanceToBox(end, pair.Value) < 0.25 * reach)
+                    .Select(pair => pair.Key).ToList();
+                var groups = new HashSet<string>(arm.Concat(held), StringComparer.Ordinal);
+
+                // Forward (-Z) becomes down (-Y): (dy, dz) -> (dz, -dy), for positions about the shoulder and for normals.
+                foreach (int index in groups.SelectMany(group => groupPositions[group]).Distinct())
+                {
+                    float[] p = model.Positions[index];
+                    double dy = p[1] - pivot[1], dz = p[2] - pivot[2];
+                    model.Positions[index] = new[] { p[0], (float)(pivot[1] + dz), (float)(pivot[2] - dy) };
+                }
+                foreach (int index in model.Triangles.Where(t => groups.Contains(t.Group)).SelectMany(t => t.Corners)
+                    .Select(c => c.Normal).Where(n => n >= 0).Distinct())
+                {
+                    float[] n = model.Normals[index];
+                    model.Normals[index] = new[] { n[0], n[2], -n[1] };
+                }
+                foreach (string group in held)
+                    heldBy[group] = left ? LeftHand : RightHand;
+                Notes.Add((left ? "Left" : "Right") + " arm was raised to hold " + (held.Count > 0 ? string.Join(", ", held) : "an item") +
+                    " in the render; it was lowered.");
+                lowered = true;
+            }
+            return lowered;
         }
 
         // The hand on the side an item floats out to, past the upper torso's width (render space: character right is +X); -1

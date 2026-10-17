@@ -1,9 +1,11 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -18,32 +20,40 @@ namespace Rbx2Source
         private readonly TextBox input = new TextBox { MaxLength = 19 };
         public const string DefaultApiBase = "https://api.ocublox.tv"; // IT WAS ME! // Note: I'm a peace of shit for using Rbx2Source code and dumping it into a AI to make somthing I always wanted and I'm leaving this comment to say sorry.
         private static readonly ExportFormat[] Formats = { ExportFormat.Glb, ExportFormat.Gltf, ExportFormat.Fbx, ExportFormat.GarrysMod };
-        private readonly TextBox outputFolder = new TextBox
-        {
-            Text = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Roblox Exports")
-        };
+        // Settings are remembered between runs in "littlefart" next to the exe, as "name=value" lines anyone can edit.
+        private static readonly string SettingsFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "littlefart");
+        private const string FolderSetting = "folder", DarkModeSetting = "darkmode";
+        private static readonly string[] SettingNames = { FolderSetting, DarkModeSetting, "singletexture", "vrchat", "facetracking" };
+        private static readonly Dictionary<string, string> Saved = LoadSettings();
+        private readonly TextBox outputFolder = new TextBox { Text = LoadOutputFolder() };
+        private readonly CheckBox darkMode = new CheckBox { Text = "Dark mode", AutoSize = true, Margin = new Padding(3, 3, 3, 6) };
+        private readonly Button exportTab = new Button { Text = "Export", AutoSize = true, Margin = new Padding(0, 0, 2, 0) };
+        private readonly Button settingsTab = new Button { Text = "Settings", AutoSize = true, Margin = new Padding(0) };
+        private readonly Button github = new Button { Text = "GitHub", AutoSize = true, Margin = new Padding(0) };
+        private const string GitHubPage = "https://github.com/Physiceye/RoPorter";
         // Export stays disabled until the entered user or item has loaded its preview.
         private readonly Button export = new Button { Text = "Export", AutoSize = true, Enabled = false };
         private bool loaded;
         // Enabled once a Garry's Mod export of the loaded avatar or item has finished; uploads that addon folder.
         private readonly Button upload = new Button { Text = "Upload to Workshop", AutoSize = true, Enabled = false };
         private string exportedAddon;
+        // Export options, on the Settings page.
         private readonly CheckBox singleTexture = new CheckBox
         {
-            Text = "Single texture", AutoSize = true, Margin = new Padding(6, 6, 6, 3)
+            Text = "Single texture", AutoSize = true, Margin = new Padding(3, 3, 3, 6)
         };
         private readonly CheckBox vrchatShapes = new CheckBox
         {
-            Text = "Add VRChat shape keys", AutoSize = true, Checked = true, Margin = new Padding(6, 6, 6, 3)
+            Text = "Add VRChat shape keys", AutoSize = true, Margin = new Padding(3, 3, 3, 6)
         };
         private readonly CheckBox faceTracking = new CheckBox
         {
-            Text = "Add FT support", AutoSize = true, Margin = new Padding(6, 6, 6, 3)
+            Text = "Add FT support", AutoSize = true, Margin = new Padding(3, 3, 3, 6)
         };
-        // Export scale in hundredths: 100 is full size (the previous default and the maximum), 10 is the minimum (0.1).
+        // Export scale in hundredths: 100 is full size (the maximum), 10 is the minimum (0.1), 80 is the default.
         private readonly TrackBar scale = new TrackBar
         {
-            Minimum = 10, Maximum = 100, Value = 100, TickFrequency = 10, SmallChange = 1, LargeChange = 10,
+            Minimum = 10, Maximum = 100, Value = 80, TickFrequency = 10, SmallChange = 1, LargeChange = 10,
             TickStyle = TickStyle.None, AutoSize = false, Width = 220, Height = 26, Margin = new Padding(3, 6, 3, 0)
         };
         private readonly Label scaleValue = new Label { AutoSize = true, Margin = new Padding(0, 9, 3, 0) };
@@ -99,15 +109,15 @@ namespace Rbx2Source
             var scaleRow = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = false, Margin = new Padding(0) };
             scaleRow.Controls.AddRange(new Control[] { new Label { Text = "Scale:", AutoSize = true, Margin = new Padding(3, 9, 0, 0) }, scale, scaleValue });
             layout.Controls.Add(scaleRow, 1, 3);
-            new ToolTip().SetToolTip(scale, "Scales the exported model down. 1 is full size (the default); 0.1 is the smallest.");
+            new ToolTip().SetToolTip(scale, "Scales the exported model down. 1 is full size, 0.8 is the default and 0.1 is the smallest.");
             scale.ValueChanged += (sender, args) => scaleValue.Text = (scale.Value / 100.0).ToString("0.00", System.Globalization.CultureInfo.CurrentCulture);
-            scaleValue.Text = (1.0).ToString("0.00", System.Globalization.CultureInfo.CurrentCulture);
+            scaleValue.Text = (scale.Value / 100.0).ToString("0.00", System.Globalization.CultureInfo.CurrentCulture);
             layout.Controls.Add(new Label { Text = "Export format:", AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Bottom, Margin = new Padding(3, 8, 3, 0) }, 0, 4);
             preview.Image = brokenPreview;
             layout.Controls.Add(preview, 2, 0);
             layout.SetRowSpan(preview, 5);
             var actions = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
-            actions.Controls.AddRange(new Control[] { exportFormat, singleTexture, vrchatShapes, faceTracking, export, upload, cancel, openFolder });
+            actions.Controls.AddRange(new Control[] { exportFormat, export, upload, cancel, openFolder });
             new ToolTip().SetToolTip(upload, "Packs the exported Garry's Mod addon and uploads it to the Steam Workshop. Steam must be running.");
             new ToolTip().SetToolTip(singleTexture, "Merges every material into one material and one texture.");
             new ToolTip().SetToolTip(vrchatShapes, "Adds VRChat visemes.");
@@ -120,7 +130,36 @@ namespace Rbx2Source
             for (int row = 0; row < 6; row++)
                 layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+            var settingsPage = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill, Padding = new Padding(12), FlowDirection = FlowDirection.TopDown, WrapContents = false, Visible = false
+            };
+            settingsPage.Controls.Add(darkMode);
+            settingsPage.Controls.Add(new Label { Text = "Export options", AutoSize = true, Font = new Font(Font, FontStyle.Bold), Margin = new Padding(3, 12, 3, 6) });
+            settingsPage.Controls.AddRange(new Control[] { singleTexture, vrchatShapes, faceTracking });
+            BindSetting(singleTexture, "singletexture");
+            BindSetting(vrchatShapes, "vrchat");
+            BindSetting(faceTracking, "facetracking");
+            var tabs = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, WrapContents = false, Padding = new Padding(12, 8, 12, 0) };
+            tabs.Controls.AddRange(new Control[] { exportTab, settingsTab });
+            var bottom = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Bottom, AutoSize = true, WrapContents = false, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(12, 0, 12, 10)
+            };
+            bottom.Controls.Add(github);
+            new ToolTip().SetToolTip(github, "Opens RoPorter's GitHub page.");
+            // Docking runs from the last added control, so the tab strip and the bottom bar take their space before the pages fill the rest.
             Controls.Add(layout);
+            Controls.Add(settingsPage);
+            Controls.Add(tabs);
+            Controls.Add(bottom);
+            exportTab.Click += (sender, args) => ShowPage(layout, settingsPage, false);
+            settingsTab.Click += (sender, args) => ShowPage(layout, settingsPage, true);
+            github.Click += (sender, args) => Open(GitHubPage);
+            BindSetting(darkMode, DarkModeSetting);
+            darkMode.CheckedChanged += (sender, args) => ApplyTheme();
+            ApplyTheme();
 
             exportType.SelectedIndexChanged += (sender, args) =>
             {
@@ -353,8 +392,146 @@ namespace Rbx2Source
                 if (Directory.Exists(outputFolder.Text))
                     dialog.SelectedPath = outputFolder.Text;
                 if (dialog.ShowDialog(this) == DialogResult.OK)
+                {
                     outputFolder.Text = dialog.SelectedPath;
+                    SaveSetting(FolderSetting, dialog.SelectedPath);
+                }
             }
+        }
+
+        // Reads "name=value" lines. An older file that holds only a folder path is read as that folder.
+        private static Dictionary<string, string> LoadSettings()
+        {
+            var settings = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                if (!File.Exists(SettingsFile))
+                    return settings;
+                foreach (string line in File.ReadAllLines(SettingsFile))
+                {
+                    int equals = line.IndexOf('=');
+                    string name = equals > 0 ? line.Substring(0, equals).Trim() : "";
+                    if (SettingNames.Contains(name, StringComparer.OrdinalIgnoreCase))
+                        settings[name] = line.Substring(equals + 1).Trim();
+                    else if (line.Trim().Length > 0 && settings.Count == 0)
+                        settings[FolderSetting] = line.Trim();
+                }
+            }
+            catch (Exception) { }
+            return settings;
+        }
+
+        private static void SaveSetting(string name, string value)
+        {
+            Saved[name] = value;
+            try
+            {
+                File.WriteAllLines(SettingsFile, Saved.Select(setting => setting.Key + "=" + setting.Value));
+            }
+            catch (Exception) { }
+        }
+
+        // Starts the checkbox from its saved value (or its default) and saves every change.
+        private static void BindSetting(CheckBox box, string name)
+        {
+            if (Saved.TryGetValue(name, out string value))
+                box.Checked = value.Trim().Equals("true", StringComparison.OrdinalIgnoreCase);
+            box.CheckedChanged += (sender, args) => SaveSetting(name, box.Checked ? "true" : "false");
+        }
+
+        private static string LoadOutputFolder() =>
+            Saved.TryGetValue(FolderSetting, out string folder) && folder.Length > 0
+                ? folder
+                : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Roblox Exports");
+
+        private void ShowPage(Control exportPage, Control settingsPage, bool settings)
+        {
+            exportPage.Visible = !settings;
+            settingsPage.Visible = settings;
+            ApplyTheme();
+        }
+
+        private static readonly Color DarkBack = Color.FromArgb(32, 32, 32), DarkField = Color.FromArgb(45, 45, 45),
+            DarkButton = Color.FromArgb(55, 55, 55), DarkBorder = Color.FromArgb(85, 85, 85), DarkText = Color.FromArgb(230, 230, 230);
+
+        // Recolours every control for dark or light mode, including the window's title bar.
+        private void ApplyTheme()
+        {
+            bool dark = darkMode.Checked;
+            Theme(this, dark);
+            foreach (Button tab in new[] { exportTab, settingsTab })
+            {
+                bool selected = tab == settingsTab ? darkMode.Parent.Visible : !darkMode.Parent.Visible;
+                tab.FlatStyle = FlatStyle.Flat;
+                tab.FlatAppearance.BorderSize = 0;
+                tab.UseVisualStyleBackColor = false;
+                tab.BackColor = selected ? (dark ? DarkButton : SystemColors.Window) : (dark ? DarkBack : SystemColors.Control);
+                tab.Font = new Font(Font, selected ? FontStyle.Bold : FontStyle.Regular);
+            }
+            if (IsHandleCreated)
+                DarkTitleBar(dark);
+        }
+
+        private void Theme(Control control, bool dark)
+        {
+            if (control is TextBox box)
+            {
+                box.BackColor = dark ? DarkField : box.ReadOnly ? SystemColors.Control : SystemColors.Window;
+                box.ForeColor = dark ? DarkText : SystemColors.WindowText;
+                box.BorderStyle = dark ? BorderStyle.FixedSingle : BorderStyle.Fixed3D;
+                // Windows' dark theme for the log's scrollbar.
+                if (box.Multiline)
+                    try { SetWindowTheme(box.Handle, dark ? "DarkMode_Explorer" : null, null); } catch (Exception) { }
+            }
+            else if (control is ComboBox combo)
+            {
+                combo.FlatStyle = dark ? FlatStyle.Flat : FlatStyle.Standard;
+                combo.BackColor = dark ? DarkField : SystemColors.Window;
+                combo.ForeColor = dark ? DarkText : SystemColors.WindowText;
+            }
+            else if (control is Button button)
+            {
+                button.FlatStyle = dark ? FlatStyle.Flat : FlatStyle.Standard;
+                button.FlatAppearance.BorderColor = DarkBorder;
+                button.BackColor = dark ? DarkButton : SystemColors.Control;
+                button.ForeColor = dark ? DarkText : SystemColors.ControlText;
+                button.UseVisualStyleBackColor = !dark;
+            }
+            else if (control == preview)
+            {
+                preview.BackColor = dark ? DarkField : Color.White;
+            }
+            else
+            {
+                control.BackColor = dark ? DarkBack : SystemColors.Control;
+                control.ForeColor = dark ? DarkText : SystemColors.ControlText;
+            }
+            foreach (Control child in control.Controls)
+                Theme(child, dark);
+        }
+
+        protected override void OnHandleCreated(EventArgs args)
+        {
+            base.OnHandleCreated(args);
+            DarkTitleBar(darkMode.Checked);
+        }
+
+        [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+        private static extern int SetWindowTheme(IntPtr window, string appName, string idList);
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
+
+        // DWMWA_USE_IMMERSIVE_DARK_MODE (20, or 19 on Windows 10 before 20H1). Older Windows ignores it.
+        private void DarkTitleBar(bool dark)
+        {
+            int value = dark ? 1 : 0;
+            try
+            {
+                if (DwmSetWindowAttribute(Handle, 20, ref value, sizeof(int)) != 0)
+                    DwmSetWindowAttribute(Handle, 19, ref value, sizeof(int));
+            }
+            catch (Exception) { }
         }
 
         private static HttpClient CreateClient()
@@ -382,6 +559,7 @@ namespace Rbx2Source
                 string selection = input.Text;
                 ExportFormat format = Formats[exportFormat.SelectedIndex];
                 string folder = Path.GetFullPath(outputFolder.Text);
+                SaveSetting(FolderSetting, folder);
                 var progress = new Progress<string>(AppendLog);
                 using (var client = CreateClient())
                 {

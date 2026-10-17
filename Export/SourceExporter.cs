@@ -264,6 +264,36 @@ namespace Rbx2Source.Export
             }
             double[] Fit(double[] p, char side) => Matrix.Add(pivot[side], Matrix.Scale(Matrix.Subtract(p, pivot[side]), scale[side]));
 
+            // R6 arms are one block, rigid on the hand in the playermodel. Viewmodel animations turn the hand well away from
+            // the forearm, which swings a hand-rigid block across the screen, so here the block runs from the shoulder to the
+            // hand instead: the part past the wrist stays on the hand and the rest blends to the upper arm towards the shoulder.
+            var wholeArm = new Dictionary<int, int>();
+            var wholeSides = new HashSet<char>();
+            foreach (char side in new[] { 'L', 'R' })
+                if (scene.Rig.IsWholeLimb(side == 'L' ? BodyPart.LeftLowerArm : BodyPart.RightLowerArm))
+                {
+                    wholeSides.Add(side);
+                    wholeArm[bones.FindIndex(b => b.Name == Prefix + side + "_Hand")] = bones.FindIndex(b => b.Name == Prefix + side + "_UpperArm");
+                }
+            List<KeyValuePair<int, double>> ArmLinks(int position)
+            {
+                var links = Links(position, scene.Rig, boneOf).Where(l => l.Key != spine && map.ContainsKey(l.Key)).ToList();
+                if (links.Count != 1 || !wholeArm.TryGetValue(links[0].Key, out int upper) || upper < 0)
+                    return links;
+                int hand = links[0].Key;
+                double[] toShoulder = Matrix.Subtract(bones[upper].Position, bones[hand].Position);
+                double length = Matrix.Length(toShoulder);
+                if (length < 1e-6)
+                    return links;
+                double[] p = ToSource(scene.Point(model.Positions[position]), units);
+                double t = Math.Max(0, Math.Min(1, Matrix.Dot(Matrix.Subtract(p, bones[hand].Position), toShoulder) / (length * length)));
+                if (t <= 0)
+                    return links;
+                if (t >= 1)
+                    return new List<KeyValuePair<int, double>> { new KeyValuePair<int, double>(upper, 1) };
+                return new List<KeyValuePair<int, double>> { new KeyValuePair<int, double>(hand, 1 - t), new KeyValuePair<int, double>(upper, t) };
+            }
+
             // Roblox arms are much thicker for their length than Valve's (a blocky arm is half as wide as it is long), so a
             // uniformly fitted arm fills the bottom of the first-person view. Across the arm, each side is instead scaled to
             // about Valve's thickness: the offset from the upper arm or forearm axis shrinks; arms already that thin keep it.
@@ -290,7 +320,7 @@ namespace Rbx2Source.Export
             var radii = new Dictionary<char, List<double>> { ['L'] = new List<double>(), ['R'] = new List<double>() };
             foreach (int position in model.Triangles.Where(include).SelectMany(t => t.Corners).Select(c => c.Position).Distinct())
             {
-                var links = Links(position, scene.Rig, boneOf).Where(l => l.Key != spine && map.ContainsKey(l.Key)).ToList();
+                var links = ArmLinks(position);
                 if (links.Sum(l => l.Value) < 0.5)
                     continue;
                 string part = PartOf(links.OrderByDescending(l => l.Value).First().Key, out char side);
@@ -331,7 +361,7 @@ namespace Rbx2Source.Export
                 var reaches = new List<double>();
                 foreach (int position in model.Triangles.Where(include).SelectMany(t => t.Corners).Select(c => c.Position).Distinct())
                 {
-                    var links = Links(position, scene.Rig, boneOf).Where(l => l.Key != spine && map.ContainsKey(l.Key)).ToList();
+                    var links = ArmLinks(position);
                     if (links.Sum(l => l.Value) < 0.5)
                         continue;
                     string part = PartOf(links.OrderByDescending(l => l.Value).First().Key, out char linkSide);
@@ -342,6 +372,17 @@ namespace Rbx2Source.Export
                 List<double> sorted = reaches.OrderBy(r => r).ToList();
                 double reach = sorted.Count > 0 ? sorted[Math.Min(sorted.Count - 1, (int)(sorted.Count * 0.95))] : 0;
                 shorten[side] = reach > valveReach ? valveReach / reach : 1;
+            }
+
+            var upperAxis = new Dictionary<char, double[]>();
+            var shoulderCap = new Dictionary<char, double>();
+            foreach (char side in new[] { 'L', 'R' })
+            {
+                double[] Valve(string bone) => valve.Find(Prefix + side + "_" + bone).WorldPosition;
+                double[] axis = Matrix.Subtract(bones.First(b => b.Name == Prefix + side + "_Forearm").Position, pivot[side]);
+                double axisLength = Matrix.Length(axis);
+                upperAxis[side] = axisLength > 1e-6 ? Matrix.Scale(axis, 1 / axisLength) : new double[] { 0, 0, -1 };
+                shoulderCap[side] = ArmRadius * (Matrix.Length(Matrix.Subtract(Valve("Forearm"), Valve("UpperArm"))) + Matrix.Length(Matrix.Subtract(Valve("Hand"), Valve("Forearm"))));
             }
 
             // The thinning is blended by the vertex's skin weights, so it changes smoothly across the elbow and wrist instead of
@@ -362,6 +403,14 @@ namespace Rbx2Source.Export
                 double past = Matrix.Dot(Matrix.Subtract(result, wrist[side]), forearmAxis[side]);
                 if (past > 0)
                     result = Matrix.Subtract(result, Matrix.Scale(forearmAxis[side], past * (1 - shorten[side])));
+                // An R6 block also reaches about half its width above the shoulder joint (10 units once fitted, nearly a
+                // whole Valve upper arm), which rises in front of the first-person camera. It is flattened to the arm's radius.
+                if (wholeSides.Contains(side))
+                {
+                    double behind = -Matrix.Dot(Matrix.Subtract(result, pivot[side]), upperAxis[side]);
+                    if (behind > shoulderCap[side])
+                        result = Matrix.Add(result, Matrix.Scale(upperAxis[side], behind - shoulderCap[side]));
+                }
                 return result;
             }
 
@@ -381,7 +430,7 @@ namespace Rbx2Source.Export
             foreach (ObjTriangle triangle in model.Triangles.Where(include))
             {
                 cancellation.ThrowIfCancellationRequested();
-                var corners = triangle.Corners.Select(c => Links(c.Position, scene.Rig, boneOf).Where(l => l.Key != spine && map.ContainsKey(l.Key)).ToList()).ToList();
+                var corners = triangle.Corners.Select(c => ArmLinks(c.Position)).ToList();
                 if (corners.Any(links => links.Sum(l => l.Value) < 0.5))
                     continue;
                 triangles++;
