@@ -48,9 +48,9 @@ namespace Rbx2Source.Export
         [DllImport("kernel32", CharSet = CharSet.Ansi, ExactSpelling = true)]
         private static extern IntPtr GetProcAddress(IntPtr module, string name);
 
-        // Entry point for "--workshop-details <id> <addon folder>": 0 on success, with what was set as the last output line;
-        // otherwise the reason is written to the error output. The description comes from the addon's addon.json; the page
-        // image (workshop_preview.jpg) is added once, after which a marker file stops later uploads adding it again.
+        // Entry point for "--workshop-details <id> <addon folder>", run once when the Workshop item is created: 0 on success,
+        // with what was set as the last output line; otherwise the reason is written to the error output. The description
+        // comes from the addon's addon.json; the page image is its workshop_preview.jpg.
         public static int Run(string[] args)
         {
             try
@@ -60,16 +60,10 @@ namespace Rbx2Source.Export
                 string folder = Path.GetFullPath(args[2]);
                 string description = Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(Path.Combine(folder, "addon.json"))).Value<string>("description");
                 string preview = Path.Combine(folder, Workshop.PreviewFile);
-                string marker = Path.Combine(folder, Workshop.PreviewAddedFile.Replace('/', Path.DirectorySeparatorChar));
-                bool addPreview = File.Exists(preview) && !File.Exists(marker);
+                bool addPreview = File.Exists(preview);
                 if (string.IsNullOrWhiteSpace(description) && !addPreview)
                     return 0;
                 Update(item, description, addPreview ? preview : null);
-                if (addPreview)
-                {
-                    Directory.CreateDirectory(Path.GetDirectoryName(marker));
-                    File.WriteAllText(marker, DateTime.UtcNow.ToString("o", System.Globalization.CultureInfo.InvariantCulture));
-                }
                 Console.WriteLine(string.IsNullOrWhiteSpace(description) ? "Added the Workshop page image"
                     : addPreview ? "Set the Workshop description and added the page image" : "Set the Workshop description");
                 return 0;

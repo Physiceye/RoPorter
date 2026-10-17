@@ -915,8 +915,10 @@ namespace Rbx2Source.Export
                 }
                 else
                 {
-                    // Without accessory metadata, layered clothing is recognised by how closely it wraps the body.
-                    layered = group.Hug >= 0.6;
+                    // Without accessory metadata, layered clothing is recognised by how closely it wraps the body. With it,
+                    // every layered item was matched by its mesh or position, so a leftover group is a rigid accessory (or a
+                    // part of one): Roblox welds those to a single body part, here the one it is mostly around.
+                    layered = accessories == null && group.Hug >= 0.6;
                     bone = group.Majority;
                 }
                 // Gear, or an unmatched item that doesn't wrap the body but holds a hand's grip point, is held in that hand.
@@ -1341,15 +1343,20 @@ namespace Rbx2Source.Export
                     double[] point = AccessoryInfo.AttachmentPoint(accessory.Attachment, PartBoxes[accessory.Part]);
                     double distance = DistanceToBox(point, groups[g].Bounds) / height;
                     cost[g, a] = 3 * distance + (accessory.Layered ? 1 - groups[g].Hug : 0.5 * groups[g].Hug);
-                    if (accessory.Mesh != null)
-                    {
-                        meshMatch[g, a] = SkinTransfer.Match(model, groupTriangles, accessory.Mesh) != null;
-                        if (!meshMatch[g, a])
-                            cost[g, a] += MeshMismatch;
-                    }
+                    meshMatch[g, a] = accessory.Mesh != null && SkinTransfer.Match(model, groupTriangles, accessory.Mesh) != null;
                 }
                 for (int d = 0; d < groups.Count; d++)
                     cost[g, accessories.Count + d] = Unmatched;
+            }
+            // The penalty only applies where a mesh identified something: an accessory whose mesh matched a group, or a
+            // group another accessory's mesh matched. An accessory whose mesh matches nothing (older meshes, parts Roblox
+            // renders differently) is matched by position as before.
+            for (int a = 0; a < accessories.Count; a++)
+            {
+                bool identified = Enumerable.Range(0, groups.Count).Any(g => meshMatch[g, a]);
+                for (int g = 0; g < groups.Count; g++)
+                    if (!meshMatch[g, a] && (identified || Enumerable.Range(0, accessories.Count).Any(other => meshMatch[g, other])))
+                        cost[g, a] += MeshMismatch;
             }
             int[] assignment = AccessoryInfo.Assign(cost);
             for (int g = 0; g < groups.Count; g++)

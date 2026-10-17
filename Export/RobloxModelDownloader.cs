@@ -1145,14 +1145,10 @@ namespace Rbx2Source.Export
                         {
                             progress?.Report("Workshop page image skipped (" + error.Message + ").");
                         }
-                    // A re-export keeps the Workshop item of the last upload (and whether its page image was added), so
-                    // uploading again updates it.
+                    // A re-export keeps the Workshop item of the last upload, so uploading again updates it.
                     long? published = Workshop.IsAddon(destination) ? Workshop.PublishedId(destination) : null;
                     if (published.HasValue)
                         Workshop.SetPublishedId(staging, published.Value);
-                    string previewAdded = Path.Combine(destination, Workshop.PreviewAddedFile.Replace('/', Path.DirectorySeparatorChar));
-                    if (File.Exists(previewAdded))
-                        File.Copy(previewAdded, Path.Combine(staging, Workshop.PreviewAddedFile.Replace('/', Path.DirectorySeparatorChar)), true);
                 }
                 else if (format == ExportFormat.Fbx)
                     FbxWriter.Write(new ExportScene(model, rig, face, scale), textures, maps, Path.Combine(staging, fileName), cancellation);

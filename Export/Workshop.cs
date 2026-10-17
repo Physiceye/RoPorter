@@ -140,14 +140,11 @@ namespace Rbx2Source.Export
             }
         }
 
-        // Marks that RoPorter added the page image to the Workshop item, so later updates don't add it again.
-        public const string PreviewAddedFile = "src/workshop_preview_added.txt";
-
         public const string DetailsArgument = "--workshop-details";
 
-        // gmpublish sets the item's title but not its description, and cannot add page images. A separate RoPorter process
-        // (see SteamPreview) sets the description from addon.json and adds the page image, since signing in to Steam as
-        // Garry's Mod lasts until the process exits.
+        // gmpublish sets the item's title but not its description, and cannot add page images. When an item is created, a
+        // separate RoPorter process (see SteamPreview) sets the description from addon.json and adds the page image, since
+        // signing in to Steam as Garry's Mod lasts until the process exits.
         private static async Task UpdateDetailsAsync(string folder, long id, IProgress<string> progress, CancellationToken cancellation)
         {
             progress?.Report("Setting the Workshop description and page image...");
@@ -232,8 +229,9 @@ namespace Rbx2Source.Export
                 {
                     if (published.Key != 0)
                         throw new InvalidDataException("gmpublish could not update the addon:\n" + Tail(output));
+                    // Updates replace only the addon and its icon: the description and page image were set when the item
+                    // was created, and may have been edited on its Workshop page since.
                     SetPublishedId(folder, existing.Value);
-                    await UpdateDetailsAsync(folder, existing.Value, progress, cancellation).ConfigureAwait(false);
                     return existing.Value;
                 }
                 Match uid = Regex.Match(output, @"UID:\s*(\d+)", RegexOptions.IgnoreCase);

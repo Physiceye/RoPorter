@@ -69,6 +69,16 @@ namespace Rbx2Source.Export
                     cells[key] = list = new List<int>();
                 list.Add(vertex);
             }
+            // Left and right halves (a pair of socks or shoes) often share mirrored UV islands, and their front faces point the
+            // same way, so the normal alone can pick the wrong side, giving a vertex the other leg's weights. The side of
+            // the item's centre the vertex is on (character right is +X in the mesh and in the render) settles it.
+            double meshMin = used.Min(v => mesh.Positions[v][0]), meshMax = used.Max(v => mesh.Positions[v][0]);
+            var rendered = triangles.SelectMany(t => t.Corners).Select(c => c.Position).Distinct().ToList();
+            double renderMin = rendered.Min(p => model.Positions[p][0]), renderMax = rendered.Max(p => model.Positions[p][0]);
+            double meshCenter = (meshMin + meshMax) / 2, renderCenter = (renderMin + renderMax) / 2;
+            double meshMargin = 0.05 * (meshMax - meshMin), renderMargin = 0.05 * (renderMax - renderMin);
+            int Side(double x, double center, double margin) => x > center + margin ? 1 : x < center - margin ? -1 : 0;
+
             var map = new Dictionary<int, int>();
             foreach (ObjCorner corner in triangles.SelectMany(t => t.Corners))
             {
@@ -76,6 +86,7 @@ namespace Rbx2Source.Export
                     continue;
                 float[] uv = model.Texcoords[corner.Texture];
                 float[] normal = corner.Normal >= 0 ? model.Normals[corner.Normal] : null;
+                int side = Side(model.Positions[corner.Position][0], renderCenter, renderMargin);
                 int best = -1;
                 double bestScore = double.MaxValue;
                 int cu = (int)Math.Floor(uv[0] / Cell), cv = (int)Math.Floor(uv[1] / Cell);
@@ -91,8 +102,10 @@ namespace Rbx2Source.Export
                                 continue;
                             // Mirrored UV islands share coordinates; the closer normal picks the right side.
                             float[] n = mesh.Normals[vertex];
+                            int meshSide = Side(mesh.Positions[vertex][0], meshCenter, meshMargin);
                             double score = Math.Abs(uv[0] - t[0]) + Math.Abs(uv[1] - t[1]) +
-                                (normal != null ? 0.01 * (1 - (normal[0] * n[0] + normal[1] * n[1] + normal[2] * n[2])) : 0);
+                                (normal != null ? 0.01 * (1 - (normal[0] * n[0] + normal[1] * n[1] + normal[2] * n[2])) : 0) +
+                                (side != 0 && meshSide != 0 && side != meshSide ? 1 : 0);
                             if (score < bestScore)
                             {
                                 bestScore = score;
