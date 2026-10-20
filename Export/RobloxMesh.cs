@@ -53,11 +53,11 @@ namespace Rbx2Source.Export
         public static RobloxMesh Parse(byte[] data)
         {
             if (data == null || data.Length < 13)
-                throw new InvalidDataException("The head mesh is empty or truncated.");
+                throw new InvalidDataException("The mesh is empty or truncated.");
             int newline = Array.IndexOf(data, (byte)'\n', 0, Math.Min(data.Length, 32));
             string header = Encoding.ASCII.GetString(data, 0, newline < 0 ? 12 : newline).Trim();
             if (!header.StartsWith("version ", StringComparison.Ordinal))
-                throw new InvalidDataException("The head asset is not a Roblox mesh.");
+                throw new InvalidDataException("The asset is not a Roblox mesh.");
             var mesh = new RobloxMesh { Version = header.Substring(8) };
             int major = mesh.Version.Length > 0 ? mesh.Version[0] - '0' : 0;
             if (major < 2)
@@ -77,11 +77,13 @@ namespace Rbx2Source.Export
                 }
                 catch (EndOfStreamException error)
                 {
-                    throw new InvalidDataException("The head mesh is truncated.", error);
+                    throw new InvalidDataException("The mesh is truncated.", error);
                 }
             }
+            if (mesh.invalidVertices.Count > 0)
+                mesh.Faces.RemoveAll(face => face.Any(mesh.invalidVertices.Contains));
             if (mesh.Positions.Count == 0 || mesh.Faces.Count == 0)
-                throw new InvalidDataException("The head mesh contains no geometry.");
+                throw new InvalidDataException("The mesh contains no geometry.");
             return mesh;
         }
 
@@ -171,7 +173,7 @@ namespace Rbx2Source.Export
                 uint version = reader.ReadUInt32();
                 uint size = reader.ReadUInt32();
                 if (size > reader.BaseStream.Length - reader.BaseStream.Position)
-                    throw new InvalidDataException("The head mesh chunk " + type + " is truncated.");
+                    throw new InvalidDataException("The mesh chunk " + type + " is truncated.");
                 var chunk = new BinaryReader(new MemoryStream(reader.ReadBytes((int)size)));
                 switch (type)
                 {
@@ -223,12 +225,12 @@ namespace Rbx2Source.Export
                 }
             }
             if (faces == null)
-                throw new InvalidDataException("The head mesh has no COREMESH chunk.");
+                throw new InvalidDataException("The mesh has no COREMESH chunk.");
             AddLod0(faces, lods);
             if (skinning != null && subsets != null)
             {
                 if (skinning.Length != Positions.Count)
-                    throw new InvalidDataException("The head mesh skinning does not match its vertices.");
+                    throw new InvalidDataException("The mesh skinning does not match its vertices.");
                 ApplySkinning(skinning, subsets);
             }
         }
@@ -236,7 +238,7 @@ namespace Rbx2Source.Export
         private static void CheckCount(uint count, BinaryReader reader, int stride)
         {
             if ((long)count * stride > reader.BaseStream.Length - reader.BaseStream.Position)
-                throw new InvalidDataException("The head mesh declares more data than it contains.");
+                throw new InvalidDataException("The mesh declares more data than it contains.");
         }
 
         // Mesh v7 stores its geometry as a Draco bitstream. Its points keep Roblox's vertex order, which the
@@ -279,11 +281,7 @@ namespace Rbx2Source.Export
                     uv.GetValue(uv.MappedIndex(point), value);
                     t = new[] { value[0], 1 - value[1] };
                 }
-                if (p.Concat(n).Concat(t).Any(v => float.IsNaN(v) || float.IsInfinity(v)))
-                    throw new InvalidDataException("The head mesh contains invalid vertex data.");
-                Positions.Add(p);
-                Normals.Add(n);
-                Texcoords.Add(t);
+                AddVertex(p, n, t);
             }
             var faces = new List<int[]>(draco.NumFaces);
             var face = new int[3];
@@ -291,7 +289,7 @@ namespace Rbx2Source.Export
             {
                 draco.ReadFace(i, face);
                 if (face.Any(index => index < 0 || index >= Positions.Count))
-                    throw new InvalidDataException("The head mesh has an out-of-range face index.");
+                    throw new InvalidDataException("The mesh has an out-of-range face index.");
                 faces.Add((int[])face.Clone());
             }
             return faces;
@@ -329,6 +327,24 @@ namespace Rbx2Source.Export
                 Faces.Add(new[] { face * 3, face * 3 + 1, face * 3 + 2 });
         }
 
+        // Vertices whose position is not a number (stray vertices some exporters leave in, which Roblox ignores). Faces
+        // using them are dropped once the mesh is read.
+        private readonly HashSet<int> invalidVertices = new HashSet<int>();
+
+        private static bool Finite(float[] values) => values.All(value => !float.IsNaN(value) && !float.IsInfinity(value));
+
+        private void AddVertex(float[] p, float[] n, float[] uv)
+        {
+            if (!Finite(p))
+            {
+                invalidVertices.Add(Positions.Count);
+                p = new float[3];
+            }
+            Positions.Add(p);
+            Normals.Add(Finite(n) ? n : new float[] { 0, 1, 0 });
+            Texcoords.Add(Finite(uv) ? uv : new float[2]);
+        }
+
         private void ReadVertices(BinaryReader reader, uint count, int stride)
         {
             if (stride < 36)
@@ -341,11 +357,7 @@ namespace Rbx2Source.Export
                 var p = new[] { BitConverter.ToSingle(vertex, 0), BitConverter.ToSingle(vertex, 4), BitConverter.ToSingle(vertex, 8) };
                 var n = new[] { BitConverter.ToSingle(vertex, 12), BitConverter.ToSingle(vertex, 16), BitConverter.ToSingle(vertex, 20) };
                 var uv = new[] { BitConverter.ToSingle(vertex, 24), 1 - BitConverter.ToSingle(vertex, 28) };
-                if (p.Concat(n).Concat(uv).Any(value => float.IsNaN(value) || float.IsInfinity(value)))
-                    throw new InvalidDataException("The head mesh contains invalid vertex data.");
-                Positions.Add(p);
-                Normals.Add(n);
-                Texcoords.Add(uv);
+                AddVertex(p, n, uv);
             }
         }
 
@@ -357,7 +369,7 @@ namespace Rbx2Source.Export
             {
                 var face = new[] { (int)reader.ReadUInt32(), (int)reader.ReadUInt32(), (int)reader.ReadUInt32() };
                 if (face.Any(index => index < 0 || index >= Positions.Count))
-                    throw new InvalidDataException("The head mesh has an out-of-range face index.");
+                    throw new InvalidDataException("The mesh has an out-of-range face index.");
                 faces.Add(face);
             }
             return faces;
@@ -391,11 +403,11 @@ namespace Rbx2Source.Export
             {
                 int start = (int)nameIndices[i];
                 if (start >= table.Length)
-                    throw new InvalidDataException("The head mesh has an invalid bone name.");
+                    throw new InvalidDataException("The mesh has an invalid bone name.");
                 int end = Array.IndexOf(table, (byte)0, start);
                 Bones[i].Name = Encoding.UTF8.GetString(table, start, (end < 0 ? table.Length : end) - start);
                 if (Bones[i].Parent >= nameIndices.Length)
-                    throw new InvalidDataException("The head mesh has an invalid bone parent.");
+                    throw new InvalidDataException("The mesh has an invalid bone parent.");
             }
         }
 
@@ -432,7 +444,7 @@ namespace Rbx2Source.Export
                         if (weight == 0)
                             continue;
                         if (local >= 26 || subset.BoneIndices[local] < 0 || subset.BoneIndices[local] >= Bones.Count)
-                            throw new InvalidDataException("The head mesh has an invalid skinning bone index.");
+                            throw new InvalidDataException("The mesh has an invalid skinning bone index.");
                         bones.Add(subset.BoneIndices[local]);
                         weights.Add(weight);
                     }

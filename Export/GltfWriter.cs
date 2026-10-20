@@ -12,7 +12,7 @@ using Newtonsoft.Json.Linq;
 
 namespace Rbx2Source.Export
 {
-    public enum ExportFormat { Glb, Gltf, Fbx, GarrysMod }
+    public enum ExportFormat { Glb, Gltf, Fbx, GarrysMod, SourceFilmmaker }
 
     // Extra PBR textures for one material, as paths relative to the export folder.
     public sealed class MaterialMaps
@@ -279,7 +279,8 @@ namespace Rbx2Source.Export
                 var json = new JObject
                 {
                     ["name"] = material.Name, ["pbrMetallicRoughness"] = pbr,
-                    ["alphaMode"] = alphaMode, ["doubleSided"] = true
+                    // Back faces only for DoubleSided accessories, as in Roblox (outline shells must keep their front faces hidden).
+                    ["alphaMode"] = alphaMode, ["doubleSided"] = material.DoubleSided
                 };
                 if (maps != null && maps.TryGetValue(material.Name, out MaterialMaps extra) && extra != null)
                 {
@@ -315,8 +316,8 @@ namespace Rbx2Source.Export
             var parts = new List<KeyValuePair<string, List<ObjTriangle>>>();
             if (scene.Face != null)
             {
-                parts.Add(new KeyValuePair<string, List<ObjTriangle>>("Body", model.Triangles.Where(t => t.Group != scene.Face.HeadGroup).ToList()));
-                parts.Add(new KeyValuePair<string, List<ObjTriangle>>("Face", model.Triangles.Where(t => t.Group == scene.Face.HeadGroup).ToList()));
+                parts.Add(new KeyValuePair<string, List<ObjTriangle>>("Body", model.Triangles.Where(t => !scene.Face.IsFace(t.Group)).ToList()));
+                parts.Add(new KeyValuePair<string, List<ObjTriangle>>("Face", model.Triangles.Where(t => scene.Face.IsFace(t.Group)).ToList()));
             }
             else
             {

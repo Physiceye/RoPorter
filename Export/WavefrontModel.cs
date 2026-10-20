@@ -32,6 +32,8 @@ namespace Rbx2Source.Export
         public bool Overlay;
         // The material named an alpha mode (rbx_alphamode); without one, the texture's own alpha decides.
         public bool AlphaModeGiven;
+        // Drawn from both sides (an accessory whose MeshPart is DoubleSided); Roblox culls back faces otherwise.
+        public bool DoubleSided;
 
         // PBR maps from Roblox SurfaceAppearances: a tangent-space normal map (map_Bump), a packed map (map_Ns:
         // R = metalness, G = roughness, B = emissive mask), and the emissive colour (map_Ke) scaled by Ke.

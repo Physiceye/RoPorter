@@ -19,6 +19,8 @@ namespace Rbx2Source.Export
         // The item's own mesh. For layered clothing it carries Roblox's skin weights on the R15 skeleton.
         public long? MeshId;
         public RobloxMesh Mesh;
+        // Roblox draws the item's back faces only when its MeshPart is DoubleSided.
+        public bool DoubleSided;
         public bool HasSkinWeights => Mesh?.SkinBones != null && Mesh.Bones.Count > 0;
 
         private static readonly HashSet<int> RigidTypes = new HashSet<int> { 8, 41, 42, 43, 44, 45, 46, 47, 57, 58 };
@@ -77,6 +79,7 @@ namespace Rbx2Source.Export
                 return;
             Layered = model.HasWrapLayer || IsLayeredType(TypeId);
             MeshId = model.MeshId;
+            DoubleSided = model.DoubleSided;
             string attachment = model.Attachments.FirstOrDefault(name => AttachmentParts.ContainsKey(name));
             if (attachment != null)
             {

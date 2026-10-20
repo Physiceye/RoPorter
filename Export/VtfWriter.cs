@@ -3,6 +3,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -15,7 +16,9 @@ namespace Rbx2Source.Export
         public enum Kind { Color, Normal, Mask }
 
         private const uint FlagNormal = 0x80, FlagEightBitAlpha = 0x2000;
-        private const int FormatBgr888 = 3, FormatBgra8888 = 12;
+        // Clamped at the edges and always at full detail: for sky faces, which must not blend into the opposite edge.
+        public const uint FlagClampS = 0x4, FlagClampT = 0x8, FlagNoLod = 0x200;
+        private const int FormatBgr888 = 3, FormatBgra8888 = 12, FormatDxt1 = 13, FormatDxt5 = 15;
         public const int MaxSize = 2048;
 
         // Returns whether the texture kept an alpha channel.
@@ -25,7 +28,9 @@ namespace Rbx2Source.Export
                 return Write(source, vtfPath, kind);
         }
 
-        public static bool Write(Bitmap source, string vtfPath, Kind kind)
+        // compress stores the texture DXT-compressed (DXT1, or DXT5 with alpha): a quarter to a sixth of the size, for a
+        // little detail.
+        public static bool Write(Bitmap source, string vtfPath, Kind kind, uint flags = 0, bool compress = false)
         {
             (int width, int height) = FitSize(source.Width, source.Height);
             int[] pixels = Resize(source, width, height);
@@ -75,7 +80,7 @@ namespace Rbx2Source.Export
                 writer.Write(80u);
                 writer.Write((ushort)width);
                 writer.Write((ushort)height);
-                writer.Write((kind == Kind.Normal ? FlagNormal : 0) | (alpha ? FlagEightBitAlpha : 0));
+                writer.Write((kind == Kind.Normal ? FlagNormal : 0) | (alpha ? FlagEightBitAlpha : 0) | flags);
                 writer.Write((ushort)1);
                 writer.Write((ushort)0);
                 writer.Write(new byte[4]);
@@ -83,7 +88,7 @@ namespace Rbx2Source.Export
                     writer.Write((float)r);
                 writer.Write(new byte[4]);
                 writer.Write(1f);
-                writer.Write(alpha ? FormatBgra8888 : FormatBgr888);
+                writer.Write(compress ? (alpha ? FormatDxt5 : FormatDxt1) : alpha ? FormatBgra8888 : FormatBgr888);
                 writer.Write((byte)mips);
                 writer.Write(-1);
                 writer.Write((byte)0);
@@ -92,6 +97,12 @@ namespace Rbx2Source.Export
                 writer.Write(new byte[80 - 65]);
                 // Mipmaps are stored smallest first.
                 for (int level = mips - 1; level >= 0; level--)
+                {
+                    if (compress)
+                    {
+                        writer.Write(EncodeDxt(levels[level], sizes[level].W, sizes[level].H, alpha));
+                        continue;
+                    }
                     foreach (int p in levels[level])
                     {
                         writer.Write((byte)(p & 255));
@@ -100,8 +111,123 @@ namespace Rbx2Source.Export
                         if (alpha)
                             writer.Write((byte)((p >> 24) & 255));
                     }
+                }
             }
             return alpha;
+        }
+
+        // DXT1 (or DXT5, with an alpha block before each colour block) in 4 x 4 blocks; blocks past a small mip level's edge
+        // repeat its last pixels.
+        private static byte[] EncodeDxt(int[] pixels, int width, int height, bool alpha)
+        {
+            int blocksX = Math.Max(1, (width + 3) / 4), blocksY = Math.Max(1, (height + 3) / 4);
+            var output = new byte[blocksX * blocksY * (alpha ? 16 : 8)];
+            var block = new int[16];
+            int offset = 0;
+            for (int by = 0; by < blocksY; by++)
+                for (int bx = 0; bx < blocksX; bx++)
+                {
+                    for (int i = 0; i < 16; i++)
+                        block[i] = pixels[Math.Min(height - 1, by * 4 + i / 4) * width + Math.Min(width - 1, bx * 4 + i % 4)];
+                    if (alpha)
+                    {
+                        EncodeAlpha(block, output, offset);
+                        offset += 8;
+                    }
+                    EncodeColor(block, output, offset);
+                    offset += 8;
+                }
+            return output;
+        }
+
+        // A colour block: two endpoint colours (the block's colour range, inset a little) and a 2-bit choice per pixel among
+        // them and the two colours between.
+        private static void EncodeColor(int[] block, byte[] output, int offset)
+        {
+            int[] low = { 255, 255, 255 }, high = { 0, 0, 0 };
+            foreach (int p in block)
+                for (int c = 0; c < 3; c++)
+                {
+                    int value = (p >> (16 - 8 * c)) & 255;
+                    low[c] = Math.Min(low[c], value);
+                    high[c] = Math.Max(high[c], value);
+                }
+            for (int c = 0; c < 3; c++)
+            {
+                int inset = (high[c] - low[c]) / 16;
+                low[c] += inset;
+                high[c] -= inset;
+            }
+            int To565(int[] rgb) => ((rgb[0] * 31 + 127) / 255 << 11) | ((rgb[1] * 63 + 127) / 255 << 5) | ((rgb[2] * 31 + 127) / 255);
+            int c0 = To565(high), c1 = To565(low);
+            if (c0 < c1)
+            {
+                int swap = c0;
+                c0 = c1;
+                c1 = swap;
+            }
+            uint indices = 0;
+            if (c0 != c1)
+            {
+                int[] From565(int c) => new[] { ((c >> 11) & 31) * 255 / 31, ((c >> 5) & 63) * 255 / 63, (c & 31) * 255 / 31 };
+                int[] p0 = From565(c0), p1 = From565(c1);
+                var palette = new[] { p0, p1, Enumerable.Range(0, 3).Select(c => (2 * p0[c] + p1[c]) / 3).ToArray(), Enumerable.Range(0, 3).Select(c => (p0[c] + 2 * p1[c]) / 3).ToArray() };
+                for (int i = 0; i < 16; i++)
+                {
+                    int r = (block[i] >> 16) & 255, g = (block[i] >> 8) & 255, b = block[i] & 255;
+                    int best = 0, bestDistance = int.MaxValue;
+                    for (int k = 0; k < 4; k++)
+                    {
+                        int dr = r - palette[k][0], dg = g - palette[k][1], db = b - palette[k][2];
+                        int distance = dr * dr + dg * dg + db * db;
+                        if (distance < bestDistance)
+                        {
+                            bestDistance = distance;
+                            best = k;
+                        }
+                    }
+                    indices |= (uint)best << (2 * i);
+                }
+            }
+            output[offset] = (byte)c0;
+            output[offset + 1] = (byte)(c0 >> 8);
+            output[offset + 2] = (byte)c1;
+            output[offset + 3] = (byte)(c1 >> 8);
+            for (int i = 0; i < 4; i++)
+                output[offset + 4 + i] = (byte)(indices >> (8 * i));
+        }
+
+        // A DXT5 alpha block: the block's highest and lowest alpha, and a 3-bit choice per pixel among them and six between.
+        private static void EncodeAlpha(int[] block, byte[] output, int offset)
+        {
+            int high = 0, low = 255;
+            foreach (int p in block)
+            {
+                int a = (p >> 24) & 255;
+                high = Math.Max(high, a);
+                low = Math.Min(low, a);
+            }
+            output[offset] = (byte)high;
+            output[offset + 1] = (byte)low;
+            ulong indices = 0;
+            if (high != low)
+            {
+                var palette = new int[8];
+                palette[0] = high;
+                palette[1] = low;
+                for (int k = 1; k <= 6; k++)
+                    palette[k + 1] = ((7 - k) * high + k * low) / 7;
+                for (int i = 0; i < 16; i++)
+                {
+                    int a = (block[i] >> 24) & 255, best = 0;
+                    for (int k = 1; k < 8; k++)
+                        if (Math.Abs(a - palette[k]) < Math.Abs(a - palette[best]))
+                            best = k;
+                    indices |= (ulong)best << (3 * i);
+                }
+            }
+            for (int i = 0; i < 6; i++)
+                output[offset + 2 + i] = (byte)(indices >> (8 * i));
         }
 
         // Solid-colour texture for untextured materials.

@@ -8,7 +8,7 @@ using System.Text.RegularExpressions;
 namespace Rbx2Source.Export
 {
     // Reads just enough of a Roblox model file (.rbxm / .rbxmx) to find head meshes and accessory attachments.
-    public static class RobloxModelFile
+    public static partial class RobloxModelFile
     {
         private static readonly byte[] BinaryMagic = Encoding.ASCII.GetBytes("<roblox!");
 
@@ -44,6 +44,8 @@ namespace Rbx2Source.Export
             public List<string> Attachments = new List<string>();
             public long? MeshId;
             public long? TextureId;
+            // MeshPart.DoubleSided: Roblox draws a mesh's back faces only when this is set (outline shells rely on it not being).
+            public bool DoubleSided;
         }
 
         // Describes an accessory: its attachment names (which decide the body part it is welded to), whether it
@@ -61,12 +63,16 @@ namespace Rbx2Source.Export
                     .OrderBy(v => v.Class == "MeshPart" ? 0 : 1).Select(v => ParseId(v.Value)).FirstOrDefault(id => id.HasValue),
                 TextureId = values.Where(v => TextureProperties.Contains(v.Property))
                     .OrderBy(v => v.Class == "SurfaceAppearance" ? 0 : v.Class == "MeshPart" ? 1 : 2)
-                    .Select(v => ParseId(v.Value)).FirstOrDefault(id => id.HasValue)
+                    .Select(v => ParseId(v.Value)).FirstOrDefault(id => id.HasValue),
+                DoubleSided = values.Any(v => v.Class == "MeshPart" && v.Property == DoubleSidedProperty && v.Value == "true")
             };
         }
 
+        private const string DoubleSidedProperty = "DoubleSided";
+
         private static bool Wanted(string className, string property) =>
-            MeshProperties.Contains(property) || TextureProperties.Contains(property) || (className == "Attachment" && property == "Name");
+            MeshProperties.Contains(property) || TextureProperties.Contains(property) || (className == "Attachment" && property == "Name") ||
+            (className == "MeshPart" && property == DoubleSidedProperty);
 
         public static long? ParseId(string content)
         {
@@ -87,7 +93,7 @@ namespace Rbx2Source.Export
             {
                 result.Add(new PropertyValue { Class = item.Groups[1].Value, Property = ClassMarker });
                 foreach (Match property in Regex.Matches(item.Groups[2].Value,
-                    @"<(?:Content|string|ContentId)\s+name=""(\w+)""[^>]*>\s*(?:<url>)?([^<]*)", RegexOptions.Singleline))
+                    @"<(?:Content|string|ContentId|bool)\s+name=""(\w+)""[^>]*>\s*(?:<url>)?([^<]*)", RegexOptions.Singleline))
                     if (Wanted(item.Groups[1].Value, property.Groups[1].Value))
                         result.Add(new PropertyValue { Class = item.Groups[1].Value, Property = property.Groups[1].Value, Value = property.Groups[2].Value.Trim() });
             }
@@ -108,13 +114,7 @@ namespace Rbx2Source.Export
                 int stored = compressed > 0 ? compressed : size;
                 if (stored < 0 || size < 0 || stored > data.Length - position)
                     throw new InvalidDataException("The model file is truncated.");
-                byte[] chunk;
-                if (compressed == 0)
-                    chunk = data.Skip(position).Take(size).ToArray();
-                else if (stored >= 4 && BitConverter.ToUInt32(data, position) == 0xFD2FB528)
-                    throw new NotSupportedException("The model file uses Zstandard compression, which this exporter cannot read yet.");
-                else
-                    chunk = DecodeLz4(data, position, compressed, size);
+                byte[] chunk = ChunkData(data, position, compressed, size);
                 position += stored;
 
                 if (name == "INST")
@@ -131,7 +131,13 @@ namespace Rbx2Source.Export
                     if (!Wanted(className, property))
                         continue;
                     byte type = chunk[offset++];
-                    if (type == 0x01)
+                    if (type == 0x02)
+                    {
+                        // Bool: one byte per instance of the class.
+                        for (; offset < chunk.Length; offset++)
+                            result.Add(new PropertyValue { Class = className, Property = property, Value = chunk[offset] != 0 ? "true" : "false" });
+                    }
+                    else if (type == 0x01)
                     {
                         while (offset + 4 <= chunk.Length)
                             result.Add(new PropertyValue { Class = className, Property = property, Value = ReadString(chunk, offset, out offset) });
@@ -161,6 +167,33 @@ namespace Rbx2Source.Export
                 throw new InvalidDataException("The model file has an invalid string.");
             next = offset + 4 + length;
             return Encoding.UTF8.GetString(data, offset + 4, length);
+        }
+
+        // A chunk's contents: stored as they are, or compressed with LZ4 or, as Roblox Studio now saves files, Zstandard.
+        private static byte[] ChunkData(byte[] data, int position, int compressed, int size)
+        {
+            if (compressed == 0)
+            {
+                var copy = new byte[size];
+                Buffer.BlockCopy(data, position, copy, 0, size);
+                return copy;
+            }
+            if (compressed < 4 || BitConverter.ToUInt32(data, position) != 0xFD2FB528)
+                return DecodeLz4(data, position, compressed, size);
+            var output = new byte[size];
+            int written;
+            try
+            {
+                using (var zstd = new ZstdSharp.Decompressor())
+                    written = zstd.Unwrap(data, position, compressed, output, 0, size);
+            }
+            catch (ZstdSharp.ZstdException error)
+            {
+                throw new InvalidDataException("Invalid Zstandard data in the model file (" + error.Message + ").");
+            }
+            if (written != size)
+                throw new InvalidDataException("Invalid Zstandard data in the model file.");
+            return output;
         }
 
         public static byte[] DecodeLz4(byte[] source, int offset, int length, int outputLength)

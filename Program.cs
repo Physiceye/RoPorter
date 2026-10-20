@@ -19,6 +19,9 @@ namespace Rbx2Source
             // Run by RoPorter itself to set a Workshop item's description and page image (see Export.SteamPreview).
             if (args.Length > 0 && args[0] == Export.Workshop.DetailsArgument)
                 return Export.SteamPreview.Run(args);
+            // Run by RoPorter itself to publish a Source Filmmaker export to SFM's Workshop (see Export.SfmWorkshop).
+            if (args.Length > 0 && args[0] == Export.SfmWorkshop.PublishArgument)
+                return Export.SfmWorkshop.Run(args);
 
             var httpsValidator = new RemoteCertificateValidationCallback(validateCert);
             ServicePointManager.ServerCertificateValidationCallback += httpsValidator;

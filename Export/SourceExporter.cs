@@ -70,10 +70,16 @@ namespace Rbx2Source.Export
         private static string F(double value) => value.ToString("0.######", CultureInfo.InvariantCulture);
         private static string V(double[] v) => F(v[0]) + " " + F(v[1]) + " " + F(v[2]);
 
+        // The Workshop page text of every addon: Steam BBCode, a linked heading.
+        internal const string WorkshopDescription = "[url=https://github.com/Physiceye/RoPorter/releases][h2]Made with RoPorter[/h2][/url]";
+
         public static string Export(ExportScene scene, IReadOnlyDictionary<string, string> textures, IReadOnlyDictionary<string, MaterialMaps> maps,
             string folder, string name, GarrysModInstall install, IProgress<string> progress, CancellationToken cancellation, string playerName = null,
-            string itemLabel = null, string itemType = null, ISet<string> gearGroups = null)
+            string itemLabel = null, string itemType = null, ISet<string> gearGroups = null, SfmInstall sfm = null, string playerCategory = null)
         {
+            // Source Filmmaker gets the same model without the Garry's Mod parts (its player animations, first-person arms,
+            // Lua, spawn menu and addon.json), compiled with SFM's studiomdl. Its models and materials folders go into SFM's
+            // usermod folder.
             WavefrontModel model = scene.Model;
             // Held gear goes in its own optional bodygroup instead of the body (and the first-person arms).
             bool IsBody(ObjTriangle triangle) => gearGroups == null || !gearGroups.Contains(triangle.Group);
@@ -121,7 +127,7 @@ namespace Rbx2Source.Export
             if (flexes != null)
                 progress?.Report("Face: " + flexes.Count + " flexes for posing, with blinking" + (flexes.Contains(JawDropFlex) ? " and voice chat mouth movement." : "."));
             File.WriteAllText(Path.Combine(src, "physics.smd"), PhysicsSmd(bones, model, scene, units, boneOf, rig, valve), Encoding.ASCII);
-            if (player)
+            if (player && sfm == null)
             {
                 File.WriteAllText(Path.Combine(src, "anims", "proportions.smd"), SkeletonSmd(bones, bones.Select(b => Local(b, bones)).ToList()), Encoding.ASCII);
                 File.WriteAllText(Path.Combine(src, "anims", "valve_reference.smd"), SkeletonSmd(bones, bones.Select(b =>
@@ -131,17 +137,22 @@ namespace Rbx2Source.Export
                 }).ToList()), Encoding.ASCII);
             }
 
-            string modelName = player ? "player/roporter/" + id + ".mdl" : "roporter/items/" + id + ".mdl";
-            File.WriteAllText(Path.Combine(src, "model.qc"), Qc(modelName, materialDir, bones, rig, valve, player, scene, units, flexes, hasGear), Encoding.ASCII);
+            string modelName = sfm != null ? (player ? "roporter/" : "roporter/items/") + id + ".mdl"
+                : player ? "player/roporter/" + id + ".mdl" : "roporter/items/" + id + ".mdl";
+            File.WriteAllText(Path.Combine(src, "model.qc"), Qc(modelName, materialDir, bones, rig, valve, player, scene, units, flexes, hasGear, sfm == null), Encoding.ASCII);
+            if (sfm != null)
+            {
+                progress?.Report("Compiling with Source Filmmaker's studiomdl...");
+                Compile(sfm.StudioMdl, null, "1840", folder, Path.Combine(src, "model.qc"), modelName, progress, cancellation);
+                return Path.Combine("models", modelName.Replace('/', Path.DirectorySeparatorChar));
+            }
             // The addon's (and Workshop item's) title and description: "RoPorter - " and the username for avatars or the
             // catalog name for items.
             string displayName = player && !string.IsNullOrWhiteSpace(playerName) ? playerName.Trim()
                 : !player && !string.IsNullOrWhiteSpace(itemLabel) ? itemLabel.Trim() : id;
             string title = "RoPorter - " + displayName;
-            // Steam BBCode: a linked heading on the Workshop page.
-            const string description = "[url=https://github.com/Physiceye/RoPorter/releases][h2]Made with RoPorter[/h2][/url]";
             File.WriteAllText(Path.Combine(folder, "addon.json"), "{\n\t\"title\": " + Newtonsoft.Json.JsonConvert.ToString(title) +
-                ",\n\t\"description\": " + Newtonsoft.Json.JsonConvert.ToString(description) +
+                ",\n\t\"description\": " + Newtonsoft.Json.JsonConvert.ToString(WorkshopDescription) +
                 ",\n\t\"type\": \"model\",\n\t\"tags\": [\"fun\"],\n\t\"ignore\": [\"src/*\", \"" + Workshop.IconFile + "\", \"" + Workshop.PreviewFile + "\"]\n}\n",
                 new UTF8Encoding(false)); // gmad cannot parse addon.json with a byte order mark
 
@@ -184,20 +195,24 @@ namespace Rbx2Source.Export
                 "player_manager.AddValidModel( " + label + ", " + path + " )\n" +
                 "list.Set( \"PlayerOptionsModel\", " + label + ", " + path + " )\n" +
                 "player_manager.AddValidHands( " + label + ", " + LuaString(hands) + ", 0, \"00000000\" )\n", new UTF8Encoding(false));
-            // The playermodel is also listed in the spawn menu, where it spawns as a ragdoll.
-            WriteSpawnMenu(folder, "avatar_" + id, displayName, "Avatars", "models/" + modelName);
+            // The playermodel is also listed in the spawn menu, where it spawns as a ragdoll: under "Avatars", or its own category
+            // ("Bundles").
+            string category = string.IsNullOrWhiteSpace(playerCategory) ? "Avatars" : playerCategory.Trim();
+            WriteSpawnMenu(folder, (category == "Bundles" ? "bundle_" : "avatar_") + id, displayName, category, "models/" + modelName);
             return Path.Combine("models", modelName.Replace('/', Path.DirectorySeparatorChar));
         }
 
-        // Lists a model in the spawn menu under "RoPorter", in a sub-category: "Avatars", or the Roblox item type ("Full Masks",
-        // "Head Accessories"). Every exported addon adds itself to the shared RoPorterCatalog table and installs the same
-        // hook, so all of them are grouped together. Items from older exports (RoPorterItems, name only) go under "Other".
+        // Lists a model in the spawn menu under "RoPorter", in a sub-category: "Avatars", "Bundles", or the Roblox item type
+        // ("Full Masks", "Head Accessories"). Every exported addon adds itself to the shared RoPorterCatalog table and installs
+        // the same hook, so all of them are grouped together. Items from older exports (RoPorterItems, name only) go under "Other".
         private static void WriteSpawnMenu(string folder, string id, string label, string type, string model)
         {
-            // Category icons, shared by every RoPorter addon: the app icon, Accoutrement_icon for item types, Humanoid_icon for avatars.
+            // Category icons, shared by every RoPorter addon: the app icon, Accoutrement_icon for item types, Humanoid_icon for
+            // avatars, Player_icon for bundles, Model_icon for model files.
             string icons = Path.Combine(folder, "materials", "roporter", "spawnmenu");
             Directory.CreateDirectory(icons);
-            foreach (var icon in new[] { ("favicon.png", "roporter.png"), ("Accoutrement_icon.png", "catalog.png"), ("Humanoid_icon.png", "avatars.png") })
+            foreach (var icon in new[] { ("favicon.png", "roporter.png"), ("Accoutrement_icon.png", "catalog.png"), ("Humanoid_icon.png", "avatars.png"),
+                ("Player_icon.png", "bundles.png"), ("Model_icon.png", "models.png") })
                 using (Stream source = typeof(SourceExporter).Assembly.GetManifestResourceStream("RoPorter." + icon.Item1))
                 using (FileStream target = File.Create(Path.Combine(icons, icon.Item2)))
                     (source ?? throw new InvalidDataException("The spawn menu icon " + icon.Item1 + " is missing from RoPorter.")).CopyTo(target);
@@ -222,7 +237,8 @@ namespace Rbx2Source.Export
                 "\t\ttable.sort( models, function( a, b ) return items[ a ].name:lower() < items[ b ].name:lower() end )\n" +
                 "\t\tlocal contents = {}\n" +
                 "\t\tfor _, model in ipairs( models ) do contents[ #contents + 1 ] = { type = \"model\", model = model } end\n" +
-                "\t\tlocal icon = name == \"Avatars\" and \"roporter/spawnmenu/avatars.png\" or \"roporter/spawnmenu/catalog.png\"\n" +
+                "\t\tlocal icon = name == \"Avatars\" and \"roporter/spawnmenu/avatars.png\" or name == \"Bundles\" and \"roporter/spawnmenu/bundles.png\"\n" +
+                "\t\t\tor name == \"Models\" and \"roporter/spawnmenu/models.png\" or \"roporter/spawnmenu/catalog.png\"\n" +
                 "\t\tspawnmenu.AddPropCategory( \"RoPorterItems/\" .. name, name, contents, icon,\n" +
                 "\t\t\t7672768 + tonumber( util.CRC( name ) ) % 1000000, 7672767 )\n" +
                 "\tend\n" +
@@ -231,6 +247,76 @@ namespace Rbx2Source.Export
 
         // First-person arm radius as a share of Valve's shoulder-to-wrist length (about 2 units on a 23-unit citizen arm).
         private const double ArmRadius = 0.085;
+
+        // R6 blocks in first person: the corner radius (about 4 units, a block about 6 units across) and the stretch blended
+        // at the elbow and wrist on each side of the joint, as shares of the arm's length.
+        private const double BlockArmRadius = 0.18, BlockJointBlend = 0.06;
+
+        // A first-person arm triangle corner in Source space, for slicing R6 blocks.
+        private struct ArmCorner
+        {
+            public double[] Point, Normal;
+            public double U, V;
+        }
+
+        private static ArmCorner Between(ArmCorner a, ArmCorner b, double t)
+        {
+            double[] normal = Matrix.Add(a.Normal, Matrix.Scale(Matrix.Subtract(b.Normal, a.Normal), t));
+            double length = Matrix.Length(normal);
+            return new ArmCorner
+            {
+                Point = Matrix.Add(a.Point, Matrix.Scale(Matrix.Subtract(b.Point, a.Point), t)),
+                Normal = length > 1e-9 ? Matrix.Scale(normal, 1 / length) : a.Normal,
+                U = a.U + (b.U - a.U) * t, V = a.V + (b.V - a.V) * t
+            };
+        }
+
+        // Cuts a triangle into the bands between planes across the arm (at the given distances along the axis from the
+        // origin), interpolating position, normal and UV, so a long block side can bend at the elbow and wrist.
+        private static List<ArmCorner[]> Slice(ArmCorner[] triangle, double[] origin, double[] axis, IEnumerable<double> cuts)
+        {
+            double Along(ArmCorner c) => Matrix.Dot(Matrix.Subtract(c.Point, origin), axis);
+            var pieces = new List<List<ArmCorner>> { triangle.ToList() };
+            foreach (double cut in cuts)
+            {
+                var next = new List<List<ArmCorner>>();
+                foreach (List<ArmCorner> polygon in pieces)
+                {
+                    double[] offsets = polygon.Select(c => Along(c) - cut).ToArray();
+                    if (offsets.All(o => o >= -1e-9) || offsets.All(o => o <= 1e-9))
+                    {
+                        next.Add(polygon);
+                        continue;
+                    }
+                    var below = new List<ArmCorner>();
+                    var above = new List<ArmCorner>();
+                    for (int i = 0; i < polygon.Count; i++)
+                    {
+                        int j = (i + 1) % polygon.Count;
+                        if (offsets[i] <= 0)
+                            below.Add(polygon[i]);
+                        if (offsets[i] >= 0)
+                            above.Add(polygon[i]);
+                        if ((offsets[i] < 0 && offsets[j] > 0) || (offsets[i] > 0 && offsets[j] < 0))
+                        {
+                            ArmCorner crossing = Between(polygon[i], polygon[j], offsets[i] / (offsets[i] - offsets[j]));
+                            below.Add(crossing);
+                            above.Add(crossing);
+                        }
+                    }
+                    if (below.Count >= 3)
+                        next.Add(below);
+                    if (above.Count >= 3)
+                        next.Add(above);
+                }
+                pieces = next;
+            }
+            var result = new List<ArmCorner[]>();
+            foreach (List<ArmCorner> polygon in pieces)
+                for (int i = 1; i + 1 < polygon.Count; i++)
+                    result.Add(new[] { polygon[0], polygon[i], polygon[i + 1] });
+            return result;
+        }
 
         private static string LuaString(string text) => "\"" + text.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "") + "\"";
 
@@ -264,34 +350,59 @@ namespace Rbx2Source.Export
             }
             double[] Fit(double[] p, char side) => Matrix.Add(pivot[side], Matrix.Scale(Matrix.Subtract(p, pivot[side]), scale[side]));
 
-            // R6 arms are one block, rigid on the hand in the playermodel. Viewmodel animations turn the hand well away from
-            // the forearm, which swings a hand-rigid block across the screen, so here the block runs from the shoulder to the
-            // hand instead: the part past the wrist stays on the hand and the rest blends to the upper arm towards the shoulder.
-            var wholeArm = new Dictionary<int, int>();
+            // R6 arms are one block, rigid on the hand in the playermodel. A hand-rigid block swings across the screen when the
+            // viewmodel turns the hand, so in first person the block is jointed like Valve's arms instead: the upper arm down to
+            // the elbow, the forearm down to the wrist, the hand past it, blending over a short stretch at each joint. The block
+            // only has vertices at its ends, so its triangles are sliced along the arm (see Slice) to bend there; blending it
+            // from shoulder to hand in one piece made it curve like a noodle.
+            var wholeArm = new Dictionary<int, char>();
             var wholeSides = new HashSet<char>();
+            int Bone(char side, string name) => bones.FindIndex(b => b.Name == Prefix + side + "_" + name);
             foreach (char side in new[] { 'L', 'R' })
                 if (scene.Rig.IsWholeLimb(side == 'L' ? BodyPart.LeftLowerArm : BodyPart.RightLowerArm))
                 {
                     wholeSides.Add(side);
-                    wholeArm[bones.FindIndex(b => b.Name == Prefix + side + "_Hand")] = bones.FindIndex(b => b.Name == Prefix + side + "_UpperArm");
+                    wholeArm[Bone(side, "Hand")] = side;
                 }
+            List<KeyValuePair<int, double>> RigLinks(int position) =>
+                Links(position, scene.Rig, boneOf).Where(l => l.Key != spine && map.ContainsKey(l.Key)).ToList();
+            // The R6 side whose block a vertex belongs to (its weight on that side's hand, apart from the tiny anchor weight
+            // that keeps a finger or helper bone in the skeleton), or null.
+            char? WholeSide(List<KeyValuePair<int, double>> links)
+            {
+                KeyValuePair<int, double> main = links.OrderByDescending(l => l.Value).FirstOrDefault();
+                return main.Value >= 0.9 && wholeArm.TryGetValue(main.Key, out char found) ? found : (char?)null;
+            }
+            // The arm of an R6 block, measured from the shoulder joint towards the wrist (unfitted Source space).
+            (double[] Shoulder, double[] Axis, double Elbow, double Wrist) BlockArm(char side)
+            {
+                double[] shoulder = bones[Bone(side, "UpperArm")].Position;
+                double[] axis = Matrix.Subtract(bones[Bone(side, "Hand")].Position, shoulder);
+                double length = Math.Max(Matrix.Length(axis), 1e-6);
+                axis = Matrix.Scale(axis, 1 / length);
+                return (shoulder, axis, Matrix.Dot(Matrix.Subtract(bones[Bone(side, "Forearm")].Position, shoulder), axis), length);
+            }
+            List<KeyValuePair<int, double>> Jointed(double[] p, char side)
+            {
+                var arm = BlockArm(side);
+                double along = Matrix.Dot(Matrix.Subtract(p, arm.Shoulder), arm.Axis), blend = BlockJointBlend * arm.Wrist;
+                double Step(double x)
+                {
+                    double t = Math.Max(0, Math.Min(1, x));
+                    return t * t * (3 - 2 * t);
+                }
+                double pastElbow = Step((along - arm.Elbow + blend) / (2 * blend)), pastWrist = Step((along - arm.Wrist + blend) / (2 * blend));
+                var links = new List<KeyValuePair<int, double>>();
+                foreach (var share in new[] { (Bone(side, "UpperArm"), 1 - pastElbow), (Bone(side, "Forearm"), pastElbow - pastWrist), (Bone(side, "Hand"), pastWrist) })
+                    if (share.Item2 > 1e-4)
+                        links.Add(new KeyValuePair<int, double>(share.Item1, share.Item2));
+                return links;
+            }
             List<KeyValuePair<int, double>> ArmLinks(int position)
             {
-                var links = Links(position, scene.Rig, boneOf).Where(l => l.Key != spine && map.ContainsKey(l.Key)).ToList();
-                if (links.Count != 1 || !wholeArm.TryGetValue(links[0].Key, out int upper) || upper < 0)
-                    return links;
-                int hand = links[0].Key;
-                double[] toShoulder = Matrix.Subtract(bones[upper].Position, bones[hand].Position);
-                double length = Matrix.Length(toShoulder);
-                if (length < 1e-6)
-                    return links;
-                double[] p = ToSource(scene.Point(model.Positions[position]), units);
-                double t = Math.Max(0, Math.Min(1, Matrix.Dot(Matrix.Subtract(p, bones[hand].Position), toShoulder) / (length * length)));
-                if (t <= 0)
-                    return links;
-                if (t >= 1)
-                    return new List<KeyValuePair<int, double>> { new KeyValuePair<int, double>(upper, 1) };
-                return new List<KeyValuePair<int, double>> { new KeyValuePair<int, double>(hand, 1 - t), new KeyValuePair<int, double>(upper, t) };
+                var links = RigLinks(position);
+                char? side = WholeSide(links);
+                return side.HasValue ? Jointed(ToSource(scene.Point(model.Positions[position]), units), side.Value) : links;
             }
 
             // Roblox arms are much thicker for their length than Valve's (a blocky arm is half as wide as it is long), so a
@@ -334,7 +445,9 @@ namespace Rbx2Source.Export
                 double valveLength = Matrix.Length(Matrix.Subtract(Valve("Forearm"), Valve("UpperArm"))) + Matrix.Length(Matrix.Subtract(Valve("Hand"), Valve("Forearm")));
                 List<double> sorted = radii[side].OrderBy(r => r).ToList();
                 double radius = sorted.Count > 0 ? sorted[Math.Min(sorted.Count - 1, (int)(sorted.Count * 0.9))] : 0;
-                thin[side] = radius > 1e-6 ? Math.Min(scale[side], ArmRadius * valveLength / radius) : scale[side];
+                // An R6 block keeps more of its bulk: measured at its corners, Valve's radius would leave a thin stick.
+                double target = (wholeSides.Contains(side) ? BlockArmRadius : ArmRadius) * valveLength;
+                thin[side] = radius > 1e-6 ? Math.Min(scale[side], target / radius) : scale[side];
             }
             // Fitted to Valve's length, then thinned across the upper arm or forearm axis (hands and fingers use the forearm's).
             // Roblox hands reach much further past the wrist than Valve's (13-19 units once fitted, against about 7), so the
@@ -427,29 +540,56 @@ namespace Rbx2Source.Export
             }
 
             var text = new StringBuilder(Nodes(arms)).Append(Skeleton(arms.Select(b => Local(b, arms)).ToList())).Append("triangles\n");
+            // Slices across an R6 arm: every 5% of its length, and closer together through the blend at the elbow and wrist.
+            List<double> BlockCuts(char side)
+            {
+                var arm = BlockArm(side);
+                double blend = BlockJointBlend * arm.Wrist;
+                var cuts = new List<double>();
+                for (int k = -10; k <= 30; k++)
+                    cuts.Add(k * arm.Wrist / 20);
+                foreach (double joint in new[] { arm.Elbow, arm.Wrist })
+                    for (int k = -2; k <= 2; k++)
+                        cuts.Add(joint + k * blend / 2);
+                return cuts.Distinct().OrderBy(d => d).ToList();
+            }
             foreach (ObjTriangle triangle in model.Triangles.Where(include))
             {
                 cancellation.ThrowIfCancellationRequested();
-                var corners = triangle.Corners.Select(c => ArmLinks(c.Position)).ToList();
-                if (corners.Any(links => links.Sum(l => l.Value) < 0.5))
+                var rigLinks = triangle.Corners.Select(c => RigLinks(c.Position)).ToList();
+                if (rigLinks.Any(links => links.Sum(l => l.Value) < 0.5))
                     continue;
-                triangles++;
-                text.Append(materials[triangle.Material]).Append('\n');
-                for (int c = 0; c < 3; c++)
+                var corners = triangle.Corners.Select(corner =>
                 {
-                    ObjCorner corner = triangle.Corners[c];
-                    var links = corners[c];
-                    double total = links.Sum(l => l.Value);
-                    double[] p = Shape(ToSource(scene.Point(model.Positions[corner.Position]), units), links);
                     double[] n = DirectionToSource(ExportScene.Direction(model.Normals[corner.Normal]));
                     double length = Matrix.Length(n);
-                    n = length > 0 ? Matrix.Scale(n, 1 / length) : new double[] { 0, 0, 1 };
                     float[] uv = corner.Texture >= 0 ? model.Texcoords[corner.Texture] : new float[2];
-                    text.Append(map[links[0].Key]).Append(' ').Append(V(p)).Append(' ').Append(V(n)).Append(' ')
-                        .Append(F(uv[0])).Append(' ').Append(F(uv[1])).Append(' ').Append(links.Count);
-                    foreach (var link in links)
-                        text.Append(' ').Append(map[link.Key]).Append(' ').Append(F(link.Value / total));
-                    text.Append('\n');
+                    return new ArmCorner
+                    {
+                        Point = ToSource(scene.Point(model.Positions[corner.Position]), units),
+                        Normal = length > 0 ? Matrix.Scale(n, 1 / length) : new double[] { 0, 0, 1 }, U = uv[0], V = uv[1]
+                    };
+                }).ToArray();
+                // An R6 block's triangle is sliced along the arm, and each piece is weighted by where its corners lie.
+                char? block = rigLinks.Select(WholeSide).Distinct().Count() == 1 ? WholeSide(rigLinks[0]) : null;
+                List<ArmCorner[]> pieces = block.HasValue
+                    ? Slice(corners, BlockArm(block.Value).Shoulder, BlockArm(block.Value).Axis, BlockCuts(block.Value))
+                    : new List<ArmCorner[]> { corners };
+                foreach (ArmCorner[] piece in pieces)
+                {
+                    triangles++;
+                    text.Append(materials[triangle.Material]).Append('\n');
+                    for (int c = 0; c < 3; c++)
+                    {
+                        var links = block.HasValue ? Jointed(piece[c].Point, block.Value) : rigLinks[c];
+                        double total = links.Sum(l => l.Value);
+                        double[] p = Shape(piece[c].Point, links);
+                        text.Append(map[links[0].Key]).Append(' ').Append(V(p)).Append(' ').Append(V(piece[c].Normal)).Append(' ')
+                            .Append(F(piece[c].U)).Append(' ').Append(F(piece[c].V)).Append(' ').Append(links.Count);
+                        foreach (var link in links)
+                            text.Append(' ').Append(map[link.Key]).Append(' ').Append(F(link.Value / total));
+                        text.Append('\n');
+                    }
                 }
             }
             return triangles > 0 ? text.Append("end\n").ToString() : null;
@@ -776,7 +916,7 @@ namespace Rbx2Source.Export
         }
 
         private static string Qc(string modelName, string materialDir, List<Bone> bones, AvatarRig rig, ValvePlayer valve, bool player,
-            ExportScene scene, double units, List<string> flexes = null, bool hasGear = false)
+            ExportScene scene, double units, List<string> flexes = null, bool hasGear = false, bool garrysMod = true)
         {
             var qc = new StringBuilder();
             qc.Append("// Generated by RoPorter\n");
@@ -836,12 +976,16 @@ namespace Rbx2Source.Export
                 foreach (ValvePlayer.IkChain chain in valve.IkChains.Where(c => present.Contains(c.Bone)))
                     qc.Append("$ikchain \"").Append(chain.Name).Append("\" \"").Append(chain.Bone).Append("\" knee ").Append(V(chain.Knee)).Append('\n');
                 // Proportions trick: the difference between this skeleton and Valve's is applied under every animation.
-                qc.Append("$sequence \"roporter_valve_reference\" \"anims/valve_reference.smd\" fps 1\n");
-                qc.Append("$animation \"a_roporter_proportions\" \"anims/proportions.smd\" fps 1 subtract \"roporter_valve_reference\" 0\n");
-                qc.Append("$sequence \"roporter_proportions\" \"a_roporter_proportions\" predelta autoplay\n");
+                // Source Filmmaker poses the model itself and has no Garry's Mod animations to adjust.
+                if (garrysMod)
+                {
+                    qc.Append("$sequence \"roporter_valve_reference\" \"anims/valve_reference.smd\" fps 1\n");
+                    qc.Append("$animation \"a_roporter_proportions\" \"anims/proportions.smd\" fps 1 subtract \"roporter_valve_reference\" 0\n");
+                    qc.Append("$sequence \"roporter_proportions\" \"a_roporter_proportions\" predelta autoplay\n");
+                }
             }
             qc.Append("$sequence \"ragdoll\" \"reference.smd\" activity \"ACT_DIERAGDOLL\" 1 fps 30\n");
-            if (player)
+            if (player && garrysMod)
                 qc.Append("$includemodel \"m_anm.mdl\"\n");
             qc.Append("$collisionjoints \"physics.smd\"\n{\n");
             qc.Append("\t$mass ").Append(F(valve.TotalMass)).Append('\n');
@@ -902,9 +1046,11 @@ namespace Rbx2Source.Export
                     string mode = material.Texture != null && textures != null && textures.TryGetValue(material.Name, out string path)
                         ? GltfWriter.AlphaMode(Full(path)) : "BLEND";
                     vmt.Append(mode == "MASK" ? "\t\"$alphatest\" \"1\"\n" : "\t\"$translucent\" \"1\"\n");
-                    // Cards such as hair and fringes are usually meant to be seen from both sides.
-                    vmt.Append("\t\"$nocull\" \"1\"\n");
                 }
+                // Back faces are drawn only for DoubleSided accessories, as in Roblox: outline effects are inside-out shells
+                // whose front faces must stay hidden.
+                if (material.DoubleSided)
+                    vmt.Append("\t\"$nocull\" \"1\"\n");
                 vmt.Append("}\n");
                 File.WriteAllText(Path.Combine(directory, name + ".vmt"), vmt.ToString(), Encoding.ASCII);
             }
@@ -913,16 +1059,21 @@ namespace Rbx2Source.Export
 
         // Compiles inside the export folder: a temporary gameinfo.txt mounts Garry's Mod (for m_anm.mdl) so studiomdl
         // writes the model into the folder's own models/ directory.
-        private static void Compile(GarrysModInstall install, string folder, string qc, string modelName, IProgress<string> progress, CancellationToken cancellation)
+        internal static void Compile(GarrysModInstall install, string folder, string qc, string modelName, IProgress<string> progress, CancellationToken cancellation) =>
+            Compile(install.StudioMdl, install.Content, "4000", folder, qc, modelName, progress, cancellation);
+
+        // The same with any game's studiomdl; content (the game folder to mount) is optional.
+        private static void Compile(string studioMdl, string content, string appId, string folder, string qc, string modelName,
+            IProgress<string> progress, CancellationToken cancellation)
         {
             string gameInfo = Path.Combine(folder, "gameinfo.txt");
-            File.WriteAllText(gameInfo, "\"GameInfo\"\n{\n\tgame \"RoPorter\"\n\ttype multiplayer_only\n\tFileSystem\n\t{\n\t\tSteamAppId 4000\n\t\tSearchPaths\n\t\t{\n" +
-                "\t\t\tgame+mod |gameinfo_path|.\n" +
-                "\t\t\tgame \"" + Path.Combine(install.Content, "garrysmod.vpk") + "\"\n" +
-                "\t\t\tgame \"" + install.Content + "\"\n\t\t}\n\t}\n}\n");
+            string mounts = content == null ? "" :
+                "\t\t\tgame \"" + Path.Combine(content, "garrysmod.vpk") + "\"\n" + "\t\t\tgame \"" + content + "\"\n";
+            File.WriteAllText(gameInfo, "\"GameInfo\"\n{\n\tgame \"RoPorter\"\n\ttype multiplayer_only\n\tFileSystem\n\t{\n\t\tSteamAppId " + appId +
+                "\n\t\tSearchPaths\n\t\t{\n\t\t\tgame+mod |gameinfo_path|.\n" + mounts + "\t\t}\n\t}\n}\n");
             try
             {
-                var start = new ProcessStartInfo(install.StudioMdl, "-nop4 -nox360 -game \"" + folder + "\" \"" + qc + "\"")
+                var start = new ProcessStartInfo(studioMdl, "-nop4 -nox360 -game \"" + folder + "\" \"" + qc + "\"")
                 {
                     UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true,
                     WorkingDirectory = Path.GetDirectoryName(qc)

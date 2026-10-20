@@ -130,7 +130,11 @@ namespace Rbx2Source.Export
                 }, cancellation);
             string colorFile = Save("color", colorPixels, colorPixels.Any(p => ((p >> 24) & 255) < 255));
             colorPixels = null;
-            var merged = new ObjMaterial { Name = result.MaterialName, Texture = colorFile };
+            // One material for everything: drawn from both sides if any item it replaces was (hair cards stay visible).
+            var merged = new ObjMaterial
+            {
+                Name = result.MaterialName, Texture = colorFile, DoubleSided = regions.Any(r => r.Materials.Any(m => m.DoubleSided))
+            };
             var mergedMaps = new MaterialMaps();
 
             if (hasNormal)

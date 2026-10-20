@@ -22,19 +22,34 @@ namespace Rbx2Source.Export
         public AssetAccessException(string message) : base(message) { }
     }
 
+    // RoPorter's API is down for maintenance (it answers HTTP 503). This stops what RoPorter was doing (no step treats it as
+    // a missing optional file), and only its message is shown.
+    public sealed class ApiMessageException : Exception
+    {
+        public const string Maintenance = "Server under maintenance. Please check back later.";
+
+        public ApiMessageException(string message) : base(message) { }
+    }
+
+    // Every request goes to RoPorter's API (api.ocublox.tv, or a local copy of it): its own routes, and Roblox CDN files (3D
+    // models, textures, thumbnails) through its /v1/cdn route. RoPorter never contacts Roblox directly.
     public sealed class RobloxModelDownloader
     {
+        public const string DefaultApi = "https://api.ocublox.tv";
+
         private readonly HttpClient client;
         private readonly string apiBase;
 
         public RobloxModelDownloader(HttpClient client, string apiBase = null)
         {
             this.client = client ?? throw new ArgumentNullException(nameof(client));
-            this.apiBase = NormalizeApiBase(apiBase);
+            this.apiBase = Api(apiBase);
         }
 
-        // Accepts an optional API that mirrors Roblox's thumbnail and asset-delivery routes. HTTPS is required,
-        // except for loopback addresses so a locally running copy of the API can be used during development.
+        private static string Api(string apiBase) => NormalizeApiBase(apiBase) ?? DefaultApi;
+
+        // The API's address. HTTPS is required, except for loopback addresses so a locally running copy of the API can be
+        // used during development.
         public static string NormalizeApiBase(string value)
         {
             if (string.IsNullOrWhiteSpace(value))
@@ -50,8 +65,7 @@ namespace Rbx2Source.Export
         {
             if (id <= 0)
                 throw new ArgumentOutOfRangeException(nameof(id), "Roblox IDs must be positive.");
-            return (NormalizeApiBase(apiBase) ?? "https://thumbnails.roblox.com") + "/v1/" +
-                (avatar ? "users/avatar-3d?userId=" : "assets-thumbnail-3d?assetId=") +
+            return Api(apiBase) + "/v1/" + (avatar ? "users/avatar-3d?userId=" : "assets-thumbnail-3d?assetId=") +
                 id.ToString(CultureInfo.InvariantCulture);
         }
 
@@ -61,13 +75,8 @@ namespace Rbx2Source.Export
         {
             if (id <= 0)
                 throw new ArgumentOutOfRangeException(nameof(id), "Roblox IDs must be positive.");
-            string ids = id.ToString(CultureInfo.InvariantCulture);
-            string api = NormalizeApiBase(apiBase);
-            if (api != null)
-                return api + (avatar ? "/v1/users/headshot?userId=" : "/v1/catalog/thumbnail?assetId=") + ids +
-                    (avatar && background ? "&background=true" : "");
-            return "https://thumbnails.roblox.com/v1/" + (avatar ? "users/avatar-headshot?userIds=" : "assets?assetIds=") + ids +
-                "&size=420x420&format=Png";
+            return Api(apiBase) + (avatar ? "/v1/users/headshot?userId=" : "/v1/catalog/thumbnail?assetId=") +
+                id.ToString(CultureInfo.InvariantCulture) + (avatar && background ? "&background=true" : "");
         }
 
         // Downloads the thumbnail image. Only completed thumbnails hosted on Roblox's CDN are accepted.
@@ -79,10 +88,7 @@ namespace Rbx2Source.Export
         {
             if (userId <= 0)
                 throw new ArgumentOutOfRangeException(nameof(userId), "Roblox IDs must be positive.");
-            string url = apiBase != null
-                ? apiBase + "/v1/users/avatar?userId=" + userId.ToString(CultureInfo.InvariantCulture)
-                : "https://thumbnails.roblox.com/v1/users/avatar?userIds=" + userId.ToString(CultureInfo.InvariantCulture) + "&size=420x420&format=Png";
-            return DownloadThumbnailAsync(new Uri(url), cancellation);
+            return DownloadThumbnailAsync(new Uri(apiBase + "/v1/users/avatar?userId=" + userId.ToString(CultureInfo.InvariantCulture)), cancellation);
         }
 
         // The user's profile background from the API's /v1/users/background route: its image, or else its colour. Both are
@@ -91,8 +97,7 @@ namespace Rbx2Source.Export
         {
             if (userId <= 0)
                 throw new ArgumentOutOfRangeException(nameof(userId), "Roblox IDs must be positive.");
-            string api = apiBase ?? "https://api.ocublox.tv";
-            JObject result = JObject.Parse(Encoding.UTF8.GetString(await DownloadAsync(new Uri(api + "/v1/users/background?userId=" +
+            JObject result = JObject.Parse(Encoding.UTF8.GetString(await DownloadAsync(new Uri(apiBase + "/v1/users/background?userId=" +
                 userId.ToString(CultureInfo.InvariantCulture)), cancellation).ConfigureAwait(false)));
             Color? color = null;
             string hex = result.Value<string>("color");
@@ -101,11 +106,8 @@ namespace Rbx2Source.Export
             string reference = result.Value<string>("imageUrl");
             if (string.IsNullOrWhiteSpace(reference))
                 return new KeyValuePair<byte[], Color?>(null, color);
-            // The image is an asset on the API ("/v1/asset?id=..."), or on Roblox's CDN.
-            Uri apiUri = new Uri(api + "/");
-            if (!Uri.TryCreate(apiUri, reference, out Uri image) || !(image.Authority == apiUri.Authority && image.Scheme == apiUri.Scheme || IsRobloxHost(image)))
-                throw new InvalidDataException("The profile background is not hosted on the API or Roblox.");
-            byte[] bytes = await DownloadAsync(image, cancellation).ConfigureAwait(false);
+            // The image is an asset on the API ("/v1/asset?id=..."), or a Roblox CDN file (fetched through the API).
+            byte[] bytes = await DownloadAsync(Hosted(reference, "The profile background"), cancellation).ConfigureAwait(false);
             try
             {
                 using (var stream = new MemoryStream(bytes))
@@ -134,9 +136,7 @@ namespace Rbx2Source.Export
                 }
                 if (state != "Completed")
                     throw new InvalidDataException("The thumbnail is unavailable (state: " + (state ?? "missing") + ").");
-                if (!Uri.TryCreate(result.Value<string>("imageUrl"), UriKind.Absolute, out Uri image) || !IsRobloxHost(image))
-                    throw new InvalidDataException("The thumbnail is not hosted on Roblox's CDN.");
-                byte[] bytes = await DownloadAsync(image, cancellation).ConfigureAwait(false);
+                byte[] bytes = await DownloadAsync(Hosted(result.Value<string>("imageUrl"), "The thumbnail"), cancellation).ConfigureAwait(false);
                 try
                 {
                     using (var stream = new MemoryStream(bytes))
@@ -152,42 +152,12 @@ namespace Rbx2Source.Export
             }
         }
 
-        public async Task<long> ResolveIdAsync(string input, bool avatar, CancellationToken cancellation)
+        // The ID typed in (the input box takes digits only).
+        public Task<long> ResolveIdAsync(string input, bool avatar, CancellationToken cancellation)
         {
-            input = input?.Trim() ?? "";
-            if (long.TryParse(input, NumberStyles.None, CultureInfo.InvariantCulture, out long id) && id > 0)
-                return id;
-            if (Uri.TryCreate(input, UriKind.Absolute, out Uri uri))
-            {
-                if (uri.Scheme != Uri.UriSchemeHttps ||
-                    !(uri.Host == "roblox.com" || uri.Host == "www.roblox.com"))
-                    throw new ArgumentException("Use an HTTPS roblox.com profile or catalog URL.");
-                Match match = Regex.Match(uri.AbsolutePath, avatar ? @"^/users/(\d+)(?:/|$)" : @"^/catalog/(\d+)(?:/|$)");
-                if (match.Success && long.TryParse(match.Groups[1].Value, out id) && id > 0)
-                    return id;
-                throw new ArgumentException(avatar ? "Expected a Roblox profile URL." : "Expected a Roblox catalog item URL, not a bundle.");
-            }
-            if (!avatar || !Regex.IsMatch(input, @"^[A-Za-z0-9_]{3,20}$") || input.All(char.IsDigit))
-                throw new ArgumentException(avatar ? "Enter a username, positive user ID, or Roblox profile URL." :
-                    "Enter a positive item ID or Roblox catalog URL.");
-
-            var body = new JObject
-            {
-                ["usernames"] = new JArray(input),
-                ["excludeBannedUsers"] = false
-            };
-            using (var request = new HttpRequestMessage(HttpMethod.Post, "https://users.roblox.com/v1/usernames/users"))
-            {
-                request.Content = new StringContent(body.ToString(Formatting.None), Encoding.UTF8, "application/json");
-                JObject result = JObject.Parse(Encoding.UTF8.GetString(await SendAsync(request, cancellation).ConfigureAwait(false)));
-                JArray users = result["data"] as JArray;
-                if (users == null || users.Count == 0)
-                    throw new InvalidDataException("No Roblox user was found for that username.");
-                id = users[0].Value<long?>("id") ?? 0;
-                if (id <= 0)
-                    throw new InvalidDataException("Roblox returned an invalid user ID.");
-                return id;
-            }
+            if (long.TryParse(input?.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out long id) && id > 0)
+                return Task.FromResult(id);
+            throw new ArgumentException(avatar ? "Enter a positive user ID." : "Enter a positive item ID.");
         }
 
         public static Uri ResolveCdnReference(string reference)
@@ -210,21 +180,92 @@ namespace Rbx2Source.Export
             return new Uri("https://t" + shard % 8 + ".rbxcdn.com/" + reference);
         }
 
-        private async Task<byte[]> SendAsync(HttpRequestMessage request, CancellationToken cancellation)
+        private bool IsApi(Uri uri)
         {
-            using (HttpResponseMessage response = await client.SendAsync(request, cancellation).ConfigureAwait(false))
+            var api = new Uri(apiBase + "/");
+            return uri.Scheme == api.Scheme && uri.Authority == api.Authority;
+        }
+
+        private static bool IsRobloxCdn(Uri uri) => uri.Scheme == Uri.UriSchemeHttps && uri.IsDefaultPort && uri.UserInfo.Length == 0 &&
+            uri.Host.EndsWith(".rbxcdn.com", StringComparison.OrdinalIgnoreCase);
+
+        // Where a request really goes: the API's own routes as they are, and Roblox CDN files through its /v1/cdn route. Any
+        // other host is refused, so nothing is ever requested from Roblox directly.
+        private Uri ToApi(Uri uri)
+        {
+            if (IsApi(uri))
+                return uri;
+            if (IsRobloxCdn(uri))
+                return new Uri(apiBase + "/v1/cdn?url=" + Uri.EscapeDataString(uri.AbsoluteUri));
+            throw new InvalidDataException("RoPorter only downloads through its API, not from " + uri.Host + ".");
+        }
+
+        // A file the API points to: one of its own (absolute, or relative like "/v1/asset?id=...") or a Roblox CDN file.
+        private Uri Hosted(string reference, string what)
+        {
+            if (string.IsNullOrWhiteSpace(reference) || !Uri.TryCreate(new Uri(apiBase + "/"), reference, out Uri uri) || !(IsApi(uri) || IsRobloxCdn(uri)))
+                throw new InvalidDataException(what + " is not hosted on the API or Roblox's CDN.");
+            return uri;
+        }
+
+        // Requests the API; the "Roblox-AssetFormat" header asks its asset route for a particular build of an asset. The API
+        // passes on Roblox's rate limit (HTTP 429), so a limited request is tried again a couple of times, after the wait
+        // the API asks for (Retry-After) or 2 and then 4 seconds.
+        private async Task<HttpResponseMessage> GetAsync(Uri uri, string assetFormat, CancellationToken cancellation)
+        {
+            for (int attempt = 0; ; attempt++)
             {
-                if (response.StatusCode == HttpStatusCode.Unauthorized || response.StatusCode == HttpStatusCode.Forbidden)
-                    throw new HttpRequestException("Roblox denied access (HTTP " + (int)response.StatusCode + "). " +
-                        "This application cannot bypass " +
-                        "Roblox's access restrictions. Never paste account cookies.");
+                using (var request = new HttpRequestMessage(HttpMethod.Get, ToApi(uri)))
+                {
+                    // Signed CDN locations do not need the format header; the API's asset route does.
+                    if (assetFormat != null && !IsRobloxCdn(uri))
+                        request.Headers.TryAddWithoutValidation("Roblox-AssetFormat", assetFormat);
+                    HttpResponseMessage response = await client.SendAsync(request, cancellation).ConfigureAwait(false);
+                    if ((int)response.StatusCode != 429 || attempt >= RateLimitRetries)
+                        return response;
+                    TimeSpan? asked = response.Headers.RetryAfter?.Delta ?? response.Headers.RetryAfter?.Date - DateTimeOffset.UtcNow;
+                    TimeSpan wait = asked.HasValue && asked.Value > TimeSpan.Zero
+                        ? TimeSpan.FromSeconds(Math.Min(asked.Value.TotalSeconds, 15)) : TimeSpan.FromSeconds(2 << attempt);
+                    response.Dispose();
+                    await Task.Delay(wait, cancellation).ConfigureAwait(false);
+                }
+            }
+        }
+
+        private const int RateLimitRetries = 2;
+
+        private async Task<byte[]> DownloadAsync(Uri uri, CancellationToken cancellation)
+        {
+            using (HttpResponseMessage response = await GetAsync(uri, null, cancellation).ConfigureAwait(false))
+            {
                 if (!response.IsSuccessStatusCode)
-                    throw new HttpRequestException("Roblox request failed: HTTP " + (int)response.StatusCode +
-                        " (" + response.ReasonPhrase + ") from " + request.RequestUri.Host + ".");
+                    throw await FailureAsync(response, ToApi(uri)).ConfigureAwait(false);
                 byte[] data = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
                 cancellation.ThrowIfCancellationRequested();
-                return await DecodeAsync(data, request.RequestUri.Host, cancellation).ConfigureAwait(false);
+                return await DecodeAsync(data, uri.Host, cancellation).ConfigureAwait(false);
             }
+        }
+
+        // The error for a failed API request. HTTP 503 means the API is down for maintenance, shown as just "Server under
+        // maintenance. Please check back later." (ApiMessageException). Anything else reads "The API answered HTTP 404 (Not
+        // Found) for /v1/cdn: <the API's error message>." (an AssetAccessException for an asset the API may not download).
+        private static async Task<Exception> FailureAsync(HttpResponseMessage response, Uri uri, bool assetAccess = false)
+        {
+            if (response.StatusCode == HttpStatusCode.ServiceUnavailable)
+                return new ApiMessageException(ApiMessageException.Maintenance);
+            JObject body = null;
+            try
+            {
+                body = JObject.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
+            }
+            catch (Exception error) when (error is JsonException || error is InvalidOperationException || error is HttpRequestException)
+            {
+            }
+            string detail = (body?["errors"] as JArray)?.OfType<JObject>().Select(entry => entry["message"]?.ToString())
+                .FirstOrDefault(message => !string.IsNullOrWhiteSpace(message)) ?? (body?["message"] ?? body?["error"])?.ToString();
+            string message = "The API answered HTTP " + (int)response.StatusCode + (string.IsNullOrEmpty(response.ReasonPhrase) ? "" : " (" + response.ReasonPhrase + ")") +
+                " for " + uri.AbsolutePath + (string.IsNullOrWhiteSpace(detail) ? "." : ": " + detail.Trim().TrimEnd('.') + ".");
+            return assetAccess ? new AssetAccessException(message) : (Exception)new HttpRequestException(message);
         }
 
         private static async Task<byte[]> DecodeAsync(byte[] data, string host, CancellationToken cancellation)
@@ -255,61 +296,35 @@ namespace Rbx2Source.Export
             return data;
         }
 
-        private static bool IsRobloxHost(Uri uri)
-        {
-            return uri.Scheme == Uri.UriSchemeHttps && uri.IsDefaultPort && uri.UserInfo.Length == 0 &&
-                (uri.Host.EndsWith(".rbxcdn.com", StringComparison.OrdinalIgnoreCase) ||
-                 uri.Host.EndsWith(".roblox.com", StringComparison.OrdinalIgnoreCase));
-        }
-
-        // Downloads an asset, following redirects only to Roblox hosts or the configured API host.
+        // Downloads an asset from the API's /v1/asset route. A redirect may only lead to the API or to a Roblox CDN file, which
+        // is fetched through the API too.
         private async Task<byte[]> GetAssetBytesAsync(Uri uri, string assetFormat, CancellationToken cancellation)
         {
-            Uri trusted = apiBase != null ? new Uri(apiBase) : null;
             for (int hop = 0; hop < 5; hop++)
             {
-                using (var request = new HttpRequestMessage(HttpMethod.Get, uri))
+                Uri requested = ToApi(uri);
+                using (HttpResponseMessage response = await GetAsync(uri, assetFormat, cancellation).ConfigureAwait(false))
                 {
-                    // Signed CDN locations do not need the format header; Roblox and the user's API do.
-                    if (assetFormat != null && !uri.Host.EndsWith(".rbxcdn.com", StringComparison.OrdinalIgnoreCase))
-                        request.Headers.TryAddWithoutValidation("Roblox-AssetFormat", assetFormat);
-                    using (HttpResponseMessage response = await client.SendAsync(request, cancellation).ConfigureAwait(false))
+                    int status = (int)response.StatusCode;
+                    if (status >= 300 && status < 400 && response.Headers.Location != null)
                     {
-                        int status = (int)response.StatusCode;
-                        if (status >= 300 && status < 400 && response.Headers.Location != null)
-                        {
-                            Uri next = response.Headers.Location.IsAbsoluteUri ? response.Headers.Location : new Uri(uri, response.Headers.Location);
-                            bool apiHost = trusted != null && next.Scheme == trusted.Scheme && next.Authority == trusted.Authority;
-                            if (!IsRobloxHost(next) && !apiHost)
-                                throw new InvalidDataException("An asset download redirected to an untrusted host: " + next.Host);
-                            uri = next;
-                            continue;
-                        }
-                        if (status == 401 || status == 403)
-                            throw new AssetAccessException("Roblox requires authentication to download this asset (HTTP " + status + ").");
-                        if (!response.IsSuccessStatusCode)
-                            throw new HttpRequestException("Asset download failed: HTTP " + status + " from " + uri.Host + ".");
-                        byte[] data = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
-                        cancellation.ThrowIfCancellationRequested();
-                        return await DecodeAsync(data, uri.Host, cancellation).ConfigureAwait(false);
+                        uri = response.Headers.Location.IsAbsoluteUri ? response.Headers.Location : new Uri(requested, response.Headers.Location);
+                        if (!IsApi(uri) && !IsRobloxCdn(uri))
+                            throw new InvalidDataException("An asset download redirected to an untrusted host: " + uri.Host);
+                        continue;
                     }
+                    if (!response.IsSuccessStatusCode)
+                        throw await FailureAsync(response, requested, assetAccess: status == 401 || status == 403).ConfigureAwait(false);
+                    byte[] data = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+                    cancellation.ThrowIfCancellationRequested();
+                    return await DecodeAsync(data, uri.Host, cancellation).ConfigureAwait(false);
                 }
             }
             throw new InvalidDataException("An asset download redirected too many times.");
         }
 
-        private async Task<byte[]> DownloadAssetFormatAsync(long assetId, string assetFormat, CancellationToken cancellation)
-        {
-            string query = "/v1/asset/?id=" + assetId.ToString(CultureInfo.InvariantCulture);
-            try
-            {
-                return await GetAssetBytesAsync(new Uri("https://assetdelivery.roblox.com" + query), assetFormat, cancellation).ConfigureAwait(false);
-            }
-            catch (AssetAccessException) when (apiBase != null)
-            {
-                return await GetAssetBytesAsync(new Uri(apiBase + query), assetFormat, cancellation).ConfigureAwait(false);
-            }
-        }
+        private Task<byte[]> DownloadAssetFormatAsync(long assetId, string assetFormat, CancellationToken cancellation) =>
+            GetAssetBytesAsync(new Uri(apiBase + "/v1/asset/?id=" + assetId.ToString(CultureInfo.InvariantCulture)), assetFormat, cancellation);
 
         // Without a format, Roblox serves a legacy build of avatar assets. For dynamic heads that build is a
         // SpecialMesh whose mesh has no skeleton or FACS data, so "avatar_meshpart_head" must be requested.
@@ -366,7 +381,8 @@ namespace Rbx2Source.Export
                             {
                                 accessory.Mesh = RobloxMesh.Parse(await DownloadAssetAsync(accessory.MeshId.Value, cancellation).ConfigureAwait(false));
                             }
-                            catch (Exception error) when (!(error is OperationCanceledException) && !(error is OutOfMemoryException))
+                            catch (Exception error) when (!(error is OperationCanceledException) && !(error is OutOfMemoryException) &&
+                                !(error is ApiMessageException))
                             {
                                 progress?.Report(accessory.Name + ": its mesh could not be read (" + error.Message + ")" +
                                     (accessory.Layered ? "; it will be auto-weighted." : "; it is matched by position."));
@@ -404,7 +420,11 @@ namespace Rbx2Source.Export
                     data = await DownloadAssetAsync(animation.Value, cancellation).ConfigureAwait(false);
                 Dictionary<string, float> pose = MoodAnimation.ReadFacePose(data);
                 if (pose.Count == 0)
-                    throw new InvalidDataException("it has no face keyframe");
+                {
+                    // Roblox's "Default Mood" is an empty animation: the face simply rests neutral.
+                    progress?.Report("Mood " + asset.Value<string>("name") + " sets no expression (the face rests neutral), so there is no mood to apply.");
+                    return null;
+                }
                 return pose;
             }
             catch (Exception error) when (error is HttpRequestException || error is InvalidDataException ||
@@ -431,8 +451,12 @@ namespace Rbx2Source.Export
             if (references.Key == null)
                 throw new InvalidDataException("the head asset does not reference a mesh");
             RobloxMesh mesh = RobloxMesh.Parse(await DownloadAssetAsync(references.Key.Value, cancellation).ConfigureAwait(false));
+            // Roblox serves its own dynamic heads' facial animation only in the "avatar_meshpart_head" build; without that
+            // format it sends an older build of the head with a plain mesh.
             if (mesh.Facs == null)
-                throw new InvalidDataException("this head (mesh " + mesh.Version + ") has no FACS facial animation data");
+                throw new InvalidDataException("this head (mesh " + mesh.Version + ") has no FACS facial animation data" +
+                    (head["assetType"]?.Value<int?>("id") == 79
+                        ? ". The API sent the head's older build: its /v1/asset route must pass the Roblox-AssetFormat header on to Roblox" : ""));
             progress?.Report("Building " + mesh.Facs.ControlNames.Count + " FACS face shapes...");
             Dictionary<string, float> mood = await GetMoodAsync(assets, progress, cancellation).ConfigureAwait(false);
             var shapes = FaceShapeBuilder.EvaluateShapes(mesh, faceTracking, vrchat, mood, cancellation);
@@ -504,6 +528,7 @@ namespace Rbx2Source.Export
                     if (shape.Deltas.TryGetValue(nearest, out float[] delta))
                         shape.Deltas[index] = delta;
             }
+            face.Layers.Add(layer);
         }
 
         // Roblox packs PBR as R = metalness, G = roughness, B = emissive mask; glTF wants G = roughness, B = metalness.
@@ -646,20 +671,68 @@ namespace Rbx2Source.Export
             }
         }
 
-        private async Task<byte[]> DownloadAsync(Uri uri, CancellationToken cancellation)
-        {
-            using (var request = new HttpRequestMessage(HttpMethod.Get, uri))
-                return await SendAsync(request, cancellation).ConfigureAwait(false);
-        }
-
-        // The account's username (not the display name): from the API's /v1/users route, or Roblox's public users API.
+        // The account's username (not the display name): from the API's /v1/users route.
         public static string GetUserUrl(long userId, string apiBase = null)
         {
             if (userId <= 0)
                 throw new ArgumentOutOfRangeException(nameof(userId), "Roblox IDs must be positive.");
-            string ids = userId.ToString(CultureInfo.InvariantCulture);
-            string api = NormalizeApiBase(apiBase);
-            return api != null ? api + "/v1/users?userId=" + ids : "https://users.roblox.com/v1/users/" + ids;
+            return Api(apiBase) + "/v1/users?userId=" + userId.ToString(CultureInfo.InvariantCulture);
+        }
+
+        // The avatar's worn items (Roblox's avatar details JSON, with its "assets" list) from the API's /v1/users/avatar-details
+        // route.
+        public static string GetAvatarDetailsUrl(long userId, string apiBase = null)
+        {
+            if (userId <= 0)
+                throw new ArgumentOutOfRangeException(nameof(userId), "Roblox IDs must be positive.");
+            return Api(apiBase) + "/v1/users/avatar-details?userId=" + userId.ToString(CultureInfo.InvariantCulture);
+        }
+
+        // The last item list received for each user, kept on this PC (%LOCALAPPDATA%\RoPorter\avatars\<user ID>.json).
+        private static readonly string SavedAvatars = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "RoPorter", "avatars");
+
+        // The avatar's worn items. Roblox rate-limits the API's requests for them (HTTP 429), so each list received is kept,
+        // and when the API can't answer, the one saved by an earlier export of the same user is used instead. Items worn since
+        // then are missing from it; items no longer worn simply match nothing in the render.
+        private async Task<List<JObject>> GetAvatarAssetsAsync(long userId, IProgress<string> progress, CancellationToken cancellation)
+        {
+            string saved = Path.Combine(SavedAvatars, userId.ToString(CultureInfo.InvariantCulture) + ".json");
+            string json;
+            try
+            {
+                json = Encoding.UTF8.GetString(await DownloadAsync(new Uri(GetAvatarDetailsUrl(userId, apiBase)), cancellation).ConfigureAwait(false));
+                JObject.Parse(json);
+                try
+                {
+                    Directory.CreateDirectory(SavedAvatars);
+                    File.WriteAllText(saved, json, new UTF8Encoding(false));
+                }
+                catch (Exception error) when (error is IOException || error is UnauthorizedAccessException)
+                {
+                }
+            }
+            catch (Exception error) when (error is HttpRequestException || error is JsonException)
+            {
+                string fallback = null;
+                DateTime when = default;
+                try
+                {
+                    if (File.Exists(saved))
+                    {
+                        fallback = File.ReadAllText(saved);
+                        when = File.GetLastWriteTime(saved);
+                    }
+                }
+                catch (Exception readError) when (readError is IOException || readError is UnauthorizedAccessException)
+                {
+                }
+                if (fallback == null)
+                    throw;
+                json = fallback;
+                progress?.Report("Avatar details unavailable (" + error.Message + "); using the item list saved by an earlier export on " +
+                    when.ToString("g", CultureInfo.CurrentCulture) + ".");
+            }
+            return (JObject.Parse(json)["assets"] as JArray)?.OfType<JObject>().ToList() ?? new List<JObject>();
         }
 
         // Roblox usernames are 3-20 letters, digits, and underscores, so they are safe as file and Source model names.
@@ -697,7 +770,7 @@ namespace Rbx2Source.Export
         {
             if (itemId <= 0)
                 throw new ArgumentOutOfRangeException(nameof(itemId), "Roblox IDs must be positive.");
-            JObject item = JObject.Parse(Encoding.UTF8.GetString(await DownloadAsync(new Uri((apiBase ?? "https://api.ocublox.tv") +
+            JObject item = JObject.Parse(Encoding.UTF8.GetString(await DownloadAsync(new Uri(apiBase +
                 "/v1/catalog?itemId=" + itemId.ToString(CultureInfo.InvariantCulture)), cancellation).ConfigureAwait(false)));
             if (item["data"] is JArray batch)
                 item = batch.First as JObject ?? throw new InvalidDataException("Roblox returned no details for item " + itemId + ".");
@@ -721,11 +794,62 @@ namespace Rbx2Source.Export
         public async Task<string> GetCatalogDisplayNameAsync(long itemId, CancellationToken cancellation) =>
             DisplayName(await GetCatalogItemAsync(itemId, cancellation).ConfigureAwait(false), itemId);
 
-        private async Task<string> GetDescriptorUrlAsync(long id, bool avatar, IProgress<string> progress, CancellationToken cancellation)
+        private Task<string> GetDescriptorUrlAsync(long id, bool avatar, IProgress<string> progress, CancellationToken cancellation) =>
+            GetDescriptorUrlAsync(new Uri(GetRequestUrl(id, avatar, apiBase)), progress, cancellation);
+
+        // A Roblox bundle (a body, a costume...): its name, its items in the avatar API's asset format, and the outfit that
+        // Roblox renders the whole bundle as.
+        public sealed class BundleInfo
+        {
+            public long Id;
+            public string Name;
+            public long OutfitId;
+            public List<JObject> Assets = new List<JObject>();
+        }
+
+        // Bundle details (Roblox's catalog bundle JSON) from the API's /v1/bundle route.
+        public static string GetBundleUrl(long bundleId, string apiBase = null)
+        {
+            if (bundleId <= 0)
+                throw new ArgumentOutOfRangeException(nameof(bundleId), "Roblox IDs must be positive.");
+            return Api(apiBase) + "/v1/bundle?bundleId=" + bundleId.ToString(CultureInfo.InvariantCulture);
+        }
+
+        // The outfit's 3D render (the same JSON as avatar-3d), from the API's /v1/users/outfit-3d route.
+        public static string GetOutfitRequestUrl(long outfitId, string apiBase = null) =>
+            Api(apiBase) + "/v1/users/outfit-3d?outfitId=" + outfitId.ToString(CultureInfo.InvariantCulture);
+
+        public async Task<BundleInfo> GetBundleAsync(long bundleId, CancellationToken cancellation)
+        {
+            JObject details = JObject.Parse(Encoding.UTF8.GetString(await DownloadAsync(new Uri(GetBundleUrl(bundleId, apiBase)), cancellation).ConfigureAwait(false)));
+            var bundle = new BundleInfo { Id = bundleId, Name = details.Value<string>("name")?.Trim() };
+            foreach (JObject item in (details["items"] as JArray)?.OfType<JObject>() ?? Enumerable.Empty<JObject>())
+            {
+                string type = item.Value<string>("type");
+                if (type == "UserOutfit" && bundle.OutfitId == 0)
+                    bundle.OutfitId = item.Value<long?>("id") ?? 0;
+                else if (type == "Asset")
+                {
+                    int assetType = item["assetType"] is JObject typed ? typed.Value<int?>("id") ?? 0 : item.Value<int?>("assetType") ?? 0;
+                    bundle.Assets.Add(new JObject { ["id"] = item["id"], ["name"] = item["name"], ["assetType"] = new JObject { ["id"] = assetType } });
+                }
+            }
+            if (string.IsNullOrEmpty(bundle.Name))
+                throw new InvalidDataException("Roblox returned no bundle " + bundleId + ".");
+            if (bundle.OutfitId <= 0)
+                throw new InvalidDataException("Bundle " + bundleId + " has no outfit for Roblox to render.");
+            return bundle;
+        }
+
+        // The bundle's catalog picture (Roblox's bundle thumbnail JSON) from the API's /v1/bundle/thumbnail route.
+        public Task<byte[]> DownloadBundleThumbnailAsync(long bundleId, CancellationToken cancellation) =>
+            DownloadThumbnailAsync(new Uri(apiBase + "/v1/bundle/thumbnail?bundleId=" + bundleId.ToString(CultureInfo.InvariantCulture)), cancellation);
+
+        private async Task<string> GetDescriptorUrlAsync(Uri requestUrl, IProgress<string> progress, CancellationToken cancellation)
         {
             for (int attempt = 0; attempt < 20; attempt++)
             {
-                byte[] bytes = await DownloadAsync(new Uri(GetRequestUrl(id, avatar, apiBase)), cancellation).ConfigureAwait(false);
+                byte[] bytes = await DownloadAsync(requestUrl, cancellation).ConfigureAwait(false);
                 JObject result = JObject.Parse(Encoding.UTF8.GetString(bytes));
                 if (result["data"] is JArray batch)
                     result = batch.First as JObject ?? throw new InvalidDataException("Roblox returned no 3D thumbnail.");
@@ -760,7 +884,7 @@ namespace Rbx2Source.Export
             progress?.Report("Downloading mesh " + item.MeshId.Value + "...");
             RobloxMesh mesh = RobloxMesh.Parse(await DownloadAssetAsync(item.MeshId.Value, cancellation).ConfigureAwait(false));
 
-            var material = new ObjMaterial { Name = "Item" };
+            var material = new ObjMaterial { Name = "Item", DoubleSided = item.DoubleSided };
             if (item.TextureId.HasValue)
             {
                 try
@@ -804,34 +928,70 @@ namespace Rbx2Source.Export
 
         public async Task<string> ExportAsync(long id, bool avatar, string descriptorUrl, string outputFolder,
             IProgress<string> progress, CancellationToken cancellation, ExportFormat format = ExportFormat.Glb, bool faceTracking = false,
-            bool vrchatShapes = true, bool singleTexture = false, float scale = 1, bool connectJoints = false)
+            bool vrchatShapes = true, bool singleTexture = false, float scale = 1, bool connectJoints = false, BundleInfo bundle = null,
+            bool applyMood = true, bool ownFolder = true, string modelFile = null)
         {
-            if (format != ExportFormat.Glb && format != ExportFormat.Gltf && format != ExportFormat.Fbx && format != ExportFormat.GarrysMod)
+            // A model file (.rbxm / .rbxmx) exports like a catalog item: a prop named after the file.
+            if (modelFile != null)
+            {
+                avatar = false;
+                bundle = null;
+            }
+            // A bundle exports like an avatar wearing it: Roblox's render of the bundle's outfit, with its items as the assets.
+            if (bundle != null)
+            {
+                avatar = true;
+                id = bundle.Id;
+            }
+            if (format != ExportFormat.Glb && format != ExportFormat.Gltf && format != ExportFormat.Fbx && format != ExportFormat.GarrysMod &&
+                format != ExportFormat.SourceFilmmaker)
                 throw new ArgumentOutOfRangeException(nameof(format));
             if (!(scale >= MinimumScale && scale <= 1))
                 throw new ArgumentOutOfRangeException(nameof(scale), "The export scale must be between " + MinimumScale.ToString(CultureInfo.InvariantCulture) + " and 1.");
+            // Both Source formats build the same Source model; Valve's player skeleton is read from Garry's Mod's files.
+            bool source = format == ExportFormat.GarrysMod || format == ExportFormat.SourceFilmmaker;
             GarrysModInstall garrysMod = null;
-            if (format == ExportFormat.GarrysMod)
+            SfmInstall sfm = null;
+            if (source)
             {
-                garrysMod = GarrysModInstall.Find(GarrysModPath) ?? throw new InvalidDataException(
-                    "Garry's Mod was not found. Install it through Steam (its studiomdl compiles the model).");
+                garrysMod = GarrysModInstall.Find(GarrysModPath) ?? throw new InvalidDataException(format == ExportFormat.GarrysMod
+                    ? "Garry's Mod was not found. Install it through Steam (its studiomdl compiles the model)."
+                    : "Garry's Mod was not found. Install it through Steam: Valve's player skeleton is read from its files.");
                 faceTracking = false;
             }
-            GetRequestUrl(id, avatar);
+            if (format == ExportFormat.SourceFilmmaker)
+                sfm = SfmInstall.Find() ?? throw new InvalidDataException("Source Filmmaker was not found. Install it through Steam (its studiomdl compiles the model).");
+            if (modelFile == null)
+                GetRequestUrl(id, avatar);
             cancellation.ThrowIfCancellationRequested();
             WavefrontModel model;
             JObject descriptor = null;
             var localTextures = new Dictionary<string, byte[]>(StringComparer.Ordinal);
-            if (!avatar && string.IsNullOrWhiteSpace(descriptorUrl))
+            // A place (.rbxl / .rbxlx) exported to Garry's Mod becomes a map; in other formats it is one static model.
+            ModelContents placeMap = null;
+            if (modelFile != null)
+            {
+                progress?.Report("Reading " + Path.GetFileName(modelFile) + "...");
+                ModelContents contents = ModelFileBuilder.Read(File.ReadAllBytes(modelFile));
+                if (contents.IsPlace && format == ExportFormat.GarrysMod)
+                {
+                    placeMap = contents;
+                    model = new WavefrontModel();
+                }
+                else
+                    model = await ModelFileBuilder.BuildAsync(contents, (assetId, token) => DownloadAssetAsync(assetId, token),
+                        localTextures, progress, cancellation).ConfigureAwait(false);
+            }
+            else if (!avatar && string.IsNullOrWhiteSpace(descriptorUrl))
             {
                 model = await BuildCatalogModelAsync(id, localTextures, progress, cancellation).ConfigureAwait(false);
             }
             else
             {
                 progress?.Report("Fetching Roblox's rendered 3D model...");
-                string url = string.IsNullOrWhiteSpace(descriptorUrl)
-                    ? await GetDescriptorUrlAsync(id, avatar, progress, cancellation).ConfigureAwait(false)
-                    : descriptorUrl.Trim();
+                string url = !string.IsNullOrWhiteSpace(descriptorUrl) ? descriptorUrl.Trim()
+                    : bundle != null ? await GetDescriptorUrlAsync(new Uri(GetOutfitRequestUrl(bundle.OutfitId, apiBase)), progress, cancellation).ConfigureAwait(false)
+                    : await GetDescriptorUrlAsync(id, avatar, progress, cancellation).ConfigureAwait(false);
                 Uri descriptorUri = ResolveCdnReference(url);
                 descriptor = JObject.Parse(Encoding.UTF8.GetString(await DownloadAsync(descriptorUri, cancellation).ConfigureAwait(false)));
                 string objReference = descriptor.Value<string>("obj");
@@ -853,10 +1013,7 @@ namespace Rbx2Source.Export
                 List<AccessoryInfo> accessories = null;
                 try
                 {
-                    JObject details = JObject.Parse(Encoding.UTF8.GetString(await DownloadAsync(
-                        new Uri("https://avatar.roblox.com/v1/users/" + id.ToString(CultureInfo.InvariantCulture) + "/avatar"),
-                        cancellation).ConfigureAwait(false)));
-                    avatarAssets = (details["assets"] as JArray)?.OfType<JObject>().ToList() ?? new List<JObject>();
+                    avatarAssets = bundle != null ? bundle.Assets : await GetAvatarAssetsAsync(id, progress, cancellation).ConfigureAwait(false);
                     accessories = await GetAccessoriesAsync(avatarAssets, progress, cancellation).ConfigureAwait(false);
                 }
                 catch (Exception error) when (error is HttpRequestException || error is InvalidDataException || error is JsonException)
@@ -866,14 +1023,18 @@ namespace Rbx2Source.Export
                 progress?.Report("Building humanoid rig...");
                 rig = AvatarRig.Build(model, accessories, cancellation, connectJoints);
                 progress?.Report("Rig parts: " + rig.Describe());
-                // Items held in a hand (gear, or UGC items Roblox renders in the hand) are in Roblox's render but are not part
-                // of the avatar. Garry's Mod keeps them as a bodygroup that starts hidden; other formats leave them out.
+                // Accessories whose MeshPart is DoubleSided are drawn from both sides; everything else is culled like Roblox.
+                foreach (ObjTriangle triangle in model.Triangles)
+                    if (rig.AccessoryGroups.TryGetValue(triangle.Group, out AccessoryInfo worn) && worn.DoubleSided)
+                        model.Materials[triangle.Material].DoubleSided = true;
+                // Gear (asset type 19) is in Roblox's render but is not part of the avatar. Garry's Mod keeps it as a bodygroup
+                // that starts hidden; other formats leave it out.
                 if (rig.HeldGroups.Count > 0)
                 {
                     gearGroups = new HashSet<string>(rig.HeldGroups, StringComparer.Ordinal);
                     string names = string.Join(", ", gearGroups.Select(group =>
                         rig.AccessoryGroups.TryGetValue(group, out AccessoryInfo item) ? item.Name : group).Distinct());
-                    if (format == ExportFormat.GarrysMod)
+                    if (source)
                         progress?.Report("Gear " + names + " is a \"gear\" bodygroup (hidden until it is switched on).");
                     else
                     {
@@ -885,9 +1046,17 @@ namespace Rbx2Source.Export
                 try
                 {
                     if (avatarAssets == null)
-                        throw new InvalidDataException("the avatar's asset list could not be downloaded");
+                        throw new InvalidDataException("the avatar's item list could not be downloaded");
                     face = await BuildFaceAsync(avatarAssets, model, rig, localTextures, faceTracking, vrchatShapes, progress, cancellation).ConfigureAwait(false);
                     progress?.Report("Added " + face.Shapes.Count + " face shape keys.");
+                    // Without the mood the face rests neutral: its "Default" shape key starts at 0 (and Source models don't
+                    // bake it in).
+                    FaceShape mood = face.Shapes.FirstOrDefault(shape => shape.Name == FaceShapeBuilder.MoodShapeName);
+                    if (mood != null && !applyMood)
+                    {
+                        mood.Weight = 0;
+                        progress?.Report("Mood expression not applied; the face is neutral.");
+                    }
                     if (faceTracking)
                     {
                         var unified = new HashSet<string>(FaceShapeBuilder.UnifiedExpressionNames, StringComparer.Ordinal);
@@ -898,9 +1067,9 @@ namespace Rbx2Source.Export
                 catch (Exception error) when (error is InvalidDataException || error is NotSupportedException ||
                     error is AssetAccessException || error is HttpRequestException || error is JsonException)
                 {
-                    string hint = error is AssetAccessException && apiBase == null
-                        ? " The API needs a /v1/asset/?id= route that can download Roblox assets." : "";
-                    progress?.Report("Face shape keys skipped: " + error.Message + hint);
+                    progress?.Report("Face shape keys skipped: " + error.Message);
+                    // Roblox renders the face with its mood, and without the head's own mesh it can't be undone.
+                    progress?.Report("The face stays as Roblox rendered it" + (applyMood ? "." : ", with its mood: Apply mood expression only works when the face shapes are built."));
                     if (faceTracking)
                         progress?.Report("Face tracking support needs a dynamic head with facial animation (FACS); none was added.");
                 }
@@ -934,7 +1103,29 @@ namespace Rbx2Source.Export
             // Avatars are named after the account's username, items after their catalog name: the export folder, the model
             // file, the single-texture files, and the Garry's Mod paths. Exporting the same name again replaces its folder.
             string username = null, itemName = null, itemLabel = null, itemType = null;
-            if (avatar)
+            if (modelFile != null)
+            {
+                // Model files are named after the file and listed under "Models" in Garry's Mod's spawn menu.
+                itemLabel = Path.GetFileNameWithoutExtension(modelFile).Trim();
+                itemType = "Models";
+                try
+                {
+                    itemName = SafeName(itemLabel, 0);
+                }
+                catch (InvalidDataException)
+                {
+                    itemName = "Model";
+                }
+                if (itemLabel.Length == 0)
+                    itemLabel = itemName;
+            }
+            else if (bundle != null)
+            {
+                // Bundles are named after the bundle; its name is also the playermodel's name in Garry's Mod.
+                username = bundle.Name;
+                itemName = SafeName(bundle.Name, bundle.Id);
+            }
+            else if (avatar)
                 try
                 {
                     username = await GetUsernameAsync(id, cancellation).ConfigureAwait(false);
@@ -955,13 +1146,39 @@ namespace Rbx2Source.Export
                 {
                     progress?.Report("Item name unavailable (" + error.Message + "); the export is named after item ID " + id + ".");
                 }
-            string name = username ?? itemName ?? id.ToString(CultureInfo.InvariantCulture);
-            string staging = Path.Combine(outputRoot, ".export-" + Guid.NewGuid().ToString("N"));
+            string name = (bundle != null ? itemName : username ?? itemName) ?? id.ToString(CultureInfo.InvariantCulture);
+            // A short name: Source paths inside it (materials\models\roporter\<name>\...) must stay under Windows' 260
+            // characters even in Garry's Mod's deep addons folder.
+            string staging;
+            do
+                staging = Path.Combine(outputRoot, ".rp-" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            while (Directory.Exists(staging) || File.Exists(staging));
+            // Without its own folder (to collect many exports in one), the export goes straight into the output folder; its
+            // textures folder is named after it so exports don't share one. Garry's Mod exports are collected into one addon:
+            // the output folder itself, or, when that is Garry's Mod's addons folder (where loose files would not load), the
+            // "RoPorter" addon inside it.
+            bool flat = !ownFolder;
+            string textureDir = flat ? name + "_textures" : "textures";
             string destination = Path.Combine(outputRoot, name);
+            string shared = format == ExportFormat.GarrysMod && IsAddonsFolder(outputRoot) ? Path.Combine(outputRoot, SharedAddon) : outputRoot;
             Directory.CreateDirectory(staging);
             try
             {
-                Directory.CreateDirectory(Path.Combine(staging, "textures"));
+                if (placeMap != null)
+                {
+                    string mapFile = await ExportPlaceMapAsync(placeMap, staging, name, itemLabel, scale, garrysMod, destination, progress, cancellation).ConfigureAwait(false);
+                    cancellation.ThrowIfCancellationRequested();
+                    if (flat)
+                    {
+                        MergeInto(staging, shared, name);
+                        ExportFolder = null;
+                        return Path.Combine(shared, mapFile);
+                    }
+                    await PublishAsync(staging, destination, progress, cancellation).ConfigureAwait(false);
+                    ExportFolder = destination;
+                    return Path.Combine(destination, mapFile);
+                }
+                Directory.CreateDirectory(Path.Combine(staging, textureDir));
                 var textures = new Dictionary<string, string>(StringComparer.Ordinal);
                 var maps = new Dictionary<string, MaterialMaps>(StringComparer.Ordinal);
                 var downloaded = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -1005,7 +1222,7 @@ namespace Rbx2Source.Export
                         if (decoded.Width <= 0 || decoded.Height <= 0)
                             throw new InvalidDataException("Roblox returned an invalid texture image.");
                     }
-                    relativePath = "textures/texture-" + downloaded.Count + extension;
+                    relativePath = textureDir + "/texture-" + downloaded.Count + extension;
                     File.WriteAllBytes(Full(relativePath), image);
                     downloaded.Add(sourceKey, relativePath);
                     return relativePath;
@@ -1037,7 +1254,7 @@ namespace Rbx2Source.Export
                         {
                             if (!converted.TryGetValue(relativePath + "|solid", out string solid))
                             {
-                                solid = "textures/material-" + textures.Count + "-solid.png";
+                                solid = textureDir + "/material-" + textures.Count + "-solid.png";
                                 Solidify(Full(relativePath), Full(solid));
                                 converted[relativePath + "|solid"] = solid;
                             }
@@ -1048,7 +1265,7 @@ namespace Rbx2Source.Export
                             string key = relativePath + "|" + string.Join(",", material.Diffuse);
                             if (!converted.TryGetValue(key, out string composite))
                             {
-                                composite = "textures/material-" + textures.Count + ".png";
+                                composite = textureDir + "/material-" + textures.Count + ".png";
                                 CompositeOverColor(Full(relativePath), Full(composite), material.Diffuse);
                                 converted[key] = composite;
                             }
@@ -1063,7 +1280,7 @@ namespace Rbx2Source.Export
                     {
                         if (!converted.TryGetValue(packed, out string metallicRoughness))
                         {
-                            metallicRoughness = "textures/metal-rough-" + converted.Count + ".png";
+                            metallicRoughness = textureDir + "/metal-rough-" + converted.Count + ".png";
                             PackMetallicRoughness(Full(packed), Full(metallicRoughness));
                             converted[packed] = metallicRoughness;
                         }
@@ -1100,14 +1317,69 @@ namespace Rbx2Source.Export
                 string fileName = name + (format == ExportFormat.Glb ? ".glb" : format == ExportFormat.Gltf ? ".gltf" : ".fbx");
                 if (scale < 1)
                     progress?.Report("Scale: " + scale.ToString("0.##", CultureInfo.InvariantCulture) + " of full size.");
-                if (format != ExportFormat.GarrysMod)
+                if (!source)
                     progress?.Report("Writing " + format.ToString().ToUpperInvariant() + ": " + model.Triangles.Count + " triangles...");
-                if (format == ExportFormat.GarrysMod)
+                if (format == ExportFormat.SourceFilmmaker)
                 {
-                    // Playermodels are listed under the account's username so players can find their avatar.
                     fileName = SourceExporter.Export(new ExportScene(model, rig, face, scale), textures, maps, staging, name, garrysMod, progress, cancellation,
-                        username, itemLabel, itemType, gearGroups);
-                    Directory.Delete(Path.Combine(staging, "textures"), true);
+                        username, itemLabel, itemType, gearGroups, sfm);
+                    Directory.Delete(Path.Combine(staging, textureDir), true);
+                    foreach (string file in atlas?.Files ?? new List<string>())
+                        if (File.Exists(Full(file)))
+                            File.Move(Full(file), Path.Combine(staging, "src", file));
+                    // SFM Workshop preview image: the avatar's headshot, the item's or the bundle's picture.
+                    byte[] picture = null;
+                    try
+                    {
+                        // A model file has no Roblox picture: its Workshop image is a plain background.
+                        picture = modelFile != null ? null : bundle != null ? await DownloadBundleThumbnailAsync(bundle.Id, cancellation).ConfigureAwait(false)
+                            : await DownloadThumbnailAsync(id, avatar, cancellation, background: true).ConfigureAwait(false);
+                    }
+                    catch (Exception error) when (error is HttpRequestException || error is InvalidDataException || error is JsonException)
+                    {
+                        progress?.Report("Thumbnail unavailable (" + error.Message + "); the Workshop image is a plain background.");
+                    }
+                    Workshop.WriteIcon(picture, Path.Combine(staging, Workshop.IconFile), avatar && bundle == null);
+                    // SFM Workshop page image, as for Garry's Mod: a bundle's picture, or an avatar's profile background with its
+                    // full-body render.
+                    try
+                    {
+                        if (bundle != null)
+                        {
+                            if (picture != null)
+                                Workshop.WritePreview(null, null, picture, Path.Combine(staging, Workshop.PreviewFile));
+                        }
+                        else if (avatar)
+                        {
+                            KeyValuePair<byte[], Color?> background = new KeyValuePair<byte[], Color?>(null, null);
+                            try
+                            {
+                                background = await DownloadProfileBackgroundAsync(id, cancellation).ConfigureAwait(false);
+                            }
+                            catch (Exception error) when (error is HttpRequestException || error is InvalidDataException || error is JsonException)
+                            {
+                                progress?.Report("Profile background unavailable (" + error.Message + ").");
+                            }
+                            Workshop.WritePreview(background.Key, background.Value, await DownloadAvatarRenderAsync(id, cancellation).ConfigureAwait(false),
+                                Path.Combine(staging, Workshop.PreviewFile));
+                        }
+                    }
+                    catch (Exception error) when (error is HttpRequestException || error is InvalidDataException || error is JsonException)
+                    {
+                        progress?.Report("Workshop page image skipped (" + error.Message + ").");
+                    }
+                    // A re-export keeps the SFM Workshop item of the last upload, so uploading again updates it.
+                    string previousId = Path.Combine(destination, SfmWorkshop.IdFile);
+                    if (File.Exists(previousId))
+                        File.Copy(previousId, Path.Combine(staging, SfmWorkshop.IdFile), true);
+                }
+                else if (format == ExportFormat.GarrysMod)
+                {
+                    // Playermodels are listed under the account's username so players can find their avatar. Bundles have their
+                    // own spawn menu category.
+                    fileName = SourceExporter.Export(new ExportScene(model, rig, face, scale), textures, maps, staging, name, garrysMod, progress, cancellation,
+                        username, itemLabel, itemType, gearGroups, playerCategory: bundle != null ? "Bundles" : null);
+                    Directory.Delete(Path.Combine(staging, textureDir), true);
                     // The merged PNGs are source art for a Source model; keep them with the other sources.
                     foreach (string file in atlas?.Files ?? new List<string>())
                         if (File.Exists(Full(file)))
@@ -1117,14 +1389,21 @@ namespace Rbx2Source.Export
                     byte[] thumbnail = null;
                     try
                     {
-                        thumbnail = await DownloadThumbnailAsync(id, avatar, cancellation, background: true).ConfigureAwait(false);
+                        thumbnail = modelFile != null ? null : bundle != null ? await DownloadBundleThumbnailAsync(bundle.Id, cancellation).ConfigureAwait(false)
+                            : await DownloadThumbnailAsync(id, avatar, cancellation, background: true).ConfigureAwait(false);
                     }
                     catch (Exception error) when (error is HttpRequestException || error is InvalidDataException || error is JsonException)
                     {
                         progress?.Report("Thumbnail unavailable (" + error.Message + "); the Workshop icon is a plain background.");
                     }
-                    Workshop.WriteIcon(thumbnail, Path.Combine(staging, Workshop.IconFile), avatar);
-                    if (avatar)
+                    Workshop.WriteIcon(thumbnail, Path.Combine(staging, Workshop.IconFile), avatar && bundle == null);
+                    if (bundle != null)
+                    {
+                        // Workshop page image for a bundle: its catalog picture on a plain background.
+                        if (thumbnail != null)
+                            Workshop.WritePreview(null, null, thumbnail, Path.Combine(staging, Workshop.PreviewFile));
+                    }
+                    else if (avatar)
                         try
                         {
                             // Workshop page image: the profile background with the full-body render on top.
@@ -1159,16 +1438,16 @@ namespace Rbx2Source.Export
                         File.Delete(Full(file));
                 if (format == ExportFormat.Glb)
                 {
-                    Directory.Delete(Path.Combine(staging, "textures"), true);
+                    Directory.Delete(Path.Combine(staging, textureDir), true);
                 }
-                else if (format != ExportFormat.GarrysMod)
+                else if (!source)
                 {
                     // Raw downloads replaced by composites, packed maps, or the atlas are not referenced by the model. FBX
                     // materials have no metalness/roughness input, so those maps are kept beside it instead.
                     var referenced = new HashSet<string>(textures.Values
                         .Concat(maps.Values.SelectMany(m => new[] { m.Normal, m.MetallicRoughness, m.Emissive }))
                         .Where(relative => relative != null).Select(relative => Path.GetFullPath(Full(relative))), StringComparer.OrdinalIgnoreCase);
-                    string folder = Path.Combine(staging, "textures");
+                    string folder = Path.Combine(staging, textureDir);
                     foreach (string file in Directory.GetFiles(folder))
                         if (!referenced.Contains(Path.GetFullPath(file)))
                             File.Delete(file);
@@ -1176,6 +1455,13 @@ namespace Rbx2Source.Export
                         Directory.Delete(folder);
                 }
                 cancellation.ThrowIfCancellationRequested();
+                if (flat)
+                {
+                    MergeInto(staging, shared, name);
+                    // A shared folder holds many exports, so it is not offered for Workshop upload.
+                    ExportFolder = null;
+                    return Path.Combine(shared, fileName);
+                }
                 await PublishAsync(staging, destination, progress, cancellation).ConfigureAwait(false);
                 ExportFolder = destination;
                 return Path.Combine(destination, fileName);
@@ -1192,6 +1478,71 @@ namespace Rbx2Source.Export
                 }
                 throw;
             }
+        }
+
+        // A place as a Garry's Mod map addon: the map, its materials and prop models, and an addon.json of type "map".
+        private async Task<string> ExportPlaceMapAsync(ModelContents contents, string staging, string name, string label, float scale,
+            GarrysModInstall garrysMod, string destination, IProgress<string> progress, CancellationToken cancellation)
+        {
+            string map = await SourceMap.ExportAsync(contents, (assetId, token) => DownloadAssetAsync(assetId, token), staging, name, scale,
+                garrysMod, progress, cancellation).ConfigureAwait(false);
+            // gmad cannot parse addon.json with a byte order mark.
+            File.WriteAllText(Path.Combine(staging, "addon.json"), "{\n\t\"title\": " + JsonConvert.ToString("RoPorter - " + label) +
+                ",\n\t\"description\": " + JsonConvert.ToString(SourceExporter.WorkshopDescription) +
+                ",\n\t\"type\": \"map\",\n\t\"tags\": [\"build\", \"fun\"],\n\t\"ignore\": [\"src/*\", \"" + Workshop.IconFile + "\", \"" + Workshop.PreviewFile + "\"]\n}\n",
+                new UTF8Encoding(false));
+            // A re-export keeps the Workshop item of the last upload, so uploading again updates it.
+            long? published = Workshop.IsAddon(destination) ? Workshop.PublishedId(destination) : null;
+            if (published.HasValue)
+                Workshop.SetPublishedId(staging, published.Value);
+            progress?.Report("Map " + Path.GetFileNameWithoutExtension(map) + ": start a game in Garry's Mod and pick it from the map list (Sandbox).");
+            return map;
+        }
+
+        // The shared Garry's Mod addon that collects exports when the output folder is Garry's Mod's addons folder.
+        private const string SharedAddon = "RoPorter";
+
+        private static bool IsAddonsFolder(string folder) =>
+            string.Equals(Path.GetFileName(folder.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)), "addons", StringComparison.OrdinalIgnoreCase);
+
+        // Moves a finished export into a shared output folder, replacing files of the same name. Source sources go into
+        // src\<name> and the per-export Workshop files are dropped, since a shared folder is never uploaded as one item. A
+        // shared Garry's Mod addon has one addon.json: an existing one is kept, and a new one is titled "RoPorter".
+        private static void MergeInto(string staging, string outputRoot, string name)
+        {
+            foreach (string drop in new[] { Workshop.IconFile, Workshop.PreviewFile, SfmWorkshop.IdFile })
+                File.Delete(Path.Combine(staging, drop));
+            string addon = Path.Combine(staging, "addon.json");
+            if (File.Exists(addon))
+            {
+                if (File.Exists(Path.Combine(outputRoot, "addon.json")))
+                    File.Delete(addon);
+                else
+                {
+                    JObject json = JObject.Parse(File.ReadAllText(addon));
+                    json["title"] = SharedAddon;
+                    // gmad cannot parse addon.json with a byte order mark.
+                    File.WriteAllText(addon, json.ToString(Formatting.Indented).Replace("  ", "\t") + "\n", new UTF8Encoding(false));
+                }
+            }
+            string src = Path.Combine(staging, "src");
+            if (Directory.Exists(src))
+            {
+                string named = Path.Combine(staging, "src-" + Guid.NewGuid().ToString("N"));
+                Directory.Move(src, named);
+                Directory.CreateDirectory(src);
+                Directory.Move(named, Path.Combine(src, name));
+            }
+            string root = Path.GetFullPath(staging).TrimEnd('\\') + "\\";
+            foreach (string file in Directory.GetFiles(staging, "*", SearchOption.AllDirectories))
+            {
+                string target = Path.Combine(outputRoot, Path.GetFullPath(file).Substring(root.Length));
+                if (Directory.Exists(target))
+                    Directory.Delete(target, true);
+                Directory.CreateDirectory(Path.GetDirectoryName(target));
+                File.Copy(file, target, true);
+            }
+            Directory.Delete(staging, true);
         }
 
         private static async Task PublishAsync(string staging, string destination, IProgress<string> progress,

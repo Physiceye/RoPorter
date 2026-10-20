@@ -18,7 +18,12 @@ namespace Rbx2Source.Export
     public sealed class FaceShapes
     {
         public string HeadGroup;
+        // Face makeup layers: other copies of the head whose vertices carry its shapes too.
+        public HashSet<string> Layers { get; } = new HashSet<string>(StringComparer.Ordinal);
         public List<FaceShape> Shapes { get; } = new List<FaceShape>();
+
+        // The head and its makeup layers make up the face mesh, the one with the shape keys.
+        public bool IsFace(string group) => group == HeadGroup || Layers.Contains(group);
 
         // Eye and jaw positions from the head mesh's facial bones, in Roblox render space.
         public Dictionary<int, double[]> FaceBones { get; } = new Dictionary<int, double[]>();

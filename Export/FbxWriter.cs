@@ -201,8 +201,8 @@ namespace Rbx2Source.Export
             var parts = new List<KeyValuePair<string, List<ObjTriangle>>>();
             if (scene.Face != null)
             {
-                parts.Add(new KeyValuePair<string, List<ObjTriangle>>("Body", model.Triangles.Where(t => t.Group != scene.Face.HeadGroup).ToList()));
-                parts.Add(new KeyValuePair<string, List<ObjTriangle>>("Face", model.Triangles.Where(t => t.Group == scene.Face.HeadGroup).ToList()));
+                parts.Add(new KeyValuePair<string, List<ObjTriangle>>("Body", model.Triangles.Where(t => !scene.Face.IsFace(t.Group)).ToList()));
+                parts.Add(new KeyValuePair<string, List<ObjTriangle>>("Face", model.Triangles.Where(t => scene.Face.IsFace(t.Group)).ToList()));
             }
             else
             {

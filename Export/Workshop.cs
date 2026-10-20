@@ -255,9 +255,9 @@ namespace Rbx2Source.Export
             }
         }
 
-        private static string Quote(string path) => "\"" + path + "\"";
+        internal static string Quote(string path) => "\"" + path + "\"";
 
-        private static string Tail(string output)
+        internal static string Tail(string output)
         {
             string[] lines = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
                 .Where(line => !line.StartsWith("Press any key", StringComparison.OrdinalIgnoreCase)).ToArray();
@@ -266,7 +266,7 @@ namespace Rbx2Source.Export
 
         // Runs a Garry's Mod tool without a window and returns its exit code and output. gmpublish waits for a key press
         // ("Press any key to continue") before it starts, so a line is sent to its input.
-        private static async Task<System.Collections.Generic.KeyValuePair<int, string>> RunAsync(string file, string arguments, CancellationToken cancellation,
+        internal static async Task<System.Collections.Generic.KeyValuePair<int, string>> RunAsync(string file, string arguments, CancellationToken cancellation,
             (string Name, string Value)[] environment = null)
         {
             var output = new StringBuilder();

@@ -39,7 +39,7 @@ namespace Rbx2Source.Export
             return null;
         }
 
-        private static IEnumerable<string> SteamLibraries()
+        internal static IEnumerable<string> SteamLibraries()
         {
             var steams = new List<string>();
             foreach (var key in new[] { (Registry.CurrentUser, @"Software\Valve\Steam", "SteamPath"),
@@ -79,6 +79,33 @@ namespace Rbx2Source.Export
 
         private ValvePlayer player;
         public ValvePlayer Player => player = player ?? ValvePlayer.Read(this);
+    }
+
+    // A Source Filmmaker install, for its model compiler.
+    public sealed class SfmInstall
+    {
+        public string Game { get; }
+        public string StudioMdl => Path.Combine(Game, "bin", "studiomdl.exe");
+
+        private SfmInstall(string game)
+        {
+            Game = game;
+        }
+
+        public static bool IsInstall(string game) =>
+            !string.IsNullOrWhiteSpace(game) && File.Exists(Path.Combine(game, "bin", "studiomdl.exe")) &&
+            File.Exists(Path.Combine(game, "usermod", "gameinfo.txt"));
+
+        public static SfmInstall Find()
+        {
+            foreach (string library in GarrysModInstall.SteamLibraries())
+            {
+                string game = Path.Combine(library, "steamapps", "common", "SourceFilmmaker", "game");
+                if (IsInstall(game))
+                    return new SfmInstall(game);
+            }
+            return null;
+        }
     }
 
     // Valve pack file (VPK v1/v2) directory reader.

@@ -112,8 +112,8 @@ namespace Rbx2Source.Export
         public Dictionary<string, AccessoryInfo> AccessoryGroups { get; } = new Dictionary<string, AccessoryInfo>(StringComparer.Ordinal);
         public HashSet<string> LayeredGroups { get; } = new HashSet<string>(StringComparer.Ordinal);
 
-        // Render groups held in a hand: gear, and items that matched no worn accessory but sit at a hand's grip (such as UGC
-        // "clothing" Roblox renders in the hand). They are rigid on that hand.
+        // Render groups of the avatar's gear (asset type 19), held in the right hand and rigid on it. Only real gear is held:
+        // every other item stays attached where Roblox wears it.
         public HashSet<string> HeldGroups { get; } = new HashSet<string>(StringComparer.Ordinal);
         private Dictionary<BodyPart, PartBounds> PartBoxes { get; } = new Dictionary<BodyPart, PartBounds>();
         private IReadOnlyList<AccessoryInfo> accessories;
@@ -198,11 +198,13 @@ namespace Rbx2Source.Export
                 }
             }
 
+            // The body's rig comes first: its parts, and where layered clothing shows hidden ones. Rigid accessories are
+            // attached to it afterwards (see ComputeWeights) and never change it.
             rig.MatchSkins(model, groupPositions);
             rig.Classify(groupBounds);
-            // An avatar holding a tool is rendered with that arm raised straight forward. It is lowered (with the tool) and
+            // An avatar holding gear is rendered with its right arm raised straight forward. It is lowered (with the gear) and
             // the parts are classified again, since bones are placed for hanging arms.
-            if (rig.LowerRaisedArms(model, groupBounds, groupPositions))
+            if (rig.LowerRaisedArm(model, groupBounds, groupPositions))
             {
                 foreach (var pair in groupPositions)
                 {
@@ -340,10 +342,15 @@ namespace Rbx2Source.Export
                 if (start == null || hips == null)
                     continue;
                 var chain = new List<string> { start };
-                while (chain.Count < 3 && !Touch(body[chain[chain.Count - 1]], hips))
+                while (chain.Count < 3)
                 {
                     PartBounds last = body[chain[chain.Count - 1]];
-                    string next = mine.Where(group => !chain.Contains(group) && Touch(body[group], last) && body[group].Center(1) > last.Center(1))
+                    // Once the chain meets the hips' box it only goes on into a part straight above the last one that meets the
+                    // hips too: a thigh tucked up into a long torso, whose shin already reaches the hips (cartoon bodies). A
+                    // hand hanging beside the leg overlaps it far less.
+                    bool atHips = Touch(last, hips);
+                    string next = mine.Where(group => !chain.Contains(group) && Touch(body[group], last) && body[group].Center(1) > last.Center(1) &&
+                            (!atHips || (Overlap(body[group], last) >= 0.5 && Touch(body[group], hips))))
                         .OrderByDescending(group => Overlap(body[group], last)).FirstOrDefault();
                     if (next == null)
                         break;
@@ -404,10 +411,14 @@ namespace Rbx2Source.Export
                     if (ordered.Count > 3)
                         ordered = ordered.Take(3).ToList();
                     double top = ordered.Max(g => body[g].Max[1]), bottom = ordered.Min(g => body[g].Min[1]);
-                    // Layered clothing over the limb's hidden end (boots over the shins and feet) shows where the limb ends.
+                    // Layered clothing over the limb's hidden parts shows where the limb starts and ends: boots over the shins
+                    // and feet, sleeves over the upper arm and forearm (a hand left alone at the end of a sleeve is a hand).
                     foreach (BodyPart hidden in labels)
                         if (skinnedBoxes.TryGetValue(PartBone[hidden], out PartBounds covered) && !covered.IsEmpty)
+                        {
+                            top = Math.Max(top, covered.Max[1]);
                             bottom = Math.Min(bottom, covered.Min[1]);
+                        }
                     double[] expected = { 0.2, 0.55, 0.88 };
                     int next = 0;
                     foreach (string group in ordered)
@@ -724,16 +735,24 @@ namespace Rbx2Source.Export
             new[] { BodyPart.LowerTorso, BodyPart.RightUpperLeg }, new[] { BodyPart.RightUpperLeg, BodyPart.RightLowerLeg }, new[] { BodyPart.RightLowerLeg, BodyPart.RightFoot }
         };
 
-        // "Connect joints": UGC bodies are often modelled as one surface cut into parts, so rigid parts open a gap when a
-        // joint bends. Near each joint, a vertex close to the neighbouring part shares its weight with that part's bone:
-        // half and half where the parts meet, fading to rigid a short way in, so the surface stretches across the joint.
-        // Only vertices around the joint are blended (an arm hanging against the torso side stays separate), and R6
-        // blocks stay rigid.
+        // "Connect joints": UGC bodies are often modelled as one surface cut into parts, and Roblox's render leaves out the
+        // faces where blocky parts cover each other's ends, so rigid parts open gaps and holes where a joint bends. Near each
+        // joint a vertex shares its weight with the other part's bone: half and half where the parts meet, fading to rigid a
+        // short way off, so the surface stretches across the joint.
+        // - Where the parts touch or overlap, a vertex close to the other part's vertices blends (only around the joint, so
+        //   an arm hanging against the torso side stays separate).
+        // - Where the parts meet along open edges (edges of a single triangle: the seam where the surface was cut), every
+        //   vertex blends by its distance from that seam. That weight depends only on where a vertex is, so both parts' open
+        //   edges move together and stay closed even where their vertices don't line up (blocky parts, the waist's sides).
+        // R6 blocks stay rigid.
         private void ConnectJoints(WavefrontModel model, Dictionary<string, HashSet<int>> groupPositions, Dictionary<BodyPart, PartBounds> actual, double height)
         {
             double seam = 0.04 * height;
             var groupsOf = Parts.GroupBy(pair => pair.Value).ToDictionary(g => g.Key, g => g.Select(pair => pair.Key).ToList());
+            var triangles = model.Triangles.ToLookup(t => t.Group, StringComparer.Ordinal);
             var blends = new Dictionary<int, Dictionary<int, double>>();
+            // Vertices lying on a seam, with the other part's bone and their distance from the seam.
+            var onSeam = new Dictionary<int, KeyValuePair<int, double>>();
             int connected = 0;
             foreach (BodyPart[] pair in JointedParts)
             {
@@ -746,16 +765,26 @@ namespace Rbx2Source.Export
                     ? Joint(lowerBox, childBox) : Bones[childBone].Position;
                 if (joint == null)
                     continue;
-                // The joint's reach: the child part's cross-section (the waist uses the torso's depth, not its width).
-                double radius = (child == BodyPart.UpperTorso ? 0.5 * childBox.Size(2) : 0.5 * Math.Max(childBox.Size(0), childBox.Size(2))) + seam;
+                // The joint's reach: the child part's cross-section. Touching vertices only blend across the torso's depth at the
+                // waist (a torso hanging over the hips at its sides stays separate); a seam blends all the way round.
+                double half = 0.5 * Math.Max(childBox.Size(0), childBox.Size(2));
+                double touchRadius = (child == BodyPart.UpperTorso ? 0.5 * childBox.Size(2) : half) + seam, seamRadius = half + seam;
                 float[] center = { (float)joint[0], (float)joint[1], (float)joint[2] };
-                List<int> Near(List<string> groups) => groups.SelectMany(g => groupPositions[g]).Distinct()
+                List<int> Near(List<string> groups, double radius) => groups.SelectMany(g => groupPositions[g]).Distinct()
                     .Where(i => Distance(model.Positions[i], center) <= radius + seam).ToList();
-                List<int> parents = Near(parentGroups), children = Near(childGroups);
-                if (parents.Count == 0 || children.Count == 0)
-                    continue;
                 bool any = false;
-                void Blend(List<int> from, List<int> to, int otherBone)
+                void Share(int vertex, double distance, int otherBone)
+                {
+                    if (distance >= seam)
+                        return;
+                    double t = distance / seam, weight = 0.5 * (1 - t * t * (3 - 2 * t));
+                    if (!blends.TryGetValue(vertex, out var shares))
+                        blends[vertex] = shares = new Dictionary<int, double>();
+                    shares[otherBone] = Math.Max(shares.TryGetValue(otherBone, out double existing) ? existing : 0, weight);
+                    any = true;
+                }
+                List<int> parents = Near(parentGroups, touchRadius), children = Near(childGroups, touchRadius);
+                void Touching(List<int> from, List<int> to, int otherBone)
                 {
                     foreach (int vertex in from)
                     {
@@ -763,24 +792,42 @@ namespace Rbx2Source.Export
                         double nearest = double.MaxValue;
                         foreach (int other in to)
                             nearest = Math.Min(nearest, Distance(p, model.Positions[other]));
-                        if (nearest >= seam)
-                            continue;
-                        double t = nearest / seam, weight = 0.5 * (1 - t * t * (3 - 2 * t));
-                        if (!blends.TryGetValue(vertex, out var shares))
-                            blends[vertex] = shares = new Dictionary<int, double>();
-                        shares[otherBone] = Math.Max(shares.TryGetValue(otherBone, out double existing) ? existing : 0, weight);
-                        any = true;
+                        Share(vertex, nearest, otherBone);
                     }
                 }
-                Blend(parents, children, childBone);
-                Blend(children, parents, parentBone);
+                Touching(parents, children, childBone);
+                Touching(children, parents, parentBone);
+                var edges = SeamEdges(model, triangles, parentGroups, childGroups, center, seamRadius + seam, 0.5 * seam)
+                    .Concat(SeamEdges(model, triangles, childGroups, parentGroups, center, seamRadius + seam, 0.5 * seam)).ToList();
+                void Seam(List<int> from, int otherBone)
+                {
+                    foreach (int vertex in from)
+                    {
+                        float[] p = model.Positions[vertex];
+                        double nearest = double.MaxValue;
+                        foreach (float[][] edge in edges)
+                            nearest = Math.Min(nearest, SegmentDistance(p, edge[0], edge[1]));
+                        Share(vertex, nearest, otherBone);
+                        // A vertex on the seam is held at exactly half and half between the two parts, whatever other joints
+                        // nearby add, so both sides of the seam move alike.
+                        if (nearest <= 0.05 * seam && (!onSeam.TryGetValue(vertex, out var held) || nearest < held.Value))
+                            onSeam[vertex] = new KeyValuePair<int, double>(otherBone, nearest);
+                    }
+                }
+                if (edges.Count > 0)
+                {
+                    Seam(Near(parentGroups, seamRadius), childBone);
+                    Seam(Near(childGroups, seamRadius), parentBone);
+                }
                 if (any)
                     connected++;
             }
             foreach (var entry in blends)
             {
                 int own = Joints[entry.Key][0];
-                var shares = entry.Value.Where(s => s.Key != own).OrderByDescending(s => s.Value).Take(3).ToList();
+                var shares = onSeam.TryGetValue(entry.Key, out var seamBone) && seamBone.Key != own
+                    ? new List<KeyValuePair<int, double>> { new KeyValuePair<int, double>(seamBone.Key, 0.5) }
+                    : entry.Value.Where(s => s.Key != own).OrderByDescending(s => s.Value).Take(3).ToList();
                 double others = shares.Sum(s => s.Value), scale = others > 0.75 ? 0.75 / others : 1;
                 var joints = new int[4];
                 var weights = new float[4];
@@ -795,6 +842,101 @@ namespace Rbx2Source.Export
                 Weights[entry.Key] = weights;
             }
             Notes.Add(connected > 0 ? "Connected " + connected + " body joints (" + blends.Count + " vertices blended)." : "No connected body joints were found.");
+        }
+
+        // A part's open edges within reach of a joint that lie on the other part (both ends within the tolerance of its
+        // surface): where the two parts were cut apart. Corners at the same position count as one vertex, since a render can
+        // split them for normals or UVs.
+        private static List<float[][]> SeamEdges(WavefrontModel model, ILookup<string, ObjTriangle> triangles, List<string> groups,
+            List<string> others, float[] center, double reach, double tolerance)
+        {
+            var surface = others.SelectMany(g => triangles[g])
+                .Where(t => t.Corners.Any(c => Distance(model.Positions[c.Position], center) <= reach + tolerance)).ToList();
+            bool OnSurface(float[] p) => surface.Any(t => TriangleDistance(p, model.Positions[t.Corners[0].Position],
+                model.Positions[t.Corners[1].Position], model.Positions[t.Corners[2].Position]) <= tolerance);
+            var result = new List<float[][]>();
+            foreach (string group in groups)
+            {
+                var ids = new Dictionary<string, int>(StringComparer.Ordinal);
+                var points = new List<float[]>();
+                int Id(int index)
+                {
+                    float[] p = model.Positions[index];
+                    string key = Math.Round(p[0], 4).ToString(CultureInfo.InvariantCulture) + "," + Math.Round(p[1], 4).ToString(CultureInfo.InvariantCulture) +
+                        "," + Math.Round(p[2], 4).ToString(CultureInfo.InvariantCulture);
+                    if (!ids.TryGetValue(key, out int id))
+                    {
+                        ids[key] = id = points.Count;
+                        points.Add(p);
+                    }
+                    return id;
+                }
+                var uses = new Dictionary<long, int>();
+                foreach (ObjTriangle triangle in triangles[group])
+                    for (int i = 0; i < 3; i++)
+                    {
+                        int a = Id(triangle.Corners[i].Position), b = Id(triangle.Corners[(i + 1) % 3].Position);
+                        if (a == b)
+                            continue;
+                        long key = (long)Math.Min(a, b) << 32 | (uint)Math.Max(a, b);
+                        uses[key] = uses.TryGetValue(key, out int count) ? count + 1 : 1;
+                    }
+                foreach (var edge in uses.Where(e => e.Value == 1))
+                {
+                    float[] a = points[(int)(edge.Key >> 32)], b = points[(int)(edge.Key & 0xffffffff)];
+                    if ((Distance(a, center) <= reach || Distance(b, center) <= reach) && OnSurface(a) && OnSurface(b))
+                        result.Add(new[] { a, b });
+                }
+            }
+            return result;
+        }
+
+        private static double SegmentDistance(float[] p, float[] a, float[] b)
+        {
+            double[] ab = { b[0] - a[0], b[1] - a[1], b[2] - a[2] }, ap = { p[0] - a[0], p[1] - a[1], p[2] - a[2] };
+            double length = Dot(ab, ab), t = length > 1e-12 ? Math.Max(0, Math.Min(1, Dot(ap, ab) / length)) : 0;
+            double[] d = { ap[0] - t * ab[0], ap[1] - t * ab[1], ap[2] - t * ab[2] };
+            return Math.Sqrt(Dot(d, d));
+        }
+
+        // Distance from a point to a triangle (the closest point found by its Voronoi region, as in Ericson's Real-Time
+        // Collision Detection).
+        private static double TriangleDistance(float[] point, float[] a, float[] b, float[] c)
+        {
+            double[] p = { point[0], point[1], point[2] }, A = { a[0], a[1], a[2] }, B = { b[0], b[1], b[2] }, C = { c[0], c[1], c[2] };
+            double[] ab = Subtract(B, A), ac = Subtract(C, A), ap = Subtract(p, A);
+            double d1 = Dot(ab, ap), d2 = Dot(ac, ap);
+            double[] closest;
+            if (d1 <= 0 && d2 <= 0)
+                closest = A;
+            else
+            {
+                double[] bp = Subtract(p, B);
+                double d3 = Dot(ab, bp), d4 = Dot(ac, bp);
+                double[] cp = Subtract(p, C);
+                double d5 = Dot(ab, cp), d6 = Dot(ac, cp);
+                double vc = d1 * d4 - d3 * d2, vb = d5 * d2 - d1 * d6, va = d3 * d6 - d5 * d4;
+                if (d3 >= 0 && d4 <= d3)
+                    closest = B;
+                else if (vc <= 0 && d1 >= 0 && d3 <= 0)
+                    closest = Add(A, Scale(ab, d1 / (d1 - d3)));
+                else if (d6 >= 0 && d5 <= d6)
+                    closest = C;
+                else if (vb <= 0 && d2 >= 0 && d6 <= 0)
+                    closest = Add(A, Scale(ac, d2 / (d2 - d6)));
+                else if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0)
+                    closest = Add(B, Scale(Subtract(C, B), (d4 - d3) / (d4 - d3 + d5 - d6)));
+                else
+                {
+                    double denominator = va + vb + vc;
+                    if (Math.Abs(denominator) < 1e-18)
+                        closest = A;
+                    else
+                        closest = Add(A, Add(Scale(ab, vb / denominator), Scale(ac, vc / denominator)));
+                }
+            }
+            double[] d = Subtract(p, closest);
+            return Math.Sqrt(Dot(d, d));
         }
 
         private void ComputeWeights(WavefrontModel model, Dictionary<string, HashSet<int>> groupPositions,
@@ -910,44 +1052,31 @@ namespace Rbx2Source.Export
                 if (group.Accessory != null)
                 {
                     layered = group.Accessory.Layered;
-                    bone = PartBone[group.Accessory.Part];
+                    bone = AccessoryBone(group.Accessory.Part);
                     AccessoryGroups[group.Name] = group.Accessory;
                 }
                 else
                 {
-                    // Without accessory metadata, layered clothing is recognised by how closely it wraps the body. With it,
-                    // every layered item was matched by its mesh or position, so a leftover group is a rigid accessory (or a
-                    // part of one): Roblox welds those to a single body part, here the one it is mostly around.
-                    layered = accessories == null && group.Hug >= 0.6;
+                    // Without accessory metadata, layered clothing is recognised by how closely it wraps the body. An item
+                    // wrapped closely around the head (a fur hood, a mask, hair) is still a head accessory, rigid on the head:
+                    // blending it into the chest made it stretch and clip whenever the head turned. With metadata, every
+                    // layered item was matched by its mesh or position, so a leftover group is a rigid accessory (or a part of
+                    // one): Roblox welds those to a single body part, here the one it is mostly around.
+                    layered = accessories == null && group.Hug >= 0.6 && group.Majority != HeadBone;
                     bone = group.Majority;
                 }
-                // Gear, or an unmatched item that doesn't wrap the body but holds a hand's grip point, is held in that hand.
-                // Held items: gear, or an unmatched item that doesn't wrap the body and holds a hand's grip point. An unmatched
-                // item floating out beside the torso (UGC "clothing" without skin weights, which Roblox's cage keeps next to the
-                // body) is put in the hand on that side, hanging from the grip point. Either way it is rigid on that hand.
-                if (heldBy.ContainsKey(group.Name) || group.Accessory?.IsGear == true || (group.Accessory == null && !layered))
+                // Only gear is held: the group matched to the avatar's gear, and any unidentified piece that came down with the
+                // raised arm holding it (a tool can have several parts). It is rigid on the right hand, where Roblox holds tools.
+                if (group.Accessory != null ? group.Accessory.IsGear : heldBy.Contains(group.Name))
                 {
-                    int hand = heldBy.TryGetValue(group.Name, out int holding) ? holding : HoldingHand(group.Bounds, height);
-                    bool moved = false;
-                    if (hand < 0 && group.Accessory == null && group.Hug < 0.2)
-                    {
-                        hand = BesideHand(group.Bounds);
-                        moved = hand >= 0;
-                    }
-                    if (hand >= 0)
-                    {
-                        HeldGroups.Add(group.Name);
-                        layered = false;
-                        bone = hand;
-                        // Every vertex of the item's triangles moves and follows the hand, including any its vertex list missed.
-                        foreach (int index in model.Triangles.Where(t => t.Group == group.Name).SelectMany(t => t.Corners).Select(c => c.Position))
-                            if (Joints[index] == null && !group.Nearest.ContainsKey(index))
-                                group.Nearest[index] = new List<KeyValuePair<int, double>>();
-                        if (moved)
-                            HangFromGrip(model, group, hand);
-                        Notes.Add(group.Name + " is held in the " + (hand == LeftHand ? "left" : "right") + " hand" +
-                            (moved ? " (moved there from beside the body)." : "."));
-                    }
+                    HeldGroups.Add(group.Name);
+                    layered = false;
+                    bone = RightHand;
+                    // Every vertex of the item's triangles follows the hand, including any its vertex list missed.
+                    foreach (int index in model.Triangles.Where(t => t.Group == group.Name).SelectMany(t => t.Corners).Select(c => c.Position))
+                        if (Joints[index] == null && !group.Nearest.ContainsKey(index))
+                            group.Nearest[index] = new List<KeyValuePair<int, double>>();
+                    Notes.Add(group.Name + " is gear, held in the right hand.");
                 }
                 if (layered)
                     LayeredGroups.Add(group.Name);
@@ -1004,28 +1133,25 @@ namespace Rbx2Source.Export
             Weights[vertex] = new[] { 1 - chest, chest, 0, 0 };
         }
 
-        // The hand whose grip point lies inside (or within 4% of the avatar's height of) the group's box, or -1.
-        private int HoldingHand(PartBounds bounds, double height)
-        {
-            int best = -1;
-            double closest = 0.04 * height;
-            foreach (var hand in new[] { (BodyPart.RightHand, "RightGripAttachment", RightHand), (BodyPart.LeftHand, "LeftGripAttachment", LeftHand) })
-            {
-                if (!PartBoxes.TryGetValue(hand.Item1, out PartBounds box))
-                    continue;
-                double distance = DistanceToBox(AccessoryInfo.AttachmentPoint(hand.Item2, box), bounds);
-                if (distance <= closest)
-                {
-                    closest = distance;
-                    best = hand.Item3;
-                }
-            }
-            return best;
-        }
-
         // R6 limbs: one block covering the whole limb, found as its middle part (LowerArm or LowerLeg).
         private readonly HashSet<BodyPart> wholeLimbs = new HashSet<BodyPart>();
         public bool IsWholeLimb(BodyPart part) => wholeLimbs.Contains(part);
+
+        // The bone an accessory welded to a body part follows. An R6 limb is one block, rigid on its end bone, so anything
+        // attached anywhere on it (gloves at the shoulder or grip attachment, say) follows that same bone.
+        private int AccessoryBone(BodyPart part)
+        {
+            foreach (string side in new[] { "Left", "Right" })
+            {
+                if (wholeLimbs.Contains(Part(side + "LowerArm")) &&
+                    (part == Part(side + "UpperArm") || part == Part(side + "LowerArm") || part == Part(side + "Hand")))
+                    return PartBone[Part(side + "Hand")];
+                if (wholeLimbs.Contains(Part(side + "LowerLeg")) &&
+                    (part == Part(side + "UpperLeg") || part == Part(side + "LowerLeg") || part == Part(side + "Foot")))
+                    return PartBone[Part(side + "Foot")];
+            }
+            return PartBone[part];
+        }
 
         // The bone a body part's point follows: its part's bone, except that a whole-limb (R6) block is rigid on the limb's end
         // bone: arms on the hands, legs on the feet.
@@ -1035,83 +1161,62 @@ namespace Rbx2Source.Export
             return wholeLimbs.Contains(part) ? bone + 1 : bone;
         }
 
-        // Items found at the end of a raised arm, and the hand bone holding them.
-        private readonly Dictionary<string, int> heldBy = new Dictionary<string, int>(StringComparer.Ordinal);
+        // Items that came down with the raised right arm: the gear, and anything worn on that arm.
+        private readonly HashSet<string> heldBy = new HashSet<string>(StringComparer.Ordinal);
 
-        // Roblox renders an avatar holding a tool with that arm pointing straight forward (-Z). An arm that reaches further
-        // forward than it is tall is rotated down 90 degrees about its shoulder, with any unidentified item touching its end
-        // (the tool), which is then held in that hand. Returns whether an arm was lowered.
-        private bool LowerRaisedArms(WavefrontModel model, Dictionary<string, PartBounds> groupBounds, Dictionary<string, HashSet<int>> groupPositions)
+        // Roblox renders an avatar holding its gear with the right arm pointing straight forward (-Z). Only an avatar that has
+        // gear is checked, and only when its right arm reaches forward further than it is tall and as far as an arm does (a
+        // lone hand left by sleeves can be deeper than tall). The arm is rotated down 90 degrees about its shoulder with the
+        // items at its end: the gear, and anything worn on that arm. Layered clothing and accessories worn elsewhere (known by
+        // their own meshes) stay where they are. Returns whether the arm was lowered.
+        private bool LowerRaisedArm(WavefrontModel model, Dictionary<string, PartBounds> groupBounds, Dictionary<string, HashSet<int>> groupPositions)
         {
-            bool lowered = false;
-            foreach (bool left in new[] { true, false })
+            if (accessories == null || !accessories.Any(accessory => accessory.IsGear))
+                return false;
+            var armParts = new[] { BodyPart.RightUpperArm, BodyPart.RightLowerArm, BodyPart.RightHand };
+            var arm = Parts.Where(pair => armParts.Contains(pair.Value)).Select(pair => pair.Key).ToList();
+            if (arm.Count == 0)
+                return false;
+            PartBounds Box(IEnumerable<string> groups)
             {
-                var armParts = left ? new[] { BodyPart.LeftUpperArm, BodyPart.LeftLowerArm, BodyPart.LeftHand }
-                    : new[] { BodyPart.RightUpperArm, BodyPart.RightLowerArm, BodyPart.RightHand };
-                var arm = Parts.Where(pair => armParts.Contains(pair.Value)).Select(pair => pair.Key).ToList();
-                if (arm.Count == 0)
-                    continue;
-                var box = new PartBounds();
-                foreach (string group in arm)
+                var result = new PartBounds();
+                foreach (string group in groups)
                 {
-                    box.Add(new[] { (float)groupBounds[group].Min[0], (float)groupBounds[group].Min[1], (float)groupBounds[group].Min[2] });
-                    box.Add(new[] { (float)groupBounds[group].Max[0], (float)groupBounds[group].Max[1], (float)groupBounds[group].Max[2] });
+                    result.Add(new[] { (float)groupBounds[group].Min[0], (float)groupBounds[group].Min[1], (float)groupBounds[group].Min[2] });
+                    result.Add(new[] { (float)groupBounds[group].Max[0], (float)groupBounds[group].Max[1], (float)groupBounds[group].Max[2] });
                 }
-                double thickness = box.Size(1), reach = box.Size(2);
-                if (reach < 1.5 * thickness)
-                    continue;
-                // The shoulder is half the arm's thickness in from its back end; the hand is at its front end.
-                double[] pivot = { box.Center(0), box.Center(1), box.Max[2] - 0.5 * thickness };
-                double[] end = { box.Center(0), box.Center(1), box.Min[2] };
-                var held = groupBounds.Where(pair => !Parts.ContainsKey(pair.Key) && DistanceToBox(end, pair.Value) < 0.25 * reach)
-                    .Select(pair => pair.Key).ToList();
-                var groups = new HashSet<string>(arm.Concat(held), StringComparer.Ordinal);
-
-                // Forward (-Z) becomes down (-Y): (dy, dz) -> (dz, -dy), for positions about the shoulder and for normals.
-                foreach (int index in groups.SelectMany(group => groupPositions[group]).Distinct())
-                {
-                    float[] p = model.Positions[index];
-                    double dy = p[1] - pivot[1], dz = p[2] - pivot[2];
-                    model.Positions[index] = new[] { p[0], (float)(pivot[1] + dz), (float)(pivot[2] - dy) };
-                }
-                foreach (int index in model.Triangles.Where(t => groups.Contains(t.Group)).SelectMany(t => t.Corners)
-                    .Select(c => c.Normal).Where(n => n >= 0).Distinct())
-                {
-                    float[] n = model.Normals[index];
-                    model.Normals[index] = new[] { n[0], n[2], -n[1] };
-                }
-                foreach (string group in held)
-                    heldBy[group] = left ? LeftHand : RightHand;
-                Notes.Add((left ? "Left" : "Right") + " arm was raised to hold " + (held.Count > 0 ? string.Join(", ", held) : "an item") +
-                    " in the render; it was lowered.");
-                lowered = true;
+                return result;
             }
-            return lowered;
-        }
+            PartBounds box = Box(arm);
+            double thickness = box.Size(1), reach = box.Size(2), height = Box(Parts.Keys).Size(1);
+            if (reach < 1.5 * thickness || reach < 0.2 * height)
+                return false;
+            // The shoulder is half the arm's thickness in from its back end; the hand is at its front end.
+            double[] pivot = { box.Center(0), box.Center(1), box.Max[2] - 0.5 * thickness };
+            double[] end = { box.Center(0), box.Center(1), box.Min[2] };
+            var triangles = model.Triangles.ToLookup(t => t.Group, StringComparer.Ordinal);
+            bool WornElsewhere(string group) => skinMatches.ContainsKey(group) || accessories.Any(accessory => !accessory.IsGear &&
+                accessory.Mesh != null && !armParts.Contains(accessory.Part) && SkinTransfer.Match(model, triangles[group].ToList(), accessory.Mesh) != null);
+            var held = groupBounds.Where(pair => !Parts.ContainsKey(pair.Key) && DistanceToBox(end, pair.Value) < 0.25 * reach && !WornElsewhere(pair.Key))
+                .Select(pair => pair.Key).ToList();
+            var groups = new HashSet<string>(arm.Concat(held), StringComparer.Ordinal);
 
-        // The hand on the side an item floats out to, past the upper torso's width (render space: character right is +X); -1
-        // for items over the body (halos, wings, ...).
-        private int BesideHand(PartBounds bounds)
-        {
-            if (!PartBoxes.TryGetValue(BodyPart.UpperTorso, out PartBounds torso))
-                return -1;
-            double x = bounds.Center(0);
-            return x > torso.Max[0] ? RightHand : x < torso.Min[0] ? LeftHand : -1;
-        }
-
-        // Moves an item so its top centre sits at the hand's grip point, as if held by its top.
-        private void HangFromGrip(WavefrontModel model, AccessoryGroup group, int hand)
-        {
-            BodyPart part = hand == LeftHand ? BodyPart.LeftHand : BodyPart.RightHand;
-            if (!PartBoxes.TryGetValue(part, out PartBounds box))
-                return;
-            double[] grip = AccessoryInfo.AttachmentPoint(hand == LeftHand ? "LeftGripAttachment" : "RightGripAttachment", box);
-            var offset = new[] { (float)(grip[0] - group.Bounds.Center(0)), (float)(grip[1] - group.Bounds.Max[1]), (float)(grip[2] - group.Bounds.Center(2)) };
-            foreach (int index in group.Nearest.Keys)
+            // Forward (-Z) becomes down (-Y): (dy, dz) -> (dz, -dy), for positions about the shoulder and for normals.
+            foreach (int index in groups.SelectMany(group => groupPositions[group]).Distinct())
             {
                 float[] p = model.Positions[index];
-                model.Positions[index] = new[] { p[0] + offset[0], p[1] + offset[1], p[2] + offset[2] };
+                double dy = p[1] - pivot[1], dz = p[2] - pivot[2];
+                model.Positions[index] = new[] { p[0], (float)(pivot[1] + dz), (float)(pivot[2] - dy) };
             }
+            foreach (int index in model.Triangles.Where(t => groups.Contains(t.Group)).SelectMany(t => t.Corners)
+                .Select(c => c.Normal).Where(n => n >= 0).Distinct())
+            {
+                float[] n = model.Normals[index];
+                model.Normals[index] = new[] { n[0], n[2], -n[1] };
+            }
+            heldBy.UnionWith(held);
+            Notes.Add("Right arm was raised to hold " + (held.Count > 0 ? string.Join(", ", held) : "the gear") + " in the render; it was lowered.");
+            return true;
         }
 
         private sealed class AccessoryGroup
@@ -1370,7 +1475,7 @@ namespace Rbx2Source.Export
                     var alike = accessories.Where(a => a.Layered == match.Layered && a.Attachment == match.Attachment).ToList();
                     string label = alike.Count == 1 || meshMatch[g, assignment[g]] ? match.Name : "one of " + string.Join(" / ", alike.Select(a => a.Name));
                     Notes.Add(groups[g].Name + " = " + label + " (" +
-                        (match.Layered ? "layered, auto-weighted" : "rigid on " + BoneNames[PartBone[match.Part]]) + ")");
+                        (match.Layered ? "layered, auto-weighted" : "rigid on " + BoneNames[AccessoryBone(match.Part)]) + ")");
                 }
                 else
                 {
@@ -1564,9 +1669,17 @@ namespace Rbx2Source.Export
                 }
                 if (best < 0)
                     continue;
-                taken.Add(best);
-                Joints[best] = new[] { ancestor, bone, 0, 0 };
-                Weights[best] = new[] { 1 - AnchorWeight, AnchorWeight, 0, 0 };
+                // Every copy of that vertex at the same position (renders split vertices along UV and normal seams) takes the
+                // same anchor: anchoring one copy alone opened a hairline crack there whenever the helper bone moved (fingers
+                // curling round a first-person weapon, VRChat hand gestures).
+                float[] at = model.Positions[best];
+                foreach (int i in rigid[ancestor])
+                    if (i == best || (!taken.Contains(i) && model.Positions[i][0] == at[0] && model.Positions[i][1] == at[1] && model.Positions[i][2] == at[2]))
+                    {
+                        taken.Add(i);
+                        Joints[i] = new[] { ancestor, bone, 0, 0 };
+                        Weights[i] = new[] { 1 - AnchorWeight, AnchorWeight, 0, 0 };
+                    }
             }
         }
 
