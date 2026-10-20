@@ -83,7 +83,7 @@ namespace Rbx2Source.Export
                 try
                 {
                     contents.Terrain = RobloxTerrain.Read(grid, terrain.Binary.TryGetValue("MaterialColors", out byte[] colors) ? colors : null);
-                    contents.Ground = contents.Terrain.Surface();
+                    contents.Ground = contents.Terrain.Surface(terrain.Flag("SmoothVoxelsUpgraded"));
                 }
                 catch (Exception error) when (error is InvalidDataException || error is NotSupportedException)
                 {
@@ -347,7 +347,7 @@ namespace Rbx2Source.Export
                         key = "__decal_" + images.Count + "__";
                         localTextures[key] = tint.All(c => c > 0.999f) ? image : Tinted(image, tint, 0, true);
                     }
-                    catch (ArgumentException)
+                    catch (InvalidDataException)
                     {
                         key = null;
                     }
@@ -414,7 +414,7 @@ namespace Rbx2Source.Export
                         byte[] texture = RobloxContent.MaterialTexture(RobloxTerrain.MaterialName(material));
                         string key = null;
                         if (texture != null)
-                            localTextures[key = "__terrain_" + RobloxTerrain.MaterialName(material) + "__"] = Tinted(texture, terrain.Color(material), 512, false);
+                            localTextures[key = "__terrain_" + RobloxTerrain.MaterialName(material) + "__"] = Tinted(texture, RobloxContent.TerrainTint(RobloxTerrain.MaterialName(material), terrain.Color(material)), 512, false);
                         model.Materials[name] = new ObjMaterial { Name = name, Diffuse = terrain.Color(material), Texture = key };
                     }
                     ObjCorner a = Corner(x, z), b = Corner(x + 1, z), c = Corner(x + 1, z + 1), d = Corner(x, z + 1);
@@ -683,28 +683,11 @@ namespace Rbx2Source.Export
         // see-through parts.
         internal static byte[] Tinted(byte[] image, float[] tint, int size, bool keepAlpha)
         {
-            using (var stream = new MemoryStream(image))
-            using (var source = new System.Drawing.Bitmap(stream))
-            using (var output = new System.Drawing.Bitmap(size > 0 ? size : source.Width, size > 0 ? size : source.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb))
+            using (Picture source = Picture.Load(image))
+            using (var output = new Picture(size > 0 ? size : source.Width, size > 0 ? size : source.Height))
             {
-                using (var graphics = System.Drawing.Graphics.FromImage(output))
-                using (var recolour = new System.Drawing.Imaging.ImageAttributes())
-                {
-                    graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
-                    graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
-                    recolour.SetWrapMode(System.Drawing.Drawing2D.WrapMode.Tile);
-                    recolour.SetColorMatrix(new System.Drawing.Imaging.ColorMatrix(new[]
-                    {
-                        new[] { tint[0], 0, 0, 0, 0 }, new[] { 0, tint[1], 0, 0, 0 }, new[] { 0, 0, tint[2], 0, 0 }, new[] { 0, 0, 0, 1f, 0 }, new[] { 0, 0, 0, 0, 1f }
-                    }));
-                    graphics.DrawImage(source, new System.Drawing.Rectangle(0, 0, output.Width, output.Height), 0, 0, source.Width, source.Height,
-                        System.Drawing.GraphicsUnit.Pixel, recolour);
-                }
-                using (var result = new MemoryStream())
-                {
-                    output.Save(result, keepAlpha ? System.Drawing.Imaging.ImageFormat.Png : System.Drawing.Imaging.ImageFormat.Jpeg);
-                    return result.ToArray();
-                }
+                output.Draw(source, 0, 0, output.Width, output.Height, tint: tint, replace: true);
+                return keepAlpha ? output.Encode(PictureFormat.Png) : output.Encode(PictureFormat.Jpeg, 90);
             }
         }
 

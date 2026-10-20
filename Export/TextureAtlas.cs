@@ -1,10 +1,7 @@
 using System;
 using System.Collections.Generic;
-using System.Drawing;
-using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
-using System.Runtime.InteropServices;
 using System.Threading;
 
 namespace Rbx2Source.Export
@@ -340,44 +337,16 @@ namespace Rbx2Source.Export
 
         private static Pixels Read(string path)
         {
-            using (var image = new Bitmap(path))
-            {
-                var pixels = new Pixels { Width = image.Width, Height = image.Height, Argb = new int[image.Width * image.Height] };
-                BitmapData data = image.LockBits(new Rectangle(0, 0, image.Width, image.Height), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-                try
-                {
-                    for (int y = 0; y < image.Height; y++)
-                        Marshal.Copy(data.Scan0 + y * data.Stride, pixels.Argb, y * image.Width, image.Width);
-                }
-                finally
-                {
-                    image.UnlockBits(data);
-                }
-                return pixels;
-            }
+            using (Picture image = Picture.Load(path))
+                return new Pixels { Width = image.Width, Height = image.Height, Argb = image.GetPixels() };
         }
 
         private static void Write(string path, int width, int height, int[] argb, bool alpha)
         {
-            using (var image = new Bitmap(width, height, PixelFormat.Format32bppArgb))
+            using (var image = new Picture(width, height))
             {
-                BitmapData data = image.LockBits(new Rectangle(0, 0, width, height), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
-                try
-                {
-                    for (int y = 0; y < height; y++)
-                        Marshal.Copy(argb, y * width, data.Scan0 + y * data.Stride, width);
-                }
-                finally
-                {
-                    image.UnlockBits(data);
-                }
-                if (alpha)
-                {
-                    image.Save(path, ImageFormat.Png);
-                    return;
-                }
-                using (var opaque = image.Clone(new Rectangle(0, 0, width, height), PixelFormat.Format24bppRgb))
-                    opaque.Save(path, ImageFormat.Png);
+                image.SetPixels(argb);
+                image.Save(path, PictureFormat.Png, opaque: !alpha);
             }
         }
     }

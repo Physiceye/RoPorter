@@ -1,7 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Drawing;
-using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
 using System.IO.Compression;
@@ -36,6 +34,12 @@ namespace Rbx2Source.Export
     public sealed class RobloxModelDownloader
     {
         public const string DefaultApi = "https://api.ocublox.tv";
+
+        // The user's own Roblox Open Cloud API key (a setting), or null. It is sent to the API with every request, in the
+        // X-Roblox-Cloud-Key header, so the API can make its Roblox requests for this user with the user's own key and rate
+        // limits instead of the shared ones. RoPorter itself still only talks to the API.
+        public static string CloudKey { get; set; }
+        public const string CloudKeyHeader = "X-Roblox-Cloud-Key";
 
         private readonly HttpClient client;
         private readonly string apiBase;
@@ -93,31 +97,25 @@ namespace Rbx2Source.Export
 
         // The user's profile background from the API's /v1/users/background route: its image, or else its colour. Both are
         // null when the user has not set one.
-        public async Task<KeyValuePair<byte[], Color?>> DownloadProfileBackgroundAsync(long userId, CancellationToken cancellation)
+        // The colour is ARGB.
+        public async Task<KeyValuePair<byte[], int?>> DownloadProfileBackgroundAsync(long userId, CancellationToken cancellation)
         {
             if (userId <= 0)
                 throw new ArgumentOutOfRangeException(nameof(userId), "Roblox IDs must be positive.");
             JObject result = JObject.Parse(Encoding.UTF8.GetString(await DownloadAsync(new Uri(apiBase + "/v1/users/background?userId=" +
                 userId.ToString(CultureInfo.InvariantCulture)), cancellation).ConfigureAwait(false)));
-            Color? color = null;
+            int? color = null;
             string hex = result.Value<string>("color");
             if (hex != null && Regex.IsMatch(hex, @"\A#[0-9A-Fa-f]{6}\z"))
-                color = Color.FromArgb(Convert.ToInt32(hex.Substring(1, 2), 16), Convert.ToInt32(hex.Substring(3, 2), 16), Convert.ToInt32(hex.Substring(5, 2), 16));
+                color = unchecked((int)0xFF000000) | Convert.ToInt32(hex.Substring(1), 16);
             string reference = result.Value<string>("imageUrl");
             if (string.IsNullOrWhiteSpace(reference))
-                return new KeyValuePair<byte[], Color?>(null, color);
+                return new KeyValuePair<byte[], int?>(null, color);
             // The image is an asset on the API ("/v1/asset?id=..."), or a Roblox CDN file (fetched through the API).
             byte[] bytes = await DownloadAsync(Hosted(reference, "The profile background"), cancellation).ConfigureAwait(false);
-            try
-            {
-                using (var stream = new MemoryStream(bytes))
-                using (Image.FromStream(stream, false, true)) { }
-            }
-            catch (ArgumentException error)
-            {
-                throw new InvalidDataException("The profile background is not an image.", error);
-            }
-            return new KeyValuePair<byte[], Color?>(bytes, color);
+            if (!Picture.IsImage(bytes))
+                throw new InvalidDataException("The profile background is not an image.");
+            return new KeyValuePair<byte[], int?>(bytes, color);
         }
 
         private async Task<byte[]> DownloadThumbnailAsync(Uri thumbnailUrl, CancellationToken cancellation)
@@ -137,17 +135,8 @@ namespace Rbx2Source.Export
                 if (state != "Completed")
                     throw new InvalidDataException("The thumbnail is unavailable (state: " + (state ?? "missing") + ").");
                 byte[] bytes = await DownloadAsync(Hosted(result.Value<string>("imageUrl"), "The thumbnail"), cancellation).ConfigureAwait(false);
-                try
-                {
-                    using (var stream = new MemoryStream(bytes))
-                    using (Image decoded = Image.FromStream(stream, false, true))
-                        if (decoded.Width <= 0 || decoded.Height <= 0)
-                            throw new InvalidDataException("Roblox returned an invalid thumbnail.");
-                }
-                catch (ArgumentException error)
-                {
-                    throw new InvalidDataException("Roblox returned a thumbnail that is not an image.", error);
-                }
+                if (!Picture.IsImage(bytes))
+                    throw new InvalidDataException("Roblox returned a thumbnail that is not an image.");
                 return bytes;
             }
         }
@@ -220,6 +209,8 @@ namespace Rbx2Source.Export
                     // Signed CDN locations do not need the format header; the API's asset route does.
                     if (assetFormat != null && !IsRobloxCdn(uri))
                         request.Headers.TryAddWithoutValidation("Roblox-AssetFormat", assetFormat);
+                    if (!string.IsNullOrWhiteSpace(CloudKey))
+                        request.Headers.TryAddWithoutValidation(CloudKeyHeader, CloudKey.Trim());
                     HttpResponseMessage response = await client.SendAsync(request, cancellation).ConfigureAwait(false);
                     if ((int)response.StatusCode != 429 || attempt >= RateLimitRetries)
                         return response;
@@ -234,15 +225,22 @@ namespace Rbx2Source.Export
 
         private const int RateLimitRetries = 2;
 
+        // A Roblox CDN file is named by its content's hash, so a copy in the content cache is always that file.
         private async Task<byte[]> DownloadAsync(Uri uri, CancellationToken cancellation)
         {
+            string cached = IsRobloxCdn(uri) ? uri.AbsolutePath.Trim('/') : null;
+            if (cached != null && ContentCache.Get(ContentCache.Cdn, cached) is byte[] hit)
+                return hit;
             using (HttpResponseMessage response = await GetAsync(uri, null, cancellation).ConfigureAwait(false))
             {
                 if (!response.IsSuccessStatusCode)
                     throw await FailureAsync(response, ToApi(uri)).ConfigureAwait(false);
                 byte[] data = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
                 cancellation.ThrowIfCancellationRequested();
-                return await DecodeAsync(data, uri.Host, cancellation).ConfigureAwait(false);
+                data = await DecodeAsync(data, uri.Host, cancellation).ConfigureAwait(false);
+                if (cached != null)
+                    ContentCache.Put(ContentCache.Cdn, cached, data);
+                return data;
             }
         }
 
@@ -323,8 +321,17 @@ namespace Rbx2Source.Export
             throw new InvalidDataException("An asset download redirected too many times.");
         }
 
-        private Task<byte[]> DownloadAssetFormatAsync(long assetId, string assetFormat, CancellationToken cancellation) =>
-            GetAssetBytesAsync(new Uri(apiBase + "/v1/asset/?id=" + assetId.ToString(CultureInfo.InvariantCulture)), assetFormat, cancellation);
+        // Assets are kept in the content cache by ID and format.
+        private async Task<byte[]> DownloadAssetFormatAsync(long assetId, string assetFormat, CancellationToken cancellation)
+        {
+            string key = assetId.ToString(CultureInfo.InvariantCulture) + (assetFormat != null ? "_" + assetFormat : "");
+            if (ContentCache.Get(ContentCache.Assets, key) is byte[] hit)
+                return hit;
+            byte[] data = await GetAssetBytesAsync(new Uri(apiBase + "/v1/asset/?id=" + assetId.ToString(CultureInfo.InvariantCulture)),
+                assetFormat, cancellation).ConfigureAwait(false);
+            ContentCache.Put(ContentCache.Assets, key, data);
+            return data;
+        }
 
         // Without a format, Roblox serves a legacy build of avatar assets. For dynamic heads that build is a
         // SpecialMesh whose mesh has no skeleton or FACS data, so "avatar_meshpart_head" must be requested.
@@ -469,11 +476,10 @@ namespace Rbx2Source.Export
                 try
                 {
                     texture = await DownloadAssetAsync(references.Value.Value, cancellation).ConfigureAwait(false);
-                    using (var stream = new MemoryStream(texture))
-                    using (Image.FromStream(stream, false, true)) { }
+                    if (!Picture.IsImage(texture))
+                        throw new InvalidDataException("it is not an image");
                 }
-                catch (Exception error) when (error is AssetAccessException || error is HttpRequestException ||
-                    error is InvalidDataException || error is ArgumentException)
+                catch (Exception error) when (error is AssetAccessException || error is HttpRequestException || error is InvalidDataException)
                 {
                     progress?.Report("Head texture unavailable (" + error.Message + ").");
                     texture = null;
@@ -534,63 +540,24 @@ namespace Rbx2Source.Export
         // Roblox packs PBR as R = metalness, G = roughness, B = emissive mask; glTF wants G = roughness, B = metalness.
         private static void PackMetallicRoughness(string source, string destination)
         {
-            using (var image = new Bitmap(source))
-            using (var output = new Bitmap(image.Width, image.Height, PixelFormat.Format24bppRgb))
+            using (Picture image = Picture.Load(source))
             {
-                var rectangle = new Rectangle(0, 0, image.Width, image.Height);
-                BitmapData input = image.LockBits(rectangle, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-                BitmapData result = output.LockBits(rectangle, ImageLockMode.WriteOnly, PixelFormat.Format24bppRgb);
-                try
+                int[] pixels = image.GetPixels();
+                for (int i = 0; i < pixels.Length; i++)
                 {
-                    var row = new byte[image.Width * 4];
-                    var packed = new byte[result.Stride];
-                    for (int y = 0; y < image.Height; y++)
-                    {
-                        System.Runtime.InteropServices.Marshal.Copy(input.Scan0 + y * input.Stride, row, 0, row.Length);
-                        for (int x = 0; x < image.Width; x++)
-                        {
-                            // Bitmap bytes are BGRA / BGR.
-                            byte metalness = row[x * 4 + 2], roughness = row[x * 4 + 1];
-                            packed[x * 3] = metalness;
-                            packed[x * 3 + 1] = roughness;
-                            packed[x * 3 + 2] = 255;
-                        }
-                        System.Runtime.InteropServices.Marshal.Copy(packed, 0, result.Scan0 + y * result.Stride, result.Stride);
-                    }
+                    int metalness = (pixels[i] >> 16) & 255, roughness = (pixels[i] >> 8) & 255;
+                    pixels[i] = unchecked((int)0xFF000000) | (255 << 16) | (roughness << 8) | metalness;
                 }
-                finally
-                {
-                    image.UnlockBits(input);
-                    output.UnlockBits(result);
-                }
-                output.Save(destination, ImageFormat.Png);
+                image.SetPixels(pixels);
+                image.Save(destination, PictureFormat.Png, opaque: true);
             }
         }
 
         // Roblox's renderer writes a black emissive map for SurfaceAppearances without emission.
         private static bool IsBlack(string path)
         {
-            using (var image = new Bitmap(path))
-            {
-                var rectangle = new Rectangle(0, 0, image.Width, image.Height);
-                BitmapData data = image.LockBits(rectangle, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-                try
-                {
-                    var row = new byte[image.Width * 4];
-                    for (int y = 0; y < image.Height; y++)
-                    {
-                        System.Runtime.InteropServices.Marshal.Copy(data.Scan0 + y * data.Stride, row, 0, row.Length);
-                        for (int x = 0; x < row.Length; x += 4)
-                            if (row[x] > 2 || row[x + 1] > 2 || row[x + 2] > 2)
-                                return false;
-                    }
-                    return true;
-                }
-                finally
-                {
-                    image.UnlockBits(data);
-                }
-            }
+            using (Picture image = Picture.Load(path))
+                return image.GetPixels().All(p => ((p >> 16) & 255) <= 2 && ((p >> 8) & 255) <= 2 && (p & 255) <= 2);
         }
 
         // Some render textures (layered clothing, hair) carry about 40% alpha over every texel although Roblox draws them
@@ -598,76 +565,44 @@ namespace Rbx2Source.Export
         // way. Real translucent or cutout textures (hair cards, glasses) always have solid texels.
         private static bool NeverOpaque(string path)
         {
-            using (var image = new Bitmap(path))
+            using (Picture image = Picture.Load(path))
             {
-                if (!Image.IsAlphaPixelFormat(image.PixelFormat))
+                if (!image.HasAlphaChannel)
                     return false;
-                BitmapData data = image.LockBits(new Rectangle(0, 0, image.Width, image.Height), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-                try
+                long opaque = 0, partial = 0;
+                foreach (int pixel in image.GetPixels())
                 {
-                    var row = new byte[image.Width * 4];
-                    long opaque = 0, partial = 0;
-                    for (int y = 0; y < image.Height; y++)
-                    {
-                        System.Runtime.InteropServices.Marshal.Copy(data.Scan0 + y * data.Stride, row, 0, row.Length);
-                        for (int x = 3; x < row.Length; x += 4)
-                        {
-                            if (row[x] >= 250)
-                                opaque++;
-                            else if (row[x] > 5)
-                                partial++;
-                        }
-                    }
-                    return partial > 0 && opaque < 0.01 * (opaque + partial);
+                    int alpha = (pixel >> 24) & 255;
+                    if (alpha >= 250)
+                        opaque++;
+                    else if (alpha > 5)
+                        partial++;
                 }
-                finally
-                {
-                    image.UnlockBits(data);
-                }
+                return partial > 0 && opaque < 0.01 * (opaque + partial);
             }
         }
 
         // Keeps the colour and makes every texel solid, except fully clear ones, which stay cut out.
         private static void Solidify(string source, string destination)
         {
-            using (var image = new Bitmap(source))
-            using (var output = new Bitmap(image.Width, image.Height, PixelFormat.Format32bppArgb))
+            using (Picture image = Picture.Load(source))
             {
-                var rectangle = new Rectangle(0, 0, image.Width, image.Height);
-                BitmapData input = image.LockBits(rectangle, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-                BitmapData result = output.LockBits(rectangle, ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
-                try
-                {
-                    var row = new byte[image.Width * 4];
-                    for (int y = 0; y < image.Height; y++)
-                    {
-                        System.Runtime.InteropServices.Marshal.Copy(input.Scan0 + y * input.Stride, row, 0, row.Length);
-                        for (int x = 3; x < row.Length; x += 4)
-                            row[x] = row[x] > 5 ? (byte)255 : (byte)0;
-                        System.Runtime.InteropServices.Marshal.Copy(row, 0, result.Scan0 + y * result.Stride, row.Length);
-                    }
-                }
-                finally
-                {
-                    image.UnlockBits(input);
-                    output.UnlockBits(result);
-                }
-                output.Save(destination, ImageFormat.Png);
+                int[] pixels = image.GetPixels();
+                for (int i = 0; i < pixels.Length; i++)
+                    pixels[i] = (pixels[i] & 0xFFFFFF) | (((pixels[i] >> 24) & 255) > 5 ? unchecked((int)0xFF000000) : 0);
+                image.SetPixels(pixels);
+                image.Save(destination, PictureFormat.Png);
             }
         }
 
         private static void CompositeOverColor(string source, string destination, float[] color)
         {
-            using (var image = new Bitmap(source))
-            using (var output = new Bitmap(image.Width, image.Height, PixelFormat.Format32bppArgb))
+            using (Picture image = Picture.Load(source))
+            using (var output = new Picture(image.Width, image.Height))
             {
-                using (var graphics = Graphics.FromImage(output))
-                {
-                    graphics.Clear(Color.FromArgb(255, (int)Math.Round(color[0] * 255), (int)Math.Round(color[1] * 255), (int)Math.Round(color[2] * 255)));
-                    graphics.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceOver;
-                    graphics.DrawImage(image, new Rectangle(0, 0, image.Width, image.Height), 0, 0, image.Width, image.Height, GraphicsUnit.Pixel);
-                }
-                output.Save(destination, ImageFormat.Png);
+                output.Clear(unchecked((int)0xFF000000) | ((int)Math.Round(color[0] * 255) << 16) | ((int)Math.Round(color[1] * 255) << 8) | (int)Math.Round(color[2] * 255));
+                output.Draw(image, 0, 0, image.Width, image.Height);
+                output.Save(destination, PictureFormat.Png);
             }
         }
 
@@ -954,9 +889,13 @@ namespace Rbx2Source.Export
             SfmInstall sfm = null;
             if (source)
             {
-                garrysMod = GarrysModInstall.Find(GarrysModPath) ?? throw new InvalidDataException(format == ExportFormat.GarrysMod
+                // Its model compiler comes only with the Windows version of the game: on Linux and macOS, Steam's Windows version
+                // (Proton, or "Force the use of a specific Steam Play compatibility tool"), run in Wine.
+                string windowsOnly = OperatingSystem.IsWindows() ? "" : " On Linux and macOS, install the Windows version of Garry's Mod " +
+                    "(in Steam: Properties > Compatibility > Force the use of a Steam Play compatibility tool) and Wine.";
+                garrysMod = GarrysModInstall.Find(GarrysModPath) ?? throw new InvalidDataException((format == ExportFormat.GarrysMod
                     ? "Garry's Mod was not found. Install it through Steam (its studiomdl compiles the model)."
-                    : "Garry's Mod was not found. Install it through Steam: Valve's player skeleton is read from its files.");
+                    : "Garry's Mod was not found. Install it through Steam: Valve's player skeleton is read from its files.") + windowsOnly);
                 faceTracking = false;
             }
             if (format == ExportFormat.SourceFilmmaker)
@@ -968,11 +907,11 @@ namespace Rbx2Source.Export
             JObject descriptor = null;
             var localTextures = new Dictionary<string, byte[]>(StringComparer.Ordinal);
             // A place (.rbxl / .rbxlx) exported to Garry's Mod becomes a map; in other formats it is one static model.
-            ModelContents placeMap = null;
+            ModelContents placeMap = null, fileContents = null;
             if (modelFile != null)
             {
                 progress?.Report("Reading " + Path.GetFileName(modelFile) + "...");
-                ModelContents contents = ModelFileBuilder.Read(File.ReadAllBytes(modelFile));
+                ModelContents contents = fileContents = ModelFileBuilder.Read(File.ReadAllBytes(modelFile));
                 if (contents.IsPlace && format == ExportFormat.GarrysMod)
                 {
                     placeMap = contents;
@@ -1018,7 +957,8 @@ namespace Rbx2Source.Export
                 }
                 catch (Exception error) when (error is HttpRequestException || error is InvalidDataException || error is JsonException)
                 {
-                    progress?.Report("Avatar details unavailable (" + error.Message + "); accessories are weighted from their shape.");
+                    progress?.Report("Avatar details unavailable (" + error.Message + "); accessories are weighted from their shape. " +
+                        "Layered clothing gets estimated weights instead of Roblox's own; export again later for those.");
                 }
                 progress?.Report("Building humanoid rig...");
                 rig = AvatarRig.Build(model, accessories, cancellation, connectJoints);
@@ -1161,7 +1101,7 @@ namespace Rbx2Source.Export
             string textureDir = flat ? name + "_textures" : "textures";
             string destination = Path.Combine(outputRoot, name);
             string shared = format == ExportFormat.GarrysMod && IsAddonsFolder(outputRoot) ? Path.Combine(outputRoot, SharedAddon) : outputRoot;
-            Directory.CreateDirectory(staging);
+            CreateStaging(staging, outputRoot);
             try
             {
                 if (placeMap != null)
@@ -1216,12 +1156,8 @@ namespace Rbx2Source.Export
                         extension = ".jpg";
                     else
                         throw new InvalidDataException("Roblox returned an unsupported texture format (expected PNG or JPEG).");
-                    using (var stream = new MemoryStream(image))
-                    using (Image decoded = Image.FromStream(stream, false, true))
-                    {
-                        if (decoded.Width <= 0 || decoded.Height <= 0)
-                            throw new InvalidDataException("Roblox returned an invalid texture image.");
-                    }
+                    if (!Picture.IsImage(image))
+                        throw new InvalidDataException("Roblox returned an invalid texture image.");
                     relativePath = textureDir + "/texture-" + downloaded.Count + extension;
                     File.WriteAllBytes(Full(relativePath), image);
                     downloaded.Add(sourceKey, relativePath);
@@ -1331,15 +1267,15 @@ namespace Rbx2Source.Export
                     byte[] picture = null;
                     try
                     {
-                        // A model file has no Roblox picture: its Workshop image is a plain background.
-                        picture = modelFile != null ? null : bundle != null ? await DownloadBundleThumbnailAsync(bundle.Id, cancellation).ConfigureAwait(false)
+                        // A model file has no Roblox picture: its Workshop image is a picture of its parts.
+                        picture = modelFile != null ? FilePicture(fileContents, model, localTextures) : bundle != null ? await DownloadBundleThumbnailAsync(bundle.Id, cancellation).ConfigureAwait(false)
                             : await DownloadThumbnailAsync(id, avatar, cancellation, background: true).ConfigureAwait(false);
                     }
                     catch (Exception error) when (error is HttpRequestException || error is InvalidDataException || error is JsonException)
                     {
                         progress?.Report("Thumbnail unavailable (" + error.Message + "); the Workshop image is a plain background.");
                     }
-                    Workshop.WriteIcon(picture, Path.Combine(staging, Workshop.IconFile), avatar && bundle == null);
+                    Workshop.WriteIcon(picture, Path.Combine(staging, Workshop.IconFile), avatar && bundle == null || modelFile != null);
                     // SFM Workshop page image, as for Garry's Mod: a bundle's picture, or an avatar's profile background with its
                     // full-body render.
                     try
@@ -1351,7 +1287,7 @@ namespace Rbx2Source.Export
                         }
                         else if (avatar)
                         {
-                            KeyValuePair<byte[], Color?> background = new KeyValuePair<byte[], Color?>(null, null);
+                            KeyValuePair<byte[], int?> background = new KeyValuePair<byte[], int?>(null, null);
                             try
                             {
                                 background = await DownloadProfileBackgroundAsync(id, cancellation).ConfigureAwait(false);
@@ -1389,14 +1325,14 @@ namespace Rbx2Source.Export
                     byte[] thumbnail = null;
                     try
                     {
-                        thumbnail = modelFile != null ? null : bundle != null ? await DownloadBundleThumbnailAsync(bundle.Id, cancellation).ConfigureAwait(false)
+                        thumbnail = modelFile != null ? FilePicture(fileContents, model, localTextures) : bundle != null ? await DownloadBundleThumbnailAsync(bundle.Id, cancellation).ConfigureAwait(false)
                             : await DownloadThumbnailAsync(id, avatar, cancellation, background: true).ConfigureAwait(false);
                     }
                     catch (Exception error) when (error is HttpRequestException || error is InvalidDataException || error is JsonException)
                     {
                         progress?.Report("Thumbnail unavailable (" + error.Message + "); the Workshop icon is a plain background.");
                     }
-                    Workshop.WriteIcon(thumbnail, Path.Combine(staging, Workshop.IconFile), avatar && bundle == null);
+                    Workshop.WriteIcon(thumbnail, Path.Combine(staging, Workshop.IconFile), avatar && bundle == null || modelFile != null);
                     if (bundle != null)
                     {
                         // Workshop page image for a bundle: its catalog picture on a plain background.
@@ -1407,7 +1343,7 @@ namespace Rbx2Source.Export
                         try
                         {
                             // Workshop page image: the profile background with the full-body render on top.
-                            KeyValuePair<byte[], Color?> background = new KeyValuePair<byte[], Color?>(null, null);
+                            KeyValuePair<byte[], int?> background = new KeyValuePair<byte[], int?>(null, null);
                             try
                             {
                                 background = await DownloadProfileBackgroundAsync(id, cancellation).ConfigureAwait(false);
@@ -1466,7 +1402,7 @@ namespace Rbx2Source.Export
                 ExportFolder = destination;
                 return Path.Combine(destination, fileName);
             }
-            catch (Exception error)
+            catch (Exception)
             {
                 try
                 {
@@ -1474,10 +1410,49 @@ namespace Rbx2Source.Export
                 }
                 catch (Exception cleanupError) when (cleanupError is IOException || cleanupError is UnauthorizedAccessException)
                 {
-                    throw new AggregateException("Export failed and temporary files could not be removed from " + staging, error, cleanupError);
+                    // The export's own error is the one to show; leftover temporary files only get a note.
+                    if (Directory.Exists(staging))
+                        progress?.Report("Temporary files could not be removed from " + staging + ": " + cleanupError.Message);
                 }
                 throw;
             }
+        }
+
+        // Creates the export's temporary folder and checks that a file can be written in it. Windows' Controlled folder access
+        // (and some antivirus programs) keeps unknown programs from writing to Documents, RoPorter's default output folder,
+        // and Windows then reports the new folder as not found or access denied, which on its own explains nothing.
+        private static void CreateStaging(string staging, string outputRoot)
+        {
+            try
+            {
+                Directory.CreateDirectory(staging);
+                string probe = Path.Combine(staging, "write.test");
+                File.WriteAllBytes(probe, new byte[0]);
+                File.Delete(probe);
+            }
+            catch (Exception error) when (error is IOException && !(error is PathTooLongException) || error is UnauthorizedAccessException)
+            {
+                try
+                {
+                    if (Directory.Exists(staging))
+                        Directory.Delete(staging, true);
+                }
+                catch (Exception cleanupError) when (cleanupError is IOException || cleanupError is UnauthorizedAccessException)
+                {
+                }
+                throw new IOException("RoPorter could not write to the output folder " + outputRoot + " (" + error.Message + ") " +
+                    SourceExporter.BlockedFolderHint(Environment.ProcessPath ?? "RoPorter"), error);
+            }
+        }
+
+        // A model file's picture for its Workshop icon (PNG): its built model with meshes and textures, as RoPorter's preview
+        // shows it, or else its parts as boxes; null when there is nothing to draw.
+        private static byte[] FilePicture(ModelContents contents, WavefrontModel model, Dictionary<string, byte[]> textures)
+        {
+            if (contents == null)
+                return null;
+            using (Picture picture = (model != null ? PlaceRender.Render(model, textures, Workshop.IconSize) : null) ?? PlaceRender.Preview(contents, Workshop.IconSize))
+                return picture?.Encode(PictureFormat.Png);
         }
 
         // A place as a Garry's Mod map addon: the map, its materials and prop models, and an addon.json of type "map".
@@ -1487,7 +1462,7 @@ namespace Rbx2Source.Export
             string map = await SourceMap.ExportAsync(contents, (assetId, token) => DownloadAssetAsync(assetId, token), staging, name, scale,
                 garrysMod, progress, cancellation).ConfigureAwait(false);
             // gmad cannot parse addon.json with a byte order mark.
-            File.WriteAllText(Path.Combine(staging, "addon.json"), "{\n\t\"title\": " + JsonConvert.ToString("RoPorter - " + label) +
+            File.WriteAllText(Path.Combine(staging, "addon.json"), "{\n\t\"title\": " + JsonConvert.ToString(label) +
                 ",\n\t\"description\": " + JsonConvert.ToString(SourceExporter.WorkshopDescription) +
                 ",\n\t\"type\": \"map\",\n\t\"tags\": [\"build\", \"fun\"],\n\t\"ignore\": [\"src/*\", \"" + Workshop.IconFile + "\", \"" + Workshop.PreviewFile + "\"]\n}\n",
                 new UTF8Encoding(false));

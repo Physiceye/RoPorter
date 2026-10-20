@@ -249,6 +249,27 @@ namespace Rbx2Source.Export
                     parts[part] = covered;
                     rig.Notes.Add(part + " is hidden by layered clothing; it is placed from the clothing's skin weights.");
                 }
+            // A limb only partly hidden keeps just its visible end (a strip of shin above a shoe, under baggy trousers): it
+            // also reaches as high and low as the clothing weighted to it, or its joint lands at that strip (the knee at the
+            // ankle).
+            foreach (BodyPart part in parts.Keys.ToList())
+            {
+                string name = part.ToString();
+                if (!(name.Contains("Arm") || name.Contains("Leg")) || !rig.skinnedBoxes.TryGetValue(PartBone[part], out PartBounds covered) ||
+                    covered.IsEmpty || (covered.Min[1] >= parts[part].Min[1] && covered.Max[1] <= parts[part].Max[1]))
+                    continue;
+                var extended = new PartBounds();
+                PartBounds visible = parts[part];
+                extended.Add(new[] { (float)visible.Min[0], (float)visible.Min[1], (float)visible.Min[2] });
+                extended.Add(new[] { (float)visible.Max[0], (float)visible.Max[1], (float)visible.Max[2] });
+                extended.Add(new[] { (float)visible.Center(0), (float)covered.Min[1], (float)visible.Center(2) });
+                extended.Add(new[] { (float)visible.Center(0), (float)covered.Max[1], (float)visible.Center(2) });
+                parts[part] = extended;
+            }
+            // Feet hidden in shoes leave the lowest body part above the ground, which the avatar still stands on: without it,
+            // the hidden shins and feet were squeezed in under the knees.
+            if (!parts.ContainsKey(BodyPart.LeftFoot) && !parts.ContainsKey(BodyPart.RightFoot) && all.Min[1] < body.Min[1])
+                body.Add(new[] { (float)body.Center(0), (float)all.Min[1], (float)body.Center(2) });
             rig.PlaceBones(parts, body);
             cancellation.ThrowIfCancellationRequested();
             rig.ComputeWeights(model, groupPositions, positionGroup, parts, body, cancellation);
@@ -325,6 +346,8 @@ namespace Rbx2Source.Export
             // the one that meets the hips. Whatever else is on that side is its arm, however close it hangs to the legs
             // (posed renders, short arms resting on big legs). Sides with nothing on the floor fall back to the distances.
             double floor = body.Values.Min(b => b.Min[1]), reach = 0.03 * Math.Max(body.Values.Max(b => b.Max[1]) - floor, 1e-6);
+            // The ground the avatar stands on, below any shoes covering its feet.
+            double ground = groups.Values.Min(b => b.Min[1]);
             bool Touch(PartBounds a, PartBounds b) => Enumerable.Range(0, 3).All(axis => a.Min[axis] - reach <= b.Max[axis] && b.Min[axis] - reach <= a.Max[axis]);
             double Overlap(PartBounds a, PartBounds b)
             {
@@ -411,6 +434,16 @@ namespace Rbx2Source.Export
                     if (ordered.Count > 3)
                         ordered = ordered.Take(3).ToList();
                     double top = ordered.Max(g => body[g].Max[1]), bottom = ordered.Min(g => body[g].Min[1]);
+                    // A leg runs from the hips (below where a hidden lower torso would end) to the floor however much of it is
+                    // hidden: pants that hide the thighs leave the shin on top, which is not a thigh, and shoes that hide the
+                    // feet leave it at the bottom, where it is not a foot. (An arm's ends are not known: a sleeve can hide the
+                    // hand as well as the upper arm.)
+                    if (limb.Key.EndsWith("Leg", StringComparison.Ordinal))
+                    {
+                        if (hips != null)
+                            top = Math.Max(top, lowerTorso != null ? hips.Min[1] : hips.Min[1] - 0.4 * hips.Size(1));
+                        bottom = Math.Min(bottom, ground);
+                    }
                     // Layered clothing over the limb's hidden parts shows where the limb starts and ends: boots over the shins
                     // and feet, sleeves over the upper arm and forearm (a hand left alone at the end of a sleeve is a hand).
                     foreach (BodyPart hidden in labels)
@@ -1039,6 +1072,7 @@ namespace Rbx2Source.Export
                     continue;
                 group.Hug = (double)hugging / group.Nearest.Count;
                 group.Majority = Array.IndexOf(votes, votes.Max());
+                group.Votes = votes;
                 groups.Add(group);
             }
 
@@ -1057,13 +1091,18 @@ namespace Rbx2Source.Export
                 }
                 else
                 {
-                    // Without accessory metadata, layered clothing is recognised by how closely it wraps the body. An item
-                    // wrapped closely around the head (a fur hood, a mask, hair) is still a head accessory, rigid on the head:
-                    // blending it into the chest made it stretch and clip whenever the head turned. With metadata, every
+                    // Without accessory metadata, layered clothing is recognised by how closely it wraps the body, or by
+                    // covering a body part missing from the render: Roblox deletes body parts only under layered clothing, so
+                    // loose pants or boots over a deleted shin are clothing, and welding them to one bone froze the limb. An
+                    // item wrapped closely around the head (a fur hood, a mask, hair) is still a head accessory, rigid on the
+                    // head: blending it into the chest made it stretch and clip whenever the head turned. With metadata, every
                     // layered item was matched by its mesh or position, so a leftover group is a rigid accessory (or a part of
                     // one): Roblox welds those to a single body part, here the one it is mostly around.
-                    layered = accessories == null && group.Hug >= 0.6 && group.Majority != HeadBone;
+                    layered = accessories == null && group.Majority != HeadBone && (group.Hug >= 0.6 || CoversHiddenPart(group.Bounds, actual));
                     bone = group.Majority;
+                    if (accessories == null)
+                        Notes.Add(group.Name + " (no item details) wraps the body " + Math.Round(100 * group.Hug) + "%, mostly around " +
+                            BoneNames[bone] + ": " + (layered ? "layered, auto-weighted" : "rigid") + ".");
                 }
                 // Only gear is held: the group matched to the avatar's gear, and any unidentified piece that came down with the
                 // raised arm holding it (a tool can have several parts). It is rigid on the right hand, where Roblox holds tools.
@@ -1080,7 +1119,16 @@ namespace Rbx2Source.Export
                 }
                 if (layered)
                     LayeredGroups.Add(group.Name);
+                // Clothing recognised by its shape follows the bones it surrounds and their neighbours: a jacket can be mostly
+                // around one sleeve, and keeping it near that bone left the other sleeve on the chest. It stays within four
+                // steps of that bone, which reaches the other forearm but not the other foot (shoes stand close together).
                 HashSet<int> allowed = Within(bone, 3);
+                if (layered && group.Accessory == null && Surrounded(group.Votes) is HashSet<int> surrounded)
+                {
+                    surrounded.IntersectWith(Within(bone, 4));
+                    if (surrounded.Count > 0)
+                        allowed = surrounded;
+                }
 
                 if (group.Skin != null)
                 {
@@ -1120,6 +1168,25 @@ namespace Rbx2Source.Export
                     Joints[i] = new[] { Hips, 0, 0, 0 };
                     Weights[i] = new[] { 1f, 0, 0, 0 };
                 }
+        }
+
+        // Whether a box covers at least half of a body part that is missing from the render (its box estimated or mirrored).
+        private bool CoversHiddenPart(PartBounds box, Dictionary<BodyPart, PartBounds> actual)
+        {
+            if (actual.Count == 0 || box.IsEmpty)
+                return false;
+            foreach (var pair in PartBoxes)
+            {
+                if (actual.ContainsKey(pair.Key) || pair.Value.IsEmpty)
+                    continue;
+                double covered = 1;
+                for (int axis = 0; axis < 3; axis++)
+                    covered *= Math.Max(0, Math.Min(box.Max[axis], pair.Value.Max[axis]) - Math.Max(box.Min[axis], pair.Value.Min[axis])) /
+                        Math.Max(pair.Value.Size(axis), 1e-6);
+                if (covered >= 0.5)
+                    return true;
+            }
+            return false;
         }
 
         // Head accessories are rigid on the head down to the bottom of the head. Below it (long hair down the back) they blend
@@ -1226,6 +1293,8 @@ namespace Rbx2Source.Export
             public readonly Dictionary<int, List<KeyValuePair<int, double>>> Nearest = new Dictionary<int, List<KeyValuePair<int, double>>>();
             public double Hug;
             public int Majority;
+            // Per rig bone, how many of the group's vertices are nearest to it.
+            public int[] Votes;
             public AccessoryInfo Accessory;
             // Rendered position -> vertex of the accessory's own mesh, when Roblox's skin weights can be used.
             public Dictionary<int, int> Skin;
@@ -1401,6 +1470,22 @@ namespace Rbx2Source.Export
             double nearest = metrics.Values.Min();
             return KeepConnected(metrics.Where(pair => pair.Value <= nearest + 4 * softness)
                 .ToDictionary(pair => pair.Key, pair => Math.Exp(-(pair.Value - nearest) / softness)));
+        }
+
+        // The bones nearest to at least 5% of a group's vertices, with their neighbours, but never the head: a collar that
+        // followed it twisted the jacket whenever the head turned (Roblox's own weights leave clothing off the head). Null when
+        // there are none.
+        private static HashSet<int> Surrounded(int[] votes)
+        {
+            int total = votes?.Sum() ?? 0;
+            if (total == 0)
+                return null;
+            var bones = new HashSet<int>();
+            for (int bone = 0; bone < votes.Length; bone++)
+                if (votes[bone] >= 0.05 * total)
+                    bones.UnionWith(Within(bone, 1));
+            bones.Remove(HeadBone);
+            return bones.Count > 0 ? bones : null;
         }
 
         private static HashSet<int> Within(int bone, int steps)

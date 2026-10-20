@@ -1,10 +1,7 @@
 using System;
 using System.Collections.Generic;
-using System.Drawing;
-using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using Newtonsoft.Json;
@@ -102,36 +99,23 @@ namespace Rbx2Source.Export
         // Picks OPAQUE, MASK (cut-out) or BLEND from the texture's actual alpha values.
         internal static string AlphaMode(string path)
         {
-            using (var image = new Bitmap(path))
+            using (Picture image = Picture.Load(path))
             {
-                if (!Image.IsAlphaPixelFormat(image.PixelFormat))
+                if (!image.HasAlphaChannel)
                     return "OPAQUE";
-                var rectangle = new Rectangle(0, 0, image.Width, image.Height);
-                BitmapData data = image.LockBits(rectangle, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-                try
+                long transparent = 0, partial = 0;
+                foreach (int pixel in image.GetPixels())
                 {
-                    var row = new byte[data.Width * 4];
-                    long transparent = 0, partial = 0;
-                    for (int y = 0; y < data.Height; y++)
-                    {
-                        Marshal.Copy(data.Scan0 + y * data.Stride, row, 0, row.Length);
-                        for (int x = 3; x < row.Length; x += 4)
-                        {
-                            if (row[x] <= 5)
-                                transparent++;
-                            else if (row[x] < 250)
-                                partial++;
-                        }
-                    }
-                    long total = (long)data.Width * data.Height;
-                    if (transparent + partial == 0)
-                        return "OPAQUE";
-                    return partial <= 0.05 * total ? "MASK" : "BLEND";
+                    int alpha = (pixel >> 24) & 255;
+                    if (alpha <= 5)
+                        transparent++;
+                    else if (alpha < 250)
+                        partial++;
                 }
-                finally
-                {
-                    image.UnlockBits(data);
-                }
+                long total = (long)image.Width * image.Height;
+                if (transparent + partial == 0)
+                    return "OPAQUE";
+                return partial <= 0.05 * total ? "MASK" : "BLEND";
             }
         }
 

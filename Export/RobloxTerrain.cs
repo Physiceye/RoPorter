@@ -9,7 +9,7 @@ namespace Rbx2Source.Export
     // data in chunks (32 voxels a side): each chunk's position as an offset from the previous chunk (three big-endian 32-bit
     // integers with their bytes interleaved), then its voxels X fastest, then Z, then Y, as runs. A run is a byte with the
     // material in its low six bits, then the occupancy (when bit 6 is set; full otherwise) and the run's length less one (when
-    // bit 7 is set; one voxel otherwise).
+    // bit 7 is set; one voxel otherwise). A length byte of 0 (a shoreline voxel) is followed by that voxel's water.
     public sealed class RobloxTerrain
     {
         public const float VoxelSize = 4;
@@ -90,6 +90,15 @@ namespace Rbx2Source.Export
                         if (position >= grid.Length)
                             throw new InvalidDataException("The terrain data is truncated.");
                         count = grid[position++] + 1;
+                        // A one-voxel run that still has a length byte is a shoreline voxel (a solid material with water in
+                        // it, from places with shorelines upgraded): one more byte follows, its water. Only the solid part is
+                        // exported.
+                        if (count == 1)
+                        {
+                            if (position >= grid.Length)
+                                throw new InvalidDataException("The terrain data is truncated.");
+                            position++;
+                        }
                     }
                     if (filled + count > perChunk)
                         throw new InvalidDataException("The terrain data has an overlong run.");
@@ -106,10 +115,11 @@ namespace Rbx2Source.Export
             return terrain;
         }
 
-        // The ground's top: for each 4-stud column, the top of its highest solid voxel (lower for one only partly full) and
+        // The ground's top as Roblox draws it: for each 4-stud column, the surface over its highest solid voxel (lower for one only partly full) and
         // that voxel's material. Water and air are not ground.
-        public TerrainSurface Surface()
+        public TerrainSurface Surface(bool smoothVoxelsUpgraded = false)
         {
+            float beyond = smoothVoxelsUpgraded ? 0 : 0.5f;
             int size = ChunkSize;
             var tops = new Dictionary<(int X, int Z), (float Height, byte Material)>();
             foreach (var chunk in Chunks)
@@ -124,7 +134,12 @@ namespace Rbx2Source.Export
                             if (material == Air || material == Water || occupancy[i] == 0)
                                 continue;
                             int vx = chunk.Key.X * size + x, vy = chunk.Key.Y * size + y, vz = chunk.Key.Z * size + z;
-                            float top = (vy + occupancy[i] / 255f) * VoxelSize;
+                            // Roblox's original smooth terrain draws the surface half a voxel beyond the filled voxels: a full top
+                            // voxel's surface is at the centre of the empty voxel above (a single voxel renders as a blob wider
+                            // than 4 studs). Places are built on that surface: TownTest's roads and fences stand 2 studs above its
+                            // full layer's top, and its baseplate at that top is hidden under the grass. Terrain upgraded to
+                            // smooth voxels (Terrain.SmoothVoxelsUpgraded) is drawn to the voxels' own extent.
+                            float top = (vy + beyond + occupancy[i] / 255f) * VoxelSize;
                             if (!tops.TryGetValue((vx, vz), out var current) || top > current.Height)
                                 tops[(vx, vz)] = (top, material);
                         }

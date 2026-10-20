@@ -6,29 +6,90 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 jobs:
-  build:
+  test:
     runs-on: windows-latest
     steps:
     - uses: actions/checkout@v4
     - uses: actions/setup-dotnet@v4
       with:
-        dotnet-version: '8.0.x'
-    - name: Add msbuild to PATH
-      uses: microsoft/setup-msbuild@v2
-    - name: Build
-      run: msbuild Rbx2Source.sln /restore /p:Configuration=Release
-    - name: Test GLB and glTF export
-      run: dotnet test Tests\Rbx2Source.Tests.csproj --configuration Release
+        dotnet-version: '10.0.x'
+    - name: Test exports
+      run: dotnet test Tests/Rbx2Source.Tests.csproj --configuration Release
+
+  publish:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, rid: win-x64, name: RoPorter-Windows-x64 }
+          - { os: ubuntu-latest, rid: linux-x64, name: RoPorter-Linux-x64 }
+          - { os: macos-latest, rid: osx-arm64, name: RoPorter-macOS-AppleSilicon }
+          - { os: macos-latest, rid: osx-x64, name: RoPorter-macOS-Intel }
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
+    # One self-contained file: nothing else needs installing to run it.
+    - name: Publish
+      run: dotnet publish Rbx2Source.csproj --configuration Release --runtime ${{ matrix.rid }} --output publish
+    - name: Package for Windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force dist | Out-Null
+        Copy-Item publish/RoPorter.exe dist/RoPorter.exe
+    - name: Package for Linux
+      if: runner.os == 'Linux'
+      run: |
+        mkdir -p dist
+        chmod +x publish/RoPorter
+        tar -czf dist/${{ matrix.name }}.tar.gz -C publish RoPorter
+    # A minimal app bundle. It is not signed, so the first launch needs right-click > Open (or System Settings > Privacy &
+    # Security > Open Anyway).
+    - name: Package for macOS
+      if: runner.os == 'macOS'
+      run: |
+        app=dist/RoPorter.app/Contents
+        mkdir -p "$app/MacOS" "$app/Resources"
+        cp publish/RoPorter "$app/MacOS/RoPorter"
+        chmod +x "$app/MacOS/RoPorter"
+        mkdir icon.iconset
+        sips -z 256 256 Resources/Images/favicon.png --out icon.iconset/icon_256x256.png
+        iconutil -c icns icon.iconset -o "$app/Resources/RoPorter.icns" || true
+        version=$(sed -n 's/.*AssemblyVersion("\([0-9.]*\)").*/\1/p' Properties/AssemblyInfo.cs)
+        cat > "$app/Info.plist" <<EOF
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+          <key>CFBundleName</key><string>RoPorter</string>
+          <key>CFBundleDisplayName</key><string>RoPorter</string>
+          <key>CFBundleIdentifier</key><string>com.physiceye.roporter</string>
+          <key>CFBundleExecutable</key><string>RoPorter</string>
+          <key>CFBundleIconFile</key><string>RoPorter</string>
+          <key>CFBundlePackageType</key><string>APPL</string>
+          <key>CFBundleShortVersionString</key><string>${version}</string>
+          <key>CFBundleVersion</key><string>${version}</string>
+          <key>LSMinimumSystemVersion</key><string>12.0</string>
+          <key>NSHighResolutionCapable</key><true/>
+        </dict>
+        </plist>
+        EOF
+        tar -czf dist/${{ matrix.name }}.tar.gz -C dist RoPorter.app
+        rm -rf dist/RoPorter.app
     - name: VirusTotal Scan
+      if: runner.os == 'Windows'
       continue-on-error: true
       uses: crazy-max/ghaction-virustotal@v3
       with:
-        vt_api_key: ${{ secrets.VT_APIKEY}}
+        vt_api_key: ${{ secrets.VT_APIKEY }}
         request_rate: 4
-        files: bin/Release/RoPorter.exe
+        files: dist/RoPorter.exe
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: RoPorter
-        path: bin/Release/RoPorter.exe
+        name: ${{ matrix.name }}
+        path: dist/*
         if-no-files-found: error

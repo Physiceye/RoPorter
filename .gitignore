@@ -18,6 +18,8 @@ mono_crash.*
 
 # Other
 /Tests
+/RobloxTestFiles
+build.bat
 
 # Build results
 [Dd]ebug/
@@ -369,3 +371,6 @@ brokenstuff/
 misc.txt
 Roblox-File-Format/
 C/
+
+# Output of build.bat
+/build/

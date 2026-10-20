@@ -1,8 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Drawing;
-using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -69,6 +67,8 @@ namespace Rbx2Source.Export
             public readonly List<float[]> Uvs = new List<float[]>();
             public readonly List<(int A, int B, int C, string Material)> Triangles = new List<(int, int, int, string)>();
             public readonly List<double[][]> Hull = new List<double[][]>();
+            // Decals are already cut into cells over their part's face and need no more vertices for lighting.
+            public bool Decal;
         }
 
         // A merged prop: the pieces in one area of the map, up to studiomdl's comfortable size.
@@ -96,6 +96,10 @@ namespace Rbx2Source.Export
             private const double MinThickness = 0.5;
             // Luxels in the whole map's lightmaps: past this the lightmaps get coarser so the map stays within Source's limits.
             private const double LuxelBudget = 2.5e6;
+            // How strongly materials glow by the place's Lighting.Ambient (see AmbientGlow).
+            private const double AmbientGlowScale = 1, MaxAmbientGlow = 0.35;
+            // Units per luxel on terrain displacements, set with the rest of the lightmap detail.
+            private int terrainLuxel = 16;
             // Merged props: areas this wide, split further past these sizes.
             private const double CellSize = 2048;
             private const int ChunkTriangles = 12000, ChunkHulls = 400, ChunkMaterials = 24;
@@ -257,29 +261,29 @@ namespace Rbx2Source.Export
                     string vmf = Path.Combine(src, map + ".vmf");
                     File.WriteAllText(vmf, Vmf(sky), Encoding.ASCII);
                     string bsp = Path.Combine(src, map + ".bsp");
-                    string game = "-game \"" + folder.TrimEnd('\\', '/') + "\" ";
+                    string game = "-game \"" + SourceExporter.ToolPath(folder.TrimEnd('\\', '/')) + "\" ";
                     progress?.Report("Compiling the map (vbsp)...");
                     // No t-junction repair: on a large place it overflows vbsp (a road of many parts merges into one face
                     // with too many edges to fix).
-                    string log = Run(vbsp, game + "-notjunc \"" + vmf + "\"");
+                    string log = Run(vbsp, game + "-notjunc \"" + SourceExporter.ToolPath(vmf) + "\"");
                     File.WriteAllText(Path.Combine(src, "vbsp.log"), log);
                     if (!File.Exists(bsp))
-                        throw new InvalidDataException("vbsp could not build the map:" + Environment.NewLine + Failure(log));
+                        throw new InvalidDataException("vbsp could not build the map:" + Environment.NewLine + SourceExporter.ToolFailure(log, vbsp));
                     if (log.IndexOf("LEAKED", StringComparison.OrdinalIgnoreCase) >= 0)
                         progress?.Report("The map leaked, so visibility was not computed.");
                     else
                     {
                         progress?.Report("Computing visibility (vvis)...");
-                        Run(vvis, game + "\"" + bsp + "\"");
+                        Run(vvis, game + "\"" + SourceExporter.ToolPath(bsp) + "\"");
                     }
                     progress?.Report("Lighting the map (vrad)...");
                     var watch = Stopwatch.StartNew();
                     // Props are lit per vertex. vrad's fast mode takes seconds where full quality takes minutes on a place
                     // with detailed meshes.
-                    log = Run(vrad, game + "-fast -StaticPropLighting \"" + bsp + "\"");
+                    log = Run(vrad, game + "-fast -StaticPropLighting \"" + SourceExporter.ToolPath(bsp) + "\"");
                     File.WriteAllText(Path.Combine(src, "vrad.log"), log);
                     if (!Regex.IsMatch(log, @"Writing .*\.bsp", RegexOptions.IgnoreCase))
-                        throw new InvalidDataException("vrad could not light the map:" + Environment.NewLine + Failure(log));
+                        throw new InvalidDataException("vrad could not light the map:" + Environment.NewLine + SourceExporter.ToolFailure(log, vrad));
                     progress?.Report("Lit in " + (int)watch.Elapsed.TotalSeconds + " seconds.");
                     string maps = Path.Combine(folder, "maps");
                     Directory.CreateDirectory(maps);
@@ -297,17 +301,13 @@ namespace Rbx2Source.Export
             // The map's picture: in Garry's Mod's map list (maps\thumb) and as the Workshop icon.
             private void WritePictures()
             {
-                using (Bitmap picture = render.Draw(512, sunTravel))
+                using (Picture picture = render.Draw(512, sunTravel))
                 {
                     string thumbs = Path.Combine(folder, "maps", "thumb");
                     Directory.CreateDirectory(thumbs);
-                    using (var thumbnail = new Bitmap(picture, 256, 256))
-                        thumbnail.Save(Path.Combine(thumbs, map + ".png"), ImageFormat.Png);
-                    using (var stream = new MemoryStream())
-                    {
-                        picture.Save(stream, ImageFormat.Png);
-                        Workshop.WriteIcon(stream.ToArray(), Path.Combine(folder, Workshop.IconFile));
-                    }
+                    using (Picture thumbnail = picture.Resized(256, 256))
+                        thumbnail.Save(Path.Combine(thumbs, map + ".png"), PictureFormat.Png);
+                    Workshop.WriteIcon(picture.Encode(PictureFormat.Png), Path.Combine(folder, Workshop.IconFile));
                 }
             }
 
@@ -315,7 +315,7 @@ namespace Rbx2Source.Export
             // materials and models through a temporary gameinfo.txt in the addon folder.
             private string GameInfo()
             {
-                string root = install.Folder;
+                string root = SourceExporter.ToolPath(install.Folder);
                 string Path(string relative) => System.IO.Path.Combine(root, relative).Replace('\\', '/');
                 return "\"GameInfo\"\n{\n\tgame \"RoPorter\"\n\ttype multiplayer_only\n\tFileSystem\n\t{\n\t\tSteamAppId 4000\n\t\tSearchPaths\n\t\t{\n" +
                     "\t\t\tgame+mod |gameinfo_path|.\n" +
@@ -331,11 +331,12 @@ namespace Rbx2Source.Export
 
             private string Run(string exe, string arguments, string workingDirectory = null)
             {
-                var start = new ProcessStartInfo(exe, arguments)
-                {
-                    UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true,
-                    WorkingDirectory = workingDirectory ?? Path.GetDirectoryName(exe)
-                };
+                ProcessStartInfo start = SourceExporter.ToolStart(exe, arguments);
+                start.UseShellExecute = false;
+                start.CreateNoWindow = true;
+                start.RedirectStandardOutput = true;
+                start.RedirectStandardError = true;
+                start.WorkingDirectory = workingDirectory ?? Path.GetDirectoryName(exe);
                 var output = new StringBuilder();
                 using (var process = new Process { StartInfo = start })
                 {
@@ -357,13 +358,6 @@ namespace Rbx2Source.Export
             }
 
             // The lines of a compile log that explain a failure.
-            private static string Failure(string log)
-            {
-                var lines = log.Split('\n').Select(l => l.Trim()).Where(l => l.Length > 0 && l.IndexOf("mount.cfg", StringComparison.OrdinalIgnoreCase) < 0).ToList();
-                var errors = lines.Where(l => Regex.IsMatch(l, @"error|leak|MAX_MAP|exceeded|can't|cannot|failed", RegexOptions.IgnoreCase)).Distinct().Take(6).ToList();
-                return string.Join(Environment.NewLine, errors.Count > 0 ? errors : lines.Skip(Math.Max(0, lines.Count - 6)));
-            }
-
             // Centres the place on the map, leaving out parts too far away to fit inside Source's world limits.
             private List<PlacedPart> Fit(List<PlacedPart> parts)
             {
@@ -683,36 +677,49 @@ namespace Rbx2Source.Export
                     vmt.Append("\t\"$surfaceprop\" \"").Append(surface).Append("\"\n");
                     if (alpha < 255)
                         vmt.Append("\t\"$translucent\" \"1\"\n\t\"$alpha\" \"").Append(F(alpha / 255.0)).Append("\"\n");
+                    if (!neon)
+                        vmt.Append(AmbientGlow);
                     File.WriteAllText(Path.Combine(materialFolder, name + ".vmt"), vmt.Append("}\n").ToString(), Encoding.ASCII);
                 }
                 return materialDir + name;
             }
 
+            // Roblox lights every surface with Lighting.Ambient however enclosed it is, while Source only bounces light in
+            // through windows: interiors came out black. Materials glow faintly by the place's ambient instead (self-illumination
+            // tinted by it, which adds the surface's own colour times the tint, as Roblox's ambient term does). Terrain is
+            // outdoors and lit by the sky's ambient.
+            private string ambientGlow;
+            private string AmbientGlow
+            {
+                get
+                {
+                    if (ambientGlow != null)
+                        return ambientGlow;
+                    float[] ambient = contents.Lighting?.Get<float[]>("Ambient") ?? new[] { 0.275f, 0.275f, 0.275f };
+                    double[] tint = ambient.Select(channel => Math.Min(MaxAmbientGlow, channel * AmbientGlowScale)).ToArray();
+                    return ambientGlow = tint.Max() < 0.01 ? "" :
+                        "\t\"$selfillum\" \"1\"\n\t\"$selfillumtint\" \"[" + F(tint[0]) + " " + F(tint[1]) + " " + F(tint[2]) + "]\"\n";
+                }
+            }
+
             // A Roblox material's colour map as a texture in the map's materials: halved for a detail texture (Source doubles
-            // detail textures as it multiplies them in), or as it is for a model's base texture. Null for materials with none.
-            private string MaterialTexture(int material, bool detail)
+            // detail textures as it multiplies them in), or as it is for a model's base texture, faded by an opacity (0-255) for a
+            // see-through part. Null for materials with none.
+            private string MaterialTexture(int material, bool detail, int alpha = 255)
             {
                 string roblox = RobloxContent.MaterialName(material);
                 byte[] image = RobloxContent.MaterialTexture(roblox);
                 if (image == null)
                     return null;
-                string name = "mat_" + roblox.ToLowerInvariant() + (detail ? "_detail" : "");
+                string name = "mat_" + roblox.ToLowerInvariant() + (detail ? "_detail" : "") + (alpha < 255 ? "_a" + alpha.ToString("x2") : "");
                 string vtf = Path.Combine(materialFolder, name + ".vtf");
                 if (!File.Exists(vtf))
-                    using (var stream = new MemoryStream(image))
-                    using (var source = new Bitmap(stream))
-                    using (var copy = new Bitmap(source.Width, source.Height, PixelFormat.Format32bppArgb))
+                    using (Picture source = Picture.Load(image))
+                    using (var copy = new Picture(source.Width, source.Height))
                     {
-                        using (Graphics graphics = Graphics.FromImage(copy))
-                        using (var halve = new ImageAttributes())
-                        {
-                            if (detail)
-                                halve.SetColorMatrix(new ColorMatrix(new[]
-                                {
-                                    new[] { 0.5f, 0, 0, 0, 0 }, new[] { 0, 0.5f, 0, 0, 0 }, new[] { 0, 0, 0.5f, 0, 0 }, new[] { 0, 0, 0, 1f, 0 }, new[] { 0, 0, 0, 0, 1f }
-                                }));
-                            graphics.DrawImage(source, new Rectangle(0, 0, copy.Width, copy.Height), 0, 0, source.Width, source.Height, GraphicsUnit.Pixel, halve);
-                        }
+                        copy.Draw(source, 0, 0, copy.Width, copy.Height, tint: detail ? new[] { 0.5f, 0.5f, 0.5f } : null, replace: true);
+                        if (alpha < 255)
+                            FadeAlpha(copy, alpha / 255.0);
                         VtfWriter.Write(copy, vtf, VtfWriter.Kind.Color, compress: true);
                     }
                 return name;
@@ -892,39 +899,37 @@ namespace Rbx2Source.Export
                     return name;
                 string vtf = Path.Combine(materialFolder, name + ".vtf");
                 string blend = null;
-                using (var stream = new MemoryStream(textureBytes[texture]))
-                using (var image = new Bitmap(stream))
+                using (Picture image = Picture.Load(textureBytes[texture]))
                 {
+                    // The part's transparency goes into the texture's alpha: Garry's Mod ignores $alpha on static props.
                     if (part.Overlay)
-                        using (var composite = new Bitmap(image.Width, image.Height, PixelFormat.Format32bppArgb))
+                        using (var composite = new Picture(image.Width, image.Height))
                         {
-                            using (Graphics graphics = Graphics.FromImage(composite))
-                            {
-                                graphics.Clear(Color.FromArgb(255, Byte(part.Color[0]), Byte(part.Color[1]), Byte(part.Color[2])));
-                                graphics.DrawImage(image, new Rectangle(0, 0, image.Width, image.Height));
-                            }
-                            VtfWriter.Write(composite, vtf, VtfWriter.Kind.Color, compress: true);
+                            composite.Clear(unchecked((int)0xFF000000) | (Byte(part.Color[0]) << 16) | (Byte(part.Color[1]) << 8) | Byte(part.Color[2]));
+                            composite.Draw(image, 0, 0, image.Width, image.Height);
+                            if (alpha < 255)
+                                FadeAlpha(composite, alpha / 255.0);
+                            if (VtfWriter.Write(composite, vtf, VtfWriter.Kind.Color, compress: true))
+                                blend = "BLEND";
                             materialColors[name] = Average(composite);
                         }
                     else
-                        using (var copy = new Bitmap(image))
-                        {
-                            if (VtfWriter.Write(copy, vtf, VtfWriter.Kind.Color, compress: true))
-                                blend = AlphaKind(copy);
-                            materialColors[name] = Average(copy);
-                        }
+                    {
+                        if (alpha < 255)
+                            FadeAlpha(image, alpha / 255.0);
+                        if (VtfWriter.Write(image, vtf, VtfWriter.Kind.Color, compress: true))
+                            blend = alpha < 255 ? "BLEND" : AlphaKind(image);
+                        materialColors[name] = Average(image);
+                    }
                 }
                 var vmt = new StringBuilder("\"VertexLitGeneric\"\n{\n");
                 vmt.Append("\t\"$basetexture\" \"").Append(materialDir).Append(name).Append("\"\n");
                 vmt.Append("\t\"$surfaceprop\" \"").Append(SurfaceProp(part.Material)).Append("\"\n");
                 if (blend != null)
                     vmt.Append(blend == "MASK" ? "\t\"$alphatest\" \"1\"\n" : "\t\"$translucent\" \"1\"\n");
-                if (alpha < 255)
-                    vmt.Append("\t\"$translucent\" \"1\"\n\t\"$alpha\" \"").Append(F(alpha / 255.0)).Append("\"\n");
                 if (part.DoubleSided)
                     vmt.Append("\t\"$nocull\" \"1\"\n");
-                if (neon)
-                    vmt.Append("\t\"$selfillum\" \"1\"\n");
+                vmt.Append(neon ? "\t\"$selfillum\" \"1\"\n" : AmbientGlow);
                 File.WriteAllText(Path.Combine(materialFolder, name + ".vmt"), vmt.Append("}\n").ToString(), Encoding.ASCII);
                 return name;
             }
@@ -965,42 +970,46 @@ namespace Rbx2Source.Export
             {
                 if (palette.Count == 0)
                     return;
-                using (var image = new Bitmap(PaletteSize, PaletteSize, PixelFormat.Format32bppArgb))
+                using (var image = new Picture(PaletteSize, PaletteSize))
                 {
+                    var texels = new int[PaletteSize * PaletteSize];
                     foreach (var entry in palette)
-                        image.SetPixel(entry.Value % PaletteSize, entry.Value / PaletteSize, Color.FromArgb(entry.Key));
+                        texels[entry.Value] = entry.Key;
+                    image.SetPixels(texels);
                     VtfWriter.Write(image, Path.Combine(materialFolder, "palette.vtf"), VtfWriter.Kind.Color);
                 }
                 string Vmt(string extra) => "\"VertexLitGeneric\"\n{\n\t\"$basetexture\" \"" + materialDir + "palette\"\n\t\"$surfaceprop\" \"plastic\"\n" + extra + "}\n";
-                File.WriteAllText(Path.Combine(materialFolder, "palette.vmt"), Vmt(""), Encoding.ASCII);
-                File.WriteAllText(Path.Combine(materialFolder, "palette_alpha.vmt"), Vmt("\t\"$translucent\" \"1\"\n"), Encoding.ASCII);
+                File.WriteAllText(Path.Combine(materialFolder, "palette.vmt"), Vmt(AmbientGlow), Encoding.ASCII);
+                File.WriteAllText(Path.Combine(materialFolder, "palette_alpha.vmt"), Vmt("\t\"$translucent\" \"1\"\n" + AmbientGlow), Encoding.ASCII);
                 File.WriteAllText(Path.Combine(materialFolder, "palette_neon.vmt"), Vmt("\t\"$selfillum\" \"1\"\n"), Encoding.ASCII);
             }
 
             // Average colour of a texture (its visible pixels), for the map's picture.
-            private static float[] Average(Bitmap image)
+            private static float[] Average(Picture image)
             {
                 double r = 0, g = 0, b = 0, weight = 0;
+                int[] pixels = image.GetPixels();
                 for (int y = 0; y < image.Height; y += Math.Max(1, image.Height / 64))
                     for (int x = 0; x < image.Width; x += Math.Max(1, image.Width / 64))
                     {
-                        Color pixel = image.GetPixel(x, y);
-                        double a = pixel.A / 255.0;
-                        r += pixel.R * a;
-                        g += pixel.G * a;
-                        b += pixel.B * a;
+                        int pixel = pixels[y * image.Width + x];
+                        double a = ((pixel >> 24) & 255) / 255.0;
+                        r += ((pixel >> 16) & 255) * a;
+                        g += ((pixel >> 8) & 255) * a;
+                        b += (pixel & 255) * a;
                         weight += a;
                     }
                 return weight > 0 ? new[] { (float)(r / weight / 255), (float)(g / weight / 255), (float)(b / weight / 255) } : new float[] { 0.6f, 0.6f, 0.6f };
             }
 
             // Cut-out (only clear and solid pixels) or see-through.
-            private static string AlphaKind(Bitmap image)
+            private static string AlphaKind(Picture image)
             {
+                int[] pixels = image.GetPixels();
                 for (int y = 0; y < image.Height; y += Math.Max(1, image.Height / 256))
                     for (int x = 0; x < image.Width; x += Math.Max(1, image.Width / 256))
                     {
-                        int a = image.GetPixel(x, y).A;
+                        int a = (pixels[y * image.Width + x] >> 24) & 255;
                         if (a > 8 && a < 247)
                             return "BLEND";
                     }
@@ -1190,13 +1199,15 @@ namespace Rbx2Source.Export
                 string name = "m_" + RobloxContent.MaterialName(material).ToLowerInvariant() + "_" + Hex(color) + (alpha < 255 ? "_a" + alpha.ToString("x2") : "");
                 if (materials.Add(name))
                 {
-                    string texture = MaterialTexture(material, false);
+                    // A see-through part's opacity is in its texture's alpha: Garry's Mod ignores $alpha on static props.
+                    string texture = MaterialTexture(material, false, alpha);
                     var vmt = new StringBuilder("\"VertexLitGeneric\"\n{\n");
                     vmt.Append("\t\"$basetexture\" \"").Append(materialDir).Append(texture).Append("\"\n");
                     vmt.Append("\t\"$color2\" \"[").Append(F(color[0])).Append(' ').Append(F(color[1])).Append(' ').Append(F(color[2])).Append("]\"\n");
                     vmt.Append("\t\"$surfaceprop\" \"").Append(SurfaceProp(material)).Append("\"\n");
                     if (alpha < 255)
-                        vmt.Append("\t\"$translucent\" \"1\"\n\t\"$alpha\" \"").Append(F(alpha / 255.0)).Append("\"\n");
+                        vmt.Append("\t\"$translucent\" \"1\"\n");
+                    vmt.Append(AmbientGlow);
                     File.WriteAllText(Path.Combine(materialFolder, name + ".vmt"), vmt.Append("}\n").ToString(), Encoding.ASCII);
                     materialColors[name] = color;
                 }
@@ -1227,6 +1238,15 @@ namespace Rbx2Source.Export
                         chunk.Hulls += piece.Hull.Count > 0 ? 1 : 0;
                         chunk.Materials.UnionWith(pieceMaterials);
                     }
+                }
+                // Each prop's origin is the middle of what it holds. The middle of its grid cell could lie outside the sealed
+                // map (an island at the map's edge), and vbsp then reports a leak and the map gets no visibility or bounced
+                // light: shadows and interiors went black.
+                foreach (Chunk chunk in chunks)
+                {
+                    var points = chunk.Pieces.SelectMany(piece => piece.Points).ToList();
+                    if (points.Count > 0)
+                        chunk.Origin = Enumerable.Range(0, 3).Select(axis => Math.Round((points.Min(p => p[axis]) + points.Max(p => p[axis])) / 2)).ToArray();
                 }
             }
 
@@ -1285,7 +1305,8 @@ namespace Rbx2Source.Export
                     for (int variant = 0; variant < job.Variants.Count; variant++)
                     {
                         File.WriteAllText(qc, job.Variants[variant], Encoding.ASCII);
-                        string log = Run(studiomdl, "-nop4 -nox360 -game \"" + folder.TrimEnd('\\', '/') + "\" \"" + qc + "\"", directory);
+                        string log = Run(studiomdl, "-nop4 -nox360 -game \"" + SourceExporter.ToolPath(folder.TrimEnd('\\', '/')) + "\" \"" +
+                            SourceExporter.ToolPath(qc) + "\"", directory);
                         string mdl = Path.Combine(folder, "models", job.Model.Replace('/', Path.DirectorySeparatorChar));
                         if (File.Exists(mdl) && !Regex.IsMatch(log, @"^\s*ERROR", RegexOptions.Multiline))
                         {
@@ -1293,7 +1314,7 @@ namespace Rbx2Source.Export
                             error = null;
                             break;
                         }
-                        error = Failure(log).Replace(Environment.NewLine, " ");
+                        error = SourceExporter.ToolFailure(log, studiomdl).Replace(Environment.NewLine, " ");
                     }
                     if (error != null)
                         lock (failures)
@@ -1321,6 +1342,43 @@ namespace Rbx2Source.Export
                 return text.ToString();
             }
 
+            // vrad lights static props at their vertices only, so a big wall lit at its four corners (buried in the floor and the
+            // walls beside it) came out black. A triangle with a long edge is split: every edge into pieces at most this long
+            // (counted from the edge alone, so the triangle sharing it splits it the same way and nothing cracks), fanned from
+            // the triangle's centre.
+            private const double MaxLitEdge = 128;
+
+            private static IEnumerable<(double[] P, double[] N, float[] Uv)[]> LitSubdivision(Piece piece, int a, int b, int c)
+            {
+                var corners = new[] { a, b, c }.Select(i => (P: piece.Points[i], N: piece.Normals[i], Uv: piece.Uvs[i])).ToArray();
+                if (piece.Decal)
+                {
+                    yield return corners;
+                    yield break;
+                }
+                int[] segments = Enumerable.Range(0, 3).Select(e =>
+                    Math.Min(16, Math.Max(1, (int)Math.Ceiling(Matrix.Length(Matrix.Subtract(corners[(e + 1) % 3].P, corners[e].P)) / MaxLitEdge)))).ToArray();
+                if (segments.All(s => s == 1))
+                {
+                    yield return corners;
+                    yield break;
+                }
+                (double[] P, double[] N, float[] Uv) Mix((double[] P, double[] N, float[] Uv) x, (double[] P, double[] N, float[] Uv) y, double t)
+                {
+                    double[] n = Enumerable.Range(0, 3).Select(k => x.N[k] + (y.N[k] - x.N[k]) * t).ToArray();
+                    double length = Math.Max(Matrix.Length(n), 1e-9);
+                    return (Enumerable.Range(0, 3).Select(k => x.P[k] + (y.P[k] - x.P[k]) * t).ToArray(), n.Select(v => v / length).ToArray(),
+                        new[] { (float)(x.Uv[0] + (y.Uv[0] - x.Uv[0]) * t), (float)(x.Uv[1] + (y.Uv[1] - x.Uv[1]) * t) });
+                }
+                var ring = new List<(double[] P, double[] N, float[] Uv)>();
+                for (int e = 0; e < 3; e++)
+                    for (int s = 0; s < segments[e]; s++)
+                        ring.Add(Mix(corners[e], corners[(e + 1) % 3], (double)s / segments[e]));
+                var middle = Mix(Mix(corners[0], corners[1], 0.5), corners[2], 1 / 3.0);
+                for (int i = 0; i < ring.Count; i++)
+                    yield return new[] { middle, ring[i], ring[(i + 1) % ring.Count] };
+            }
+
             // A merged prop's model (its parts' triangles around the prop's origin) and collision model (a hull per part).
             private void WriteChunk(Chunk chunk, string directory)
             {
@@ -1332,9 +1390,12 @@ namespace Rbx2Source.Export
                         string name = Material(material);
                         int hash = material.IndexOf('#');
                         float[] paletteUv = hash < 0 ? null : PaletteUv(int.Parse(material.Substring(hash + 1), CultureInfo.InvariantCulture));
-                        text.Append(name).Append('\n');
-                        foreach (int index in new[] { a, b, c })
-                            SmdVertex(text, Matrix.Subtract(piece.Points[index], chunk.Origin), piece.Normals[index], paletteUv ?? piece.Uvs[index]);
+                        foreach (var corners in LitSubdivision(piece, a, b, c))
+                        {
+                            text.Append(name).Append('\n');
+                            foreach (var (p, n, uv) in corners)
+                                SmdVertex(text, Matrix.Subtract(p, chunk.Origin), n, paletteUv ?? uv);
+                        }
                     }
                 File.WriteAllText(Path.Combine(directory, chunk.Name + ".smd"), text.Append("end\n").ToString(), Encoding.ASCII);
                 if (chunk.Hulls == 0)
@@ -1379,6 +1440,23 @@ namespace Rbx2Source.Export
                     progress?.Report("Terrain: " + displacements + " displacements.");
             }
 
+            // How much of a material is around a corner of the column grid: the 4 by 4 columns about it, nearer ones counting more.
+            // Roblox fades one material into the next over a couple of voxels; the 4 columns touching the corner switched within one.
+            private static double Share(TerrainSurface ground, int cx, int cz, byte material)
+            {
+                double total = 0, matching = 0;
+                for (int dz = -2; dz < 2; dz++)
+                    for (int dx = -2; dx < 2; dx++)
+                        if (ground.Has(cx + dx, cz + dz))
+                        {
+                            double weight = (2 - Math.Abs(dx + 0.5)) * (2 - Math.Abs(dz + 0.5));
+                            total += weight;
+                            if (ground.Materials[cx + dx + ground.Width * (cz + dz)] == material)
+                                matching += weight;
+                        }
+                return total > 0 ? matching / total : 0;
+            }
+
             private void AddDisplacement(TerrainSurface ground, int tileX, int tileZ, int step, List<byte> columns)
             {
                 const int size = 17;
@@ -1399,10 +1477,7 @@ namespace Rbx2Source.Export
                         else
                             lowest = Math.Min(lowest, heights[i, j]);
                         if (second.HasValue)
-                        {
-                            var around = ground.CornerMaterials(cx, cz).ToList();
-                            alphas[i, j] = around.Count == 0 ? 0 : 255.0 * around.Count(m => m == second.Value) / around.Count;
-                        }
+                            alphas[i, j] = 255 * Share(ground, cx, cz, second.Value);
                     }
                 for (int i = 0; i < size; i++)
                     for (int j = 0; j < size; j++)
@@ -1465,8 +1540,8 @@ namespace Rbx2Source.Export
 
             private float[] RobloxTerrainColor(byte material) => contents.Terrain.Color(material);
 
-            // A terrain material's texture: Roblox's texture for it multiplied by the place's colour for it (Terrain.MaterialColors),
-            // as Roblox shades terrain, or just the colour when there is no texture.
+            // A terrain material's texture: Roblox's texture for it tinted to the place's colour for it (Terrain.MaterialColors),
+            // or just the colour when there is no texture.
             private void TerrainTexture(byte material)
             {
                 string name = "terrain_" + RobloxTerrain.MaterialName(material).ToLowerInvariant();
@@ -1479,20 +1554,11 @@ namespace Rbx2Source.Export
                     VtfWriter.WriteSolid(vtf, RobloxTerrainColor(material), 1);
                     return;
                 }
-                float[] tint = RobloxTerrainColor(material);
-                using (var stream = new MemoryStream(image))
-                using (var source = new Bitmap(stream))
-                using (var copy = new Bitmap(source.Width, source.Height, PixelFormat.Format32bppArgb))
+                float[] tint = RobloxContent.TerrainTint(RobloxTerrain.MaterialName(material), RobloxTerrainColor(material));
+                using (Picture source = Picture.Load(image))
+                using (var copy = new Picture(source.Width, source.Height))
                 {
-                    using (Graphics graphics = Graphics.FromImage(copy))
-                    using (var recolour = new ImageAttributes())
-                    {
-                        recolour.SetColorMatrix(new ColorMatrix(new[]
-                        {
-                            new[] { tint[0], 0, 0, 0, 0 }, new[] { 0, tint[1], 0, 0, 0 }, new[] { 0, 0, tint[2], 0, 0 }, new[] { 0, 0, 0, 1f, 0 }, new[] { 0, 0, 0, 0, 1f }
-                        }));
-                        graphics.DrawImage(source, new Rectangle(0, 0, copy.Width, copy.Height), 0, 0, source.Width, source.Height, GraphicsUnit.Pixel, recolour);
-                    }
+                    copy.Draw(source, 0, 0, copy.Width, copy.Height, tint: tint, replace: true);
                     VtfWriter.Write(copy, vtf, VtfWriter.Kind.Color, compress: true);
                 }
             }
@@ -1678,10 +1744,8 @@ namespace Rbx2Source.Export
                 Directory.CreateDirectory(directory);
                 foreach (var (suffix, _) in faces)
                 {
-                    using (var stream = new MemoryStream(images[suffix]))
-                    using (var image = new Bitmap(stream))
-                    using (var copy = new Bitmap(image))
-                        VtfWriter.Write(copy, Path.Combine(directory, name + suffix + ".vtf"), VtfWriter.Kind.Color,
+                    using (Picture image = Picture.Load(images[suffix]))
+                        VtfWriter.Write(image, Path.Combine(directory, name + suffix + ".vtf"), VtfWriter.Kind.Color,
                             VtfWriter.FlagClampS | VtfWriter.FlagClampT | VtfWriter.FlagNoLod, compress: true);
                     File.WriteAllText(Path.Combine(directory, name + suffix + ".vmt"), "\"UnlitGeneric\"\n{\n\t\"$basetexture\" \"skybox/" + name + suffix +
                         "\"\n\t\"$nofog\" \"1\"\n\t\"$ignorez\" \"1\"\n}\n", Encoding.ASCII);
@@ -1705,7 +1769,7 @@ namespace Rbx2Source.Export
                     if (material == null)
                         continue;
                     ModelFileBuilder.DecalGeometry(part, decal, 32, out List<float[]> positions, out List<float[]> uvs, out List<int[]> faces, out float[] normal);
-                    var piece = new Piece();
+                    var piece = new Piece { Decal = true };
                     double[] n = SourceNormal(part.CFrame, normal[0], normal[1], normal[2], new float[] { 1, 1, 1 });
                     for (int i = 0; i < positions.Count; i++)
                     {
@@ -1721,14 +1785,19 @@ namespace Rbx2Source.Export
                 }
             }
 
-            // A decal's material: its image (once per image) tinted by its Color3, see-through where the image is and by its
-            // Transparency.
+            // A decal's material: its image tinted by its Color3, see-through where the image is and by its Transparency. Garry's
+            // Mod ignores a material's $alpha on static props (a Texture at 0.98 transparency came out solid), so the decal's
+            // transparency is multiplied into the texture's own alpha: one texture per image and transparency.
             private async Task<string> DecalMaterialAsync(RobloxInstance decal)
             {
                 string content = decal.Get<string>("Texture") ?? decal.Get<string>("ColorMapContent");
                 if (string.IsNullOrWhiteSpace(content))
                     return null;
-                if (!decalTextures.TryGetValue(content.Trim(), out var texture))
+                int alpha = Byte(1 - (decal.Number("Transparency") ?? 0));
+                if (alpha == 0)
+                    return null;
+                string key = content.Trim() + "|" + alpha;
+                if (!decalTextures.TryGetValue(key, out var texture))
                 {
                     byte[] image = await ImageAsync(content.Trim()).ConfigureAwait(false);
                     texture = (null, false);
@@ -1736,37 +1805,49 @@ namespace Rbx2Source.Export
                         try
                         {
                             string name = "d" + decalTextures.Count;
-                            using (var stream = new MemoryStream(image))
-                            using (var source = new Bitmap(stream))
-                            using (var copy = new Bitmap(source))
-                                texture = (name, VtfWriter.Write(copy, Path.Combine(materialFolder, name + ".vtf"), VtfWriter.Kind.Color, compress: true));
+                            using (Picture source = Picture.Load(image))
+                            {
+                                if (alpha < 255)
+                                    FadeAlpha(source, alpha / 255.0);
+                                texture = (name, VtfWriter.Write(source, Path.Combine(materialFolder, name + ".vtf"), VtfWriter.Kind.Color, compress: true));
+                            }
                         }
-                        catch (ArgumentException)
+                        catch (InvalidDataException)
                         {
-                            // Not an image GDI+ can read.
+                            // Not an image that can be read.
                         }
                     if (texture.Name == null)
                         missingDecals++;
-                    decalTextures[content.Trim()] = texture;
+                    decalTextures[key] = texture;
                 }
                 if (texture.Name == null)
                     return null;
                 float[] tint = decal.Get<float[]>("Color3") ?? new float[] { 1, 1, 1 };
-                int alpha = Byte(1 - (decal.Number("Transparency") ?? 0));
-                string material = texture.Name + "_" + Hex(tint) + (alpha < 255 ? "_a" + alpha.ToString("x2") : "");
+                string material = texture.Name + "_" + Hex(tint);
                 if (materials.Add(material))
                 {
                     var vmt = new StringBuilder("\"VertexLitGeneric\"\n{\n");
                     vmt.Append("\t\"$basetexture\" \"").Append(materialDir).Append(texture.Name).Append("\"\n");
                     if (tint.Any(c => c < 0.999f))
                         vmt.Append("\t\"$color2\" \"[").Append(F(tint[0])).Append(' ').Append(F(tint[1])).Append(' ').Append(F(tint[2])).Append("]\"\n");
-                    if (texture.Alpha || alpha < 255)
+                    if (texture.Alpha)
                         vmt.Append("\t\"$translucent\" \"1\"\n");
-                    if (alpha < 255)
-                        vmt.Append("\t\"$alpha\" \"").Append(F(alpha / 255.0)).Append("\"\n");
+                    vmt.Append(AmbientGlow);
                     File.WriteAllText(Path.Combine(materialFolder, material + ".vmt"), vmt.Append("}\n").ToString(), Encoding.ASCII);
                 }
                 return material;
+            }
+
+            // Multiplies a picture's alpha (opacity 0-1), for see-through textures on props.
+            private static void FadeAlpha(Picture picture, double opacity)
+            {
+                int[] pixels = picture.GetPixels();
+                for (int i = 0; i < pixels.Length; i++)
+                {
+                    int a = (int)Math.Round(((pixels[i] >> 24) & 255) * opacity);
+                    pixels[i] = (pixels[i] & 0xFFFFFF) | (a << 24);
+                }
+                picture.SetPixels(pixels);
             }
 
             private static void Key(StringBuilder text, string key, string value) =>
@@ -1802,6 +1883,11 @@ namespace Rbx2Source.Export
                 int luxel = 16;
                 while (luxel < 128 && area / (luxel * (double)luxel) > LuxelBudget)
                     luxel *= 2;
+                // Terrain has its own share, so its shadows (trees and houses on the ground) stay fine on a big map.
+                double ground = brushes.SelectMany(b => b.Sides).Where(s => s.Displacement != null).Sum(s => s.Area);
+                terrainLuxel = 16;
+                while (terrainLuxel < 128 && ground / (terrainLuxel * (double)terrainLuxel) > LuxelBudget / 2)
+                    terrainLuxel *= 2;
 
                 var text = new StringBuilder();
                 text.Append("versioninfo\n{\n\t\"editorversion\" \"400\"\n\t\"editorbuild\" \"8864\"\n\t\"mapversion\" \"1\"\n\t\"formatversion\" \"100\"\n\t\"prefab\" \"0\"\n}\n");
@@ -1909,7 +1995,9 @@ namespace Rbx2Source.Export
                     string texel = F(side.TextureScale);
                     string u = (az >= ax && az >= ay ? "[1 0 0 0] " : ax >= ay ? "[0 1 0 0] " : "[1 0 0 0] ") + texel;
                     string v = (az >= ax && az >= ay ? "[0 -1 0 0] " : "[0 0 -1 0] ") + texel;
-                    int scale = side.Extent > 8192 ? Math.Max(32, luxel) : luxel;
+                    // A displacement's lightmap may be at most 125 luxels across.
+                    int scale = side.Displacement != null ? Math.Max(terrainLuxel, (int)Math.Ceiling(side.Extent / 120))
+                        : side.Extent > 8192 ? Math.Max(32, luxel) : luxel;
                     text.Append("\t\tside\n\t\t{\n");
                     text.Append("\t\t\t\"id\" \"").Append(nextId++).Append("\"\n");
                     text.Append("\t\t\t\"plane\" \"(").Append(V(side.A)).Append(") (").Append(V(side.B)).Append(") (").Append(V(side.C)).Append(")\"\n");

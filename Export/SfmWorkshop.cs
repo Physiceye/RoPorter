@@ -68,8 +68,8 @@ namespace Rbx2Source.Export
                     ["pageImage"] = File.Exists(Path.Combine(folder, Workshop.PreviewFile)) ? Path.Combine(folder, Workshop.PreviewFile) : ""
                 }.ToString());
                 progress?.Report(existing.HasValue ? "Updating SFM Workshop item " + existing.Value + "..." : "Uploading to the SFM Steam Workshop...");
-                string self = Process.GetCurrentProcess().MainModule.FileName;
-                var result = await Workshop.RunAsync(self, PublishArgument + " " + Workshop.Quote(job), cancellation,
+                string self = Environment.ProcessPath;
+                var result = await Workshop.RunAsync(self, PublishArgument + " \"" + job + "\"", cancellation,
                     new[] { ("SteamAppId", "1840"), ("SteamGameId", "1840") }).ConfigureAwait(false);
                 string last = (Workshop.Tail(result.Value).Split('\n').LastOrDefault() ?? "").Trim();
                 if (result.Key != 0 || !long.TryParse(last, NumberStyles.None, CultureInfo.InvariantCulture, out long id) || id <= 0)
@@ -197,6 +197,10 @@ namespace Rbx2Source.Export
                     if (!Get<UpdateTextFn>("SteamAPI_ISteamRemoteStorage_UpdatePublishedFileFile")(storage, update, Utf8(cloudZip)) ||
                         !Get<UpdateTextFn>("SteamAPI_ISteamRemoteStorage_UpdatePublishedFilePreviewFile")(storage, update, Utf8(cloudPreview)))
                         throw new InvalidOperationException("Steam rejected the Workshop update.");
+                    // The change note names the RoPorter version, as for Garry's Mod addons.
+                    IntPtr changes = GetProcAddress(module, "SteamAPI_ISteamRemoteStorage_UpdatePublishedFileSetChangeDescription");
+                    if (changes != IntPtr.Zero)
+                        Marshal.GetDelegateForFunctionPointer<UpdateTextFn>(changes)(storage, update, Utf8(Workshop.ChangeNote));
                     call = Get<CommitFn>("SteamAPI_ISteamRemoteStorage_CommitPublishedFileUpdate")(storage, update);
                 }
                 if (call == 0)

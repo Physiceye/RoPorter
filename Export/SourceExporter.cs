@@ -146,11 +146,10 @@ namespace Rbx2Source.Export
                 Compile(sfm.StudioMdl, null, "1840", folder, Path.Combine(src, "model.qc"), modelName, progress, cancellation);
                 return Path.Combine("models", modelName.Replace('/', Path.DirectorySeparatorChar));
             }
-            // The addon's (and Workshop item's) title and description: "RoPorter - " and the username for avatars or the
-            // catalog name for items.
+            // The addon's (and Workshop item's) title: the username for avatars or the catalog name for items.
             string displayName = player && !string.IsNullOrWhiteSpace(playerName) ? playerName.Trim()
                 : !player && !string.IsNullOrWhiteSpace(itemLabel) ? itemLabel.Trim() : id;
-            string title = "RoPorter - " + displayName;
+            string title = displayName;
             File.WriteAllText(Path.Combine(folder, "addon.json"), "{\n\t\"title\": " + Newtonsoft.Json.JsonConvert.ToString(title) +
                 ",\n\t\"description\": " + Newtonsoft.Json.JsonConvert.ToString(WorkshopDescription) +
                 ",\n\t\"type\": \"model\",\n\t\"tags\": [\"fun\"],\n\t\"ignore\": [\"src/*\", \"" + Workshop.IconFile + "\", \"" + Workshop.PreviewFile + "\"]\n}\n",
@@ -189,7 +188,7 @@ namespace Rbx2Source.Export
 
             string lua = Path.Combine(folder, "lua", "autorun");
             Directory.CreateDirectory(lua);
-            // In game the playermodel is listed by its plain name, without the Workshop title's "RoPorter - ".
+            // In game the playermodel is listed by the same name as the Workshop title.
             string label = LuaString(displayName), path = LuaString("models/" + modelName);
             File.WriteAllText(Path.Combine(lua, "roporter_" + id + ".lua"),
                 "player_manager.AddValidModel( " + label + ", " + path + " )\n" +
@@ -1068,16 +1067,17 @@ namespace Rbx2Source.Export
         {
             string gameInfo = Path.Combine(folder, "gameinfo.txt");
             string mounts = content == null ? "" :
-                "\t\t\tgame \"" + Path.Combine(content, "garrysmod.vpk") + "\"\n" + "\t\t\tgame \"" + content + "\"\n";
+                "\t\t\tgame \"" + ToolPath(Path.Combine(content, "garrysmod.vpk")) + "\"\n" + "\t\t\tgame \"" + ToolPath(content) + "\"\n";
             File.WriteAllText(gameInfo, "\"GameInfo\"\n{\n\tgame \"RoPorter\"\n\ttype multiplayer_only\n\tFileSystem\n\t{\n\t\tSteamAppId " + appId +
                 "\n\t\tSearchPaths\n\t\t{\n\t\t\tgame+mod |gameinfo_path|.\n" + mounts + "\t\t}\n\t}\n}\n");
             try
             {
-                var start = new ProcessStartInfo(studioMdl, "-nop4 -nox360 -game \"" + folder + "\" \"" + qc + "\"")
-                {
-                    UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true,
-                    WorkingDirectory = Path.GetDirectoryName(qc)
-                };
+                ProcessStartInfo start = ToolStart(studioMdl, "-nop4 -nox360 -game \"" + ToolPath(folder) + "\" \"" + ToolPath(qc) + "\"");
+                start.UseShellExecute = false;
+                start.CreateNoWindow = true;
+                start.RedirectStandardOutput = true;
+                start.RedirectStandardError = true;
+                start.WorkingDirectory = Path.GetDirectoryName(qc);
                 var output = new StringBuilder();
                 using (var process = new Process { StartInfo = start })
                 {
@@ -1097,14 +1097,7 @@ namespace Rbx2Source.Export
                     string mdl = Path.Combine(folder, "models", modelName.Replace('/', Path.DirectorySeparatorChar));
                     string log = output.ToString();
                     if (process.ExitCode != 0 || !File.Exists(mdl) || Regex.IsMatch(log, @"^\s*ERROR", RegexOptions.Multiline))
-                    {
-                        var errors = log.Split('\n').Select(l => l.Trim())
-                            .Where(l => l.StartsWith("ERROR", StringComparison.OrdinalIgnoreCase) && l.IndexOf("Aborted Processing", StringComparison.OrdinalIgnoreCase) < 0)
-                            .Distinct().Take(5).ToList();
-                        string error = errors.Count > 0 ? string.Join(Environment.NewLine, errors)
-                            : log.Split('\n').Select(l => l.Trim()).LastOrDefault(l => l.StartsWith("ERROR", StringComparison.OrdinalIgnoreCase)) ?? "exit code " + process.ExitCode;
-                        throw new InvalidDataException("studiomdl could not compile the model:" + Environment.NewLine + error);
-                    }
+                        throw new InvalidDataException("studiomdl could not compile the model:" + Environment.NewLine + ToolFailure(log, studioMdl));
                     foreach (string warning in log.Split('\n').Select(l => l.Trim())
                         .Where(l => l.StartsWith("WARNING", StringComparison.OrdinalIgnoreCase) && l.IndexOf("mount.cfg", StringComparison.OrdinalIgnoreCase) < 0)
                         .Distinct().Take(5))
@@ -1116,5 +1109,79 @@ namespace Rbx2Source.Export
                 File.Delete(gameInfo);
             }
         }
+
+        // The lines of a Valve tool's log that say why it failed: its errors (studiomdl's "ERROR:" lines, and messages such as
+        // "Error opening ... (Check for write enable)" or "Unable to find gameinfo.txt" that have no prefix), or else its last lines.
+        internal static string ToolFailure(string log, string exe)
+        {
+            var lines = log.Split('\n').Select(l => l.Trim())
+                .Where(l => l.Length > 0 && l.IndexOf("mount.cfg", StringComparison.OrdinalIgnoreCase) < 0 && l.IndexOf("Aborted Processing", StringComparison.OrdinalIgnoreCase) < 0)
+                .ToList();
+            var errors = lines.Where(l => !l.StartsWith("WARNING", StringComparison.OrdinalIgnoreCase) &&
+                Regex.IsMatch(l, @"error|leak|MAX_MAP|exceeded|can't|cannot|unable|failed", RegexOptions.IgnoreCase)).Distinct().Take(6).ToList();
+            string failure = string.Join(Environment.NewLine, errors.Count > 0 ? errors : lines.Skip(Math.Max(0, lines.Count - 6)));
+            // Windows' Controlled folder access keeps unknown programs from writing to Documents and the Desktop.
+            if (log.IndexOf("Check for write enable", StringComparison.OrdinalIgnoreCase) >= 0)
+                failure += Environment.NewLine + "Windows did not let " + Path.GetFileName(exe) + " write to the output folder. " + BlockedFolderHint(exe);
+            return failure.Length > 0 ? failure : "it stopped without a message";
+        }
+
+        // What to do when Windows refuses writes to the output folder.
+        internal static string BlockedFolderHint(string exe) =>
+            "If Controlled folder access is on (Windows Security > Virus & threat protection > Ransomware protection), allow " + exe +
+            " through it, or choose an output folder outside Documents and the Desktop.";
+
+        // Valve's tools read their command line and file paths in Windows' ANSI code page, so a path with characters outside
+        // it (a Japanese folder name on an English Windows) reaches them garbled and they report it missing. Such a path is
+        // passed in its 8.3 short form, which is plain ASCII on drives that keep short names. On Linux and macOS the tools run
+        // in Wine, which sees the file system as drive Z:.
+        internal static string ToolPath(string path)
+        {
+            if (!OperatingSystem.IsWindows())
+                return "Z:" + Path.GetFullPath(path).Replace('/', '\\');
+            Encoding ansi = AnsiEncoding.Value;
+            bool Readable(string text) => ansi.GetString(ansi.GetBytes(text)) == text;
+            if (Readable(path))
+                return path;
+            var buffer = new StringBuilder(32767);
+            int length = GetShortPathName(path, buffer, buffer.Capacity);
+            if (length > 0 && length < buffer.Capacity && Readable(buffer.ToString()))
+                return buffer.ToString();
+            string unreadable = new string(path.Where(c => !Readable(c.ToString())).Distinct().Take(8).ToArray());
+            throw new InvalidDataException("Valve's tools cannot read the path " + path + ": it has characters (" + unreadable +
+                ") outside the language Windows uses for non-Unicode programs. Choose an output folder whose path has none of them.");
+        }
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+        private static extern int GetShortPathName(string longPath, StringBuilder shortPath, int bufferLength);
+
+        // Windows' ANSI code page (the "language for non-Unicode programs"); .NET's default encoding is UTF-8.
+        private static readonly Lazy<Encoding> AnsiEncoding = new Lazy<Encoding>(() =>
+        {
+            Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+            return Encoding.GetEncoding((int)GetACP());
+        });
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+        private static extern uint GetACP();
+
+        // How a Valve tool (a Windows program) is started: directly on Windows, in Wine on Linux and macOS.
+        internal static ProcessStartInfo ToolStart(string exe, string arguments)
+        {
+            if (OperatingSystem.IsWindows())
+                return new ProcessStartInfo(ToolPath(exe), arguments);
+            string wine = new[] { "wine64", "wine" }.Select(FindProgram).FirstOrDefault(found => found != null)
+                ?? throw new InvalidDataException(Path.GetFileName(exe) + " is a Windows program: install Wine to run Garry's Mod's tools on " +
+                    (OperatingSystem.IsMacOS() ? "macOS" : "Linux") + ".");
+            var start = new ProcessStartInfo(wine, "\"" + ToolPath(exe) + "\" " + arguments);
+            // Wine's own messages would otherwise fill the tool's log.
+            start.Environment["WINEDEBUG"] = "-all";
+            return start;
+        }
+
+        // A program on the PATH, or null.
+        private static string FindProgram(string name) =>
+            (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator).Where(folder => folder.Length > 0)
+                .Select(folder => Path.Combine(folder, name)).FirstOrDefault(File.Exists);
     }
 }

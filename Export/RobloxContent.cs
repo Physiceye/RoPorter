@@ -70,6 +70,35 @@ namespace Rbx2Source.Export
         public static bool HasMaterialTexture(int material) =>
             MaterialName(material) is string name && Resources.Value.ContainsKey(Normalize("materials/" + name + ".jpg"));
 
+        // The colour that tints a terrain material's colour map so the ground shows the place's colour for it on average
+        // (Terrain.MaterialColors is the colour terrain is seen in; the maps average 65-75% grey, so multiplying by the colour alone
+        // came out a third darker: tan sand, olive grass). At most 2.5 times the colour.
+        public static float[] TerrainTint(string name, float[] color)
+        {
+            float[] average = name == null ? null : Averages.GetOrAdd(name, key =>
+            {
+                byte[] image = MaterialTexture(key);
+                if (image == null)
+                    return null;
+                using (Picture picture = Picture.Load(image))
+                {
+                    var sum = new double[3];
+                    int[] pixels = picture.GetPixels();
+                    foreach (int pixel in pixels)
+                    {
+                        sum[0] += (pixel >> 16) & 255;
+                        sum[1] += (pixel >> 8) & 255;
+                        sum[2] += pixel & 255;
+                    }
+                    return sum.Select(channel => (float)(channel / pixels.Length / 255)).ToArray();
+                }
+            });
+            return average == null ? color : color.Select((channel, i) => Math.Min(channel / Math.Max(average[i], 0.4f), 2.5f * channel)).ToArray();
+        }
+
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, float[]> Averages =
+            new System.Collections.Concurrent.ConcurrentDictionary<string, float[]>(StringComparer.OrdinalIgnoreCase);
+
         // A face of Roblox's default sky (bk, dn, ft, lf, rt, up).
         public static byte[] DefaultSky(string face) => Read("sky/sky512_" + face + ".jpg");
 

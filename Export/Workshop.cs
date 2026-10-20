@@ -1,8 +1,5 @@
 using System;
 using System.Diagnostics;
-using System.Drawing;
-using System.Drawing.Drawing2D;
-using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -24,35 +21,32 @@ namespace Rbx2Source.Export
         // Where earlier versions kept the Workshop item from an upload (now in addon.json); still read for those addons.
         public const string IdFile = "src/workshop_id.txt";
 
-        private const int IconSize = 512;
+        internal const int IconSize = 512;
+
+        // The change note of a Workshop update: "Updated with RoPorter v2.1.0".
+        internal static string ChangeNote => "Updated with RoPorter v" + typeof(Workshop).Assembly.GetName().Version.ToString(3);
 
         // The icon: the avatar's headshot (with the background the API gives it) filling the icon, or the item's thumbnail
         // centred. Anything transparent shows a light grey gradient behind it, which is also the icon without a thumbnail.
         public static void WriteIcon(byte[] thumbnail, string path, bool headshot = false)
         {
-            using (var icon = new Bitmap(IconSize, IconSize, PixelFormat.Format24bppRgb))
+            using (var icon = new Picture(IconSize, IconSize))
             {
-                using (Graphics graphics = Graphics.FromImage(icon))
-                {
-                    graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                    graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                    graphics.CompositingQuality = CompositingQuality.HighQuality;
-                    var bounds = new Rectangle(0, 0, IconSize, IconSize);
-                    using (var backdrop = new LinearGradientBrush(bounds, Color.FromArgb(236, 237, 239), Color.FromArgb(196, 199, 204), LinearGradientMode.Vertical))
-                        graphics.FillRectangle(backdrop, bounds);
-                    if (thumbnail != null)
-                        using (var stream = new MemoryStream(thumbnail))
-                        using (Image image = Image.FromStream(stream))
-                        {
-                            // Headshots fill the icon; item thumbnails fill most of it. Both keep their proportions.
-                            double fit = IconSize * (headshot ? 1 : 0.875) / Math.Max(image.Width, image.Height);
-                            int width = (int)Math.Round(image.Width * fit), height = (int)Math.Round(image.Height * fit);
-                            graphics.DrawImage(image, (IconSize - width) / 2, (IconSize - height) / 2, width, height);
-                        }
-                }
-                SaveJpeg(icon, path);
+                icon.FillVertical(LightGrey, DarkGrey);
+                if (thumbnail != null)
+                    using (Picture image = Picture.Load(thumbnail))
+                    {
+                        // Headshots fill the icon; item thumbnails fill most of it. Both keep their proportions.
+                        double fit = IconSize * (headshot ? 1 : 0.875) / Math.Max(image.Width, image.Height);
+                        int width = (int)Math.Round(image.Width * fit), height = (int)Math.Round(image.Height * fit);
+                        icon.Draw(image, (IconSize - width) / 2, (IconSize - height) / 2, width, height);
+                    }
+                icon.Save(path, PictureFormat.Jpeg, 92);
             }
         }
+
+        // The icon's backdrop: a light grey gradient (ARGB).
+        private const int LightGrey = unchecked((int)0xFFECEDEF), DarkGrey = unchecked((int)0xFFC4C7CC);
 
         // The Workshop page image (637x358, the size the Workshop shows it at): the user's profile background, or its colour,
         // or the icon's grey gradient, with the avatar's full-body render in the centre. gmpublish cannot upload it, so it is
@@ -60,84 +54,54 @@ namespace Rbx2Source.Export
         public const string PreviewFile = "workshop_preview.jpg";
         private const int PreviewWidth = 637, PreviewHeight = 358;
 
-        public static void WritePreview(byte[] background, Color? color, byte[] avatar, string path)
+        // color is the profile's background colour (ARGB), when it has one.
+        public static void WritePreview(byte[] background, int? color, byte[] avatar, string path)
         {
-            using (var preview = new Bitmap(PreviewWidth, PreviewHeight, PixelFormat.Format24bppRgb))
+            using (var preview = new Picture(PreviewWidth, PreviewHeight))
             {
-                using (Graphics graphics = Graphics.FromImage(preview))
-                {
-                    graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                    graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                    graphics.CompositingQuality = CompositingQuality.HighQuality;
-                    var bounds = new Rectangle(0, 0, PreviewWidth, PreviewHeight);
-                    if (color.HasValue)
-                        graphics.Clear(color.Value);
-                    else
-                        using (var backdrop = new LinearGradientBrush(bounds, Color.FromArgb(236, 237, 239), Color.FromArgb(196, 199, 204), LinearGradientMode.Vertical))
-                            graphics.FillRectangle(backdrop, bounds);
-                    if (background != null)
-                        using (var stream = new MemoryStream(background))
-                        using (Image image = Image.FromStream(stream))
-                        {
-                            // Cover: scaled to fill the frame, cropped evenly on the long side.
-                            double fit = Math.Max((double)PreviewWidth / image.Width, (double)PreviewHeight / image.Height);
-                            int width = (int)Math.Ceiling(image.Width * fit), height = (int)Math.Ceiling(image.Height * fit);
-                            graphics.DrawImage(image, (PreviewWidth - width) / 2, (PreviewHeight - height) / 2, width, height);
-                        }
-                    if (avatar != null)
-                        using (var stream = new MemoryStream(avatar))
-                        using (var image = new Bitmap(stream))
-                        {
-                            // The render has uneven empty space around the avatar, so only its visible pixels are placed:
-                            // centred in the frame, filling 90% of its height (or width).
-                            Rectangle visible = VisibleBounds(image);
-                            double fit = Math.Min(PreviewHeight * 0.9 / visible.Height, PreviewWidth * 0.9 / visible.Width);
-                            int width = (int)Math.Round(visible.Width * fit), height = (int)Math.Round(visible.Height * fit);
-                            graphics.DrawImage(image, new Rectangle((PreviewWidth - width) / 2, (PreviewHeight - height) / 2, width, height),
-                                visible, GraphicsUnit.Pixel);
-                        }
-                }
-                SaveJpeg(preview, path);
+                if (color.HasValue)
+                    preview.Clear(color.Value | unchecked((int)0xFF000000));
+                else
+                    preview.FillVertical(LightGrey, DarkGrey);
+                if (background != null)
+                    using (Picture image = Picture.Load(background))
+                    {
+                        // Cover: scaled to fill the frame, cropped evenly on the long side.
+                        double fit = Math.Max((double)PreviewWidth / image.Width, (double)PreviewHeight / image.Height);
+                        int width = (int)Math.Ceiling(image.Width * fit), height = (int)Math.Ceiling(image.Height * fit);
+                        preview.Draw(image, (PreviewWidth - width) / 2, (PreviewHeight - height) / 2, width, height);
+                    }
+                if (avatar != null)
+                    using (Picture image = Picture.Load(avatar))
+                    {
+                        // The render has uneven empty space around the avatar, so only its visible pixels are placed:
+                        // centred in the frame, filling 90% of its height (or width).
+                        var (left, top, right, bottom) = VisibleBounds(image);
+                        int visibleWidth = right - left, visibleHeight = bottom - top;
+                        double fit = Math.Min(PreviewHeight * 0.9 / visibleHeight, PreviewWidth * 0.9 / visibleWidth);
+                        int width = (int)Math.Round(visibleWidth * fit), height = (int)Math.Round(visibleHeight * fit);
+                        preview.Draw(image, (PreviewWidth - width) / 2, (PreviewHeight - height) / 2, width, height, left, top, visibleWidth, visibleHeight);
+                    }
+                preview.Save(path, PictureFormat.Jpeg, 92);
             }
         }
 
-        // The smallest rectangle holding every pixel that isn't (nearly) transparent; the whole image when none is.
-        private static Rectangle VisibleBounds(Bitmap image)
+        // The smallest rectangle holding every pixel that isn't (nearly) transparent (right and bottom exclusive); the whole
+        // image when none is.
+        private static (int Left, int Top, int Right, int Bottom) VisibleBounds(Picture image)
         {
-            var rectangle = new Rectangle(0, 0, image.Width, image.Height);
-            BitmapData data = image.LockBits(rectangle, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-            try
-            {
-                int left = image.Width, top = image.Height, right = -1, bottom = -1;
-                var row = new byte[image.Width * 4];
-                for (int y = 0; y < image.Height; y++)
-                {
-                    System.Runtime.InteropServices.Marshal.Copy(data.Scan0 + y * data.Stride, row, 0, row.Length);
-                    for (int x = 0; x < image.Width; x++)
-                        if (row[x * 4 + 3] > 16)
-                        {
-                            left = Math.Min(left, x);
-                            right = Math.Max(right, x);
-                            top = Math.Min(top, y);
-                            bottom = y;
-                        }
-                }
-                return right < 0 ? rectangle : Rectangle.FromLTRB(left, top, right + 1, bottom + 1);
-            }
-            finally
-            {
-                image.UnlockBits(data);
-            }
-        }
-
-        private static void SaveJpeg(Image image, string path)
-        {
-            ImageCodecInfo jpeg = ImageCodecInfo.GetImageEncoders().First(codec => codec.FormatID == ImageFormat.Jpeg.Guid);
-            using (var parameters = new EncoderParameters(1))
-            {
-                parameters.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, 92L);
-                image.Save(path, jpeg, parameters);
-            }
+            int[] pixels = image.GetPixels();
+            int left = image.Width, top = image.Height, right = -1, bottom = -1;
+            for (int y = 0; y < image.Height; y++)
+                for (int x = 0; x < image.Width; x++)
+                    if (((pixels[y * image.Width + x] >> 24) & 255) > 16)
+                    {
+                        left = Math.Min(left, x);
+                        right = Math.Max(right, x);
+                        top = Math.Min(top, y);
+                        bottom = y;
+                    }
+            return right < 0 ? (0, 0, image.Width, image.Height) : (left, top, right + 1, bottom + 1);
         }
 
         public const string DetailsArgument = "--workshop-details";
@@ -148,8 +112,8 @@ namespace Rbx2Source.Export
         private static async Task UpdateDetailsAsync(string folder, long id, IProgress<string> progress, CancellationToken cancellation)
         {
             progress?.Report("Setting the Workshop description and page image...");
-            string self = Process.GetCurrentProcess().MainModule.FileName;
-            var result = await RunAsync(self, DetailsArgument + " " + id.ToString(CultureInfo.InvariantCulture) + " " + Quote(folder), cancellation,
+            string self = Environment.ProcessPath;
+            var result = await RunAsync(self, DetailsArgument + " " + id.ToString(CultureInfo.InvariantCulture) + " \"" + folder + "\"", cancellation,
                 new[] { ("SteamAppId", "4000"), ("SteamGameId", "4000") }).ConfigureAwait(false);
             // The helper's last line says what it did, or why it failed; steam_api prints its own start-up lines before it.
             string last = (Tail(result.Value).Split('\n').LastOrDefault() ?? "").Trim().TrimEnd('.');
@@ -219,7 +183,7 @@ namespace Rbx2Source.Export
                 progress?.Report(existing.HasValue ? "Updating Workshop item " + existing.Value + "..." : "Uploading to the Steam Workshop...");
                 string arguments = existing.HasValue
                     ? "update -id " + existing.Value.ToString(CultureInfo.InvariantCulture) + " -addon " + Quote(gma) + " -icon " + Quote(icon) +
-                        " -changes \"Updated with RoPorter\""
+                        " -changes \"" + ChangeNote + "\""
                     : "create -icon " + Quote(icon) + " -addon " + Quote(gma);
                 var published = await RunAsync(gmpublish, arguments, cancellation).ConfigureAwait(false);
                 string output = published.Value;
@@ -255,7 +219,8 @@ namespace Rbx2Source.Export
             }
         }
 
-        internal static string Quote(string path) => "\"" + path + "\"";
+        // A path argument for a Valve tool (a Wine path on Linux and macOS).
+        internal static string Quote(string path) => "\"" + SourceExporter.ToolPath(path) + "\"";
 
         internal static string Tail(string output)
         {
@@ -270,15 +235,15 @@ namespace Rbx2Source.Export
             (string Name, string Value)[] environment = null)
         {
             var output = new StringBuilder();
-            using (var process = new Process
-            {
-                StartInfo = new ProcessStartInfo(file, arguments)
-                {
-                    UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = Path.GetDirectoryName(file),
-                    RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true
-                },
-                EnableRaisingEvents = true
-            })
+            // Garry's Mod's gmad and gmpublish are Windows programs, run in Wine on Linux and macOS; RoPorter itself runs as it is.
+            ProcessStartInfo start = file.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? SourceExporter.ToolStart(file, arguments) : new ProcessStartInfo(file, arguments);
+            start.UseShellExecute = false;
+            start.CreateNoWindow = true;
+            start.WorkingDirectory = Path.GetDirectoryName(file);
+            start.RedirectStandardInput = true;
+            start.RedirectStandardOutput = true;
+            start.RedirectStandardError = true;
+            using (var process = new Process { StartInfo = start, EnableRaisingEvents = true })
             {
                 foreach (var variable in environment ?? new (string, string)[0])
                     process.StartInfo.EnvironmentVariables[variable.Name] = variable.Value;

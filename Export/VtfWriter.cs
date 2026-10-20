@@ -1,7 +1,4 @@
 using System;
-using System.Drawing;
-using System.Drawing.Drawing2D;
-using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -24,13 +21,13 @@ namespace Rbx2Source.Export
         // Returns whether the texture kept an alpha channel.
         public static bool Write(string imagePath, string vtfPath, Kind kind)
         {
-            using (var source = new Bitmap(imagePath))
+            using (Picture source = Picture.Load(imagePath))
                 return Write(source, vtfPath, kind);
         }
 
         // compress stores the texture DXT-compressed (DXT1, or DXT5 with alpha): a quarter to a sixth of the size, for a
         // little detail.
-        public static bool Write(Bitmap source, string vtfPath, Kind kind, uint flags = 0, bool compress = false)
+        public static bool Write(Picture source, string vtfPath, Kind kind, uint flags = 0, bool compress = false)
         {
             (int width, int height) = FitSize(source.Width, source.Height);
             int[] pixels = Resize(source, width, height);
@@ -233,11 +230,10 @@ namespace Rbx2Source.Export
         // Solid-colour texture for untextured materials.
         public static void WriteSolid(string vtfPath, float[] color, float opacity)
         {
-            using (var image = new Bitmap(4, 4, PixelFormat.Format32bppArgb))
+            using (var image = new Picture(4, 4))
             {
-                using (var graphics = Graphics.FromImage(image))
-                    graphics.Clear(Color.FromArgb((int)Math.Round(opacity * 255), (int)Math.Round(color[0] * 255),
-                        (int)Math.Round(color[1] * 255), (int)Math.Round(color[2] * 255)));
+                image.Clear(((int)Math.Round(opacity * 255) << 24) | ((int)Math.Round(color[0] * 255) << 16) |
+                    ((int)Math.Round(color[1] * 255) << 8) | (int)Math.Round(color[2] * 255));
                 Write(image, vtfPath, Kind.Color);
             }
         }
@@ -265,34 +261,10 @@ namespace Rbx2Source.Export
             return (w, h);
         }
 
-        private static int[] Resize(Bitmap source, int width, int height)
+        private static int[] Resize(Picture source, int width, int height)
         {
-            using (var resized = new Bitmap(width, height, PixelFormat.Format32bppArgb))
-            {
-                using (var graphics = Graphics.FromImage(resized))
-                {
-                    graphics.CompositingMode = CompositingMode.SourceCopy;
-                    graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                    graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                    using (var attributes = new ImageAttributes())
-                    {
-                        attributes.SetWrapMode(WrapMode.TileFlipXY);
-                        graphics.DrawImage(source, new Rectangle(0, 0, width, height), 0, 0, source.Width, source.Height, GraphicsUnit.Pixel, attributes);
-                    }
-                }
-                var pixels = new int[width * height];
-                BitmapData data = resized.LockBits(new Rectangle(0, 0, width, height), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-                try
-                {
-                    for (int y = 0; y < height; y++)
-                        Marshal.Copy(data.Scan0 + y * data.Stride, pixels, y * width, width);
-                }
-                finally
-                {
-                    resized.UnlockBits(data);
-                }
-                return pixels;
-            }
+            using (Picture resized = source.Resized(width, height))
+                return resized.GetPixels();
         }
 
         private static int[] Downsample(int[] pixels, int w, int h, int nw, int nh)

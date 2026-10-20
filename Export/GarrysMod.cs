@@ -42,20 +42,32 @@ namespace Rbx2Source.Export
         internal static IEnumerable<string> SteamLibraries()
         {
             var steams = new List<string>();
-            foreach (var key in new[] { (Registry.CurrentUser, @"Software\Valve\Steam", "SteamPath"),
-                (Registry.LocalMachine, @"SOFTWARE\WOW6432Node\Valve\Steam", "InstallPath"), (Registry.LocalMachine, @"SOFTWARE\Valve\Steam", "InstallPath") })
+            if (OperatingSystem.IsWindows())
             {
-                try
+                foreach (var key in new[] { (Registry.CurrentUser, @"Software\Valve\Steam", "SteamPath"),
+                    (Registry.LocalMachine, @"SOFTWARE\WOW6432Node\Valve\Steam", "InstallPath"), (Registry.LocalMachine, @"SOFTWARE\Valve\Steam", "InstallPath") })
                 {
-                    using (RegistryKey opened = key.Item1.OpenSubKey(key.Item2))
-                        if (opened?.GetValue(key.Item3) is string path && Directory.Exists(path))
-                            steams.Add(Path.GetFullPath(path));
+                    try
+                    {
+                        using (RegistryKey opened = key.Item1.OpenSubKey(key.Item2))
+                            if (opened?.GetValue(key.Item3) is string path && Directory.Exists(path))
+                                steams.Add(Path.GetFullPath(path));
+                    }
+                    catch (Exception error) when (error is System.Security.SecurityException || error is IOException || error is UnauthorizedAccessException)
+                    {
+                    }
                 }
-                catch (Exception error) when (error is System.Security.SecurityException || error is IOException || error is UnauthorizedAccessException)
-                {
-                }
+                steams.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
             }
-            steams.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
+            else
+            {
+                // Steam on Linux (also as a Flatpak or Snap) and macOS.
+                string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                foreach (string folder in new[] { ".steam/steam", ".local/share/Steam", ".var/app/com.valvesoftware.Steam/.local/share/Steam",
+                    "snap/steam/common/.local/share/Steam", "Library/Application Support/Steam" })
+                    if (Directory.Exists(Path.Combine(home, folder)))
+                        steams.Add(Path.GetFullPath(Path.Combine(home, folder)));
+            }
             var libraries = new List<string>();
             foreach (string steam in steams.Distinct(StringComparer.OrdinalIgnoreCase))
             {

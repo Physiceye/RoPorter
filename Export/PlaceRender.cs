@@ -1,9 +1,7 @@
 using System;
 using System.Collections.Generic;
-using System.Drawing;
-using System.Drawing.Imaging;
+using System.IO;
 using System.Linq;
-using System.Runtime.InteropServices;
 
 namespace Rbx2Source.Export
 {
@@ -12,6 +10,82 @@ namespace Rbx2Source.Export
     internal sealed class PlaceRender
     {
         private readonly List<(double[] A, double[] B, double[] C, int Color)> triangles = new List<(double[], double[], double[], int)>();
+        // Textures of textured triangles (by triangle index): the texture's pixels and each corner's texture coordinates.
+        private readonly Dictionary<int, (Texel Texture, float[][] Uvs)> textured = new Dictionary<int, (Texel, float[][])>();
+
+        private sealed class Texel
+        {
+            public int Width, Height;
+            public int[] Pixels;
+
+            // The texture's colour at a texture coordinate (repeating, V up), over the colour behind it by the texel's alpha.
+            public int Sample(double u, double v, int behind)
+            {
+                int x = (int)Math.Floor((u - Math.Floor(u)) * Width), y = (int)Math.Floor((1 - (v - Math.Floor(v))) * Height);
+                int pixel = Pixels[Math.Min(Height - 1, Math.Max(0, y)) * Width + Math.Min(Width - 1, Math.Max(0, x))];
+                double a = ((pixel >> 24) & 255) / 255.0;
+                int Mix(int shift) => (int)Math.Round(((pixel >> shift) & 255) * a + ((behind >> shift) & 255) * (1 - a));
+                return unchecked((int)0xFF000000) | (Mix(16) << 16) | (Mix(8) << 8) | Mix(0);
+            }
+        }
+
+        // A picture of a built model (a model file with its meshes and textures downloaded): its triangles with their
+        // textures, seen from above at an angle. Null for a model with nothing to draw.
+        public static Picture Render(WavefrontModel model, IReadOnlyDictionary<string, byte[]> textures, int size)
+        {
+            var render = new PlaceRender();
+            var loaded = new Dictionary<string, Texel>(StringComparer.Ordinal);
+            Texel TextureOf(ObjMaterial material)
+            {
+                if (material?.Texture == null || textures == null || !textures.TryGetValue(material.Texture, out byte[] image))
+                    return null;
+                if (!loaded.TryGetValue(material.Texture, out Texel texel))
+                {
+                    try
+                    {
+                        using (Picture picture = Picture.Load(image))
+                        using (Picture small = picture.Width > 256 || picture.Height > 256 ? picture.Resized(Math.Min(256, picture.Width), Math.Min(256, picture.Height)) : null)
+                        {
+                            Picture source = small ?? picture;
+                            texel = new Texel { Width = source.Width, Height = source.Height, Pixels = source.GetPixels() };
+                        }
+                    }
+                    catch (InvalidDataException)
+                    {
+                        texel = null;
+                    }
+                    loaded[material.Texture] = texel;
+                }
+                return texel;
+            }
+            double[] Axes(float[] p) => new double[] { -p[2], -p[0], p[1] };
+            foreach (ObjTriangle triangle in model.Triangles)
+            {
+                if (triangle.Corners.Length != 3)
+                    continue;
+                model.Materials.TryGetValue(triangle.Material ?? "", out ObjMaterial material);
+                if (material != null && material.Opacity < 0.05f)
+                    continue;
+                float[] color = material?.Diffuse ?? new float[] { 0.65f, 0.65f, 0.65f };
+                Texel texture = TextureOf(material);
+                double[][] points = triangle.Corners.Select(c => Axes(model.Positions[c.Position])).ToArray();
+                if (texture != null && triangle.Corners.All(c => c.Texture >= 0 && c.Texture < model.Texcoords.Count))
+                    render.textured[render.triangles.Count] = (texture, triangle.Corners.Select(c => model.Texcoords[c.Texture]).ToArray());
+                // A texture shows over white, unless it is an overlay on the part's colour.
+                render.AddTriangle(points[0], points[1], points[2], texture != null && !(material?.Overlay ?? false) ? new float[] { 1, 1, 1 } : color);
+                for (int axis = 0; axis < 3; axis++)
+                {
+                    render.low[axis] = Math.Min(render.low[axis], points.Min(p => p[axis]));
+                    render.high[axis] = Math.Max(render.high[axis], points.Max(p => p[axis]));
+                }
+            }
+            if (render.triangles.Count == 0)
+                return null;
+            render.AddPart(render.low, render.high);
+            return render.Draw(size, new[] { 0.35, 0.25, -1 });
+        }
+
+        private readonly double[] low = { double.MaxValue, double.MaxValue, double.MaxValue }, high = { double.MinValue, double.MinValue, double.MinValue };
         // What the picture frames: the parts, leaving out ones so wide they are the ground (a baseplate) unless nothing else is.
         private readonly List<(double[] Min, double[] Max)> parts = new List<(double[], double[])>();
 
@@ -33,7 +107,7 @@ namespace Rbx2Source.Export
 
         // A quick picture of a model or place file, for the preview: its blocks, wedges, spheres and cylinders in their colours,
         // its meshes and unions as boxes their size, and its terrain's ground. Nothing is downloaded.
-        public static Bitmap Preview(ModelContents contents, int size)
+        public static Picture Preview(ModelContents contents, int size)
         {
             var render = new PlaceRender();
             // Roblox's axes to the picture's (Z up), as for maps.
@@ -69,20 +143,46 @@ namespace Rbx2Source.Export
             if (ground != null)
             {
                 const float voxel = RobloxTerrain.VoxelSize;
-                for (int z = 0; z < ground.Depth; z++)
-                    for (int x = 0; x < ground.Width; x++)
-                        if (ground.Has(x, z))
+                // The ground in blocks of columns, about 160 across, each in its columns' average colour: a quad per column was
+                // far smaller than a pixel on a big place, and its bumps and mixed materials came out as speckles.
+                int step = Math.Max(1, (int)Math.Ceiling(Math.Max(ground.Width, ground.Depth) / 160.0));
+                for (int bz = 0; bz < ground.Depth; bz += step)
+                    for (int bx = 0; bx < ground.Width; bx += step)
+                    {
+                        int x1 = Math.Min(bx + step, ground.Width), z1 = Math.Min(bz + step, ground.Depth);
+                        var color = new float[3];
+                        float height = 0;
+                        int count = 0;
+                        for (int z = bz; z < z1; z++)
+                            for (int x = bx; x < x1; x++)
+                                if (ground.Has(x, z))
+                                {
+                                    float[] column = contents.Terrain.Color(ground.Materials[x + ground.Width * z]);
+                                    for (int channel = 0; channel < 3; channel++)
+                                        color[channel] += column[channel];
+                                    height += ground.Heights[x + ground.Width * z];
+                                    count++;
+                                }
+                        if (count == 0)
+                            continue;
+                        for (int channel = 0; channel < 3; channel++)
+                            color[channel] /= count;
+                        height /= count;
+                        // Half a stud up, as the map's terrain is lifted: ground level with a part's top (a baseplate under the
+                        // terrain) otherwise fought it pixel by pixel.
+                        double[] Corner(int cx, int cz)
                         {
-                            double[] Corner(int cx, int cz) => Axes((ground.MinX + cx) * voxel, ground.CornerHeight(cx, cz, out _), (ground.MinZ + cz) * voxel);
-                            // Counter-clockwise seen from above, in the picture's axes.
-                            render.AddPolygon(new[] { Corner(x, z), Corner(x, z + 1), Corner(x + 1, z + 1), Corner(x + 1, z) },
-                                contents.Terrain.Color(ground.Materials[x + ground.Width * z]));
+                            float y = ground.CornerHeight(cx, cz, out bool any);
+                            return Axes((ground.MinX + cx) * voxel, (any ? y : height) + 0.5, (ground.MinZ + cz) * voxel);
                         }
+                        // Counter-clockwise seen from above, in the picture's axes.
+                        render.AddPolygon(new[] { Corner(bx, bz), Corner(bx, z1), Corner(x1, z1), Corner(x1, bz) }, color);
+                    }
             }
             return render.triangles.Count == 0 ? null : render.Draw(size, new[] { 0.35, 0.25, -1 });
         }
 
-        public Bitmap Draw(int size, double[] light)
+        public Picture Draw(int size, double[] light)
         {
             const double yaw = 225 * Math.PI / 180, pitch = 35 * Math.PI / 180;
             // The camera looks down at the map from the south-east; right and up span the picture.
@@ -132,8 +232,10 @@ namespace Rbx2Source.Export
                     depth[y * size + x] = double.MaxValue;
                 }
             }
-            foreach (var (a, b, c, color) in triangles)
+            for (int t = 0; t < triangles.Count; t++)
             {
+                var (a, b, c, color) = triangles[t];
+                textured.TryGetValue(t, out var texture);
                 double[] normal = Cross(Subtract(b, a), Subtract(c, a));
                 double length = Math.Sqrt(Dot(normal, normal));
                 if (length < 1e-9 || Dot(normal, view) >= 0)
@@ -161,22 +263,21 @@ namespace Rbx2Source.Export
                         if (z < depth[index])
                         {
                             depth[index] = z;
-                            pixels[index] = shaded;
+                            if (texture.Texture == null)
+                                pixels[index] = shaded;
+                            else
+                            {
+                                float[][] uv = texture.Uvs;
+                                int texel = texture.Texture.Sample(w0 * uv[0][0] + w1 * uv[1][0] + w2 * uv[2][0], w0 * uv[0][1] + w1 * uv[1][1] + w2 * uv[2][1], color);
+                                pixels[index] = unchecked((int)0xFF000000) | ((int)(((texel >> 16) & 255) * shade) << 16) |
+                                    ((int)(((texel >> 8) & 255) * shade) << 8) | (int)((texel & 255) * shade);
+                            }
                         }
                     }
             }
-            var bitmap = new Bitmap(size, size, PixelFormat.Format32bppArgb);
-            BitmapData data = bitmap.LockBits(new Rectangle(0, 0, size, size), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
-            try
-            {
-                for (int y = 0; y < size; y++)
-                    Marshal.Copy(pixels, y * size, data.Scan0 + y * data.Stride, size);
-            }
-            finally
-            {
-                bitmap.UnlockBits(data);
-            }
-            return bitmap;
+            var picture = new Picture(size, size);
+            picture.SetPixels(pixels);
+            return picture;
         }
 
         private static double[] Subtract(double[] a, double[] b) => new[] { a[0] - b[0], a[1] - b[1], a[2] - b[2] };
