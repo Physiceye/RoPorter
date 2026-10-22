@@ -1072,6 +1072,7 @@ namespace Rbx2Source.Export
                 "\n\t\tSearchPaths\n\t\t{\n\t\t\tgame+mod |gameinfo_path|.\n" + mounts + "\t\t}\n\t}\n}\n");
             try
             {
+                using IDisposable textures = HideTextures(folder);
                 ProcessStartInfo start = ToolStart(studioMdl, "-nop4 -nox360 -game \"" + ToolPath(folder) + "\" \"" + ToolPath(qc) + "\"");
                 start.UseShellExecute = false;
                 start.CreateNoWindow = true;
@@ -1107,6 +1108,40 @@ namespace Rbx2Source.Export
             finally
             {
                 File.Delete(gameInfo);
+            }
+        }
+
+        // Garry's Mod's studiomdl (from its October 2026 update) crashes with EXCEPTION_ACCESS_VIOLATION whenever it opens a
+        // loose .vtf, ours or Valve's, after writing the model. It only needs the .vmt files (their flags), so the folder's
+        // textures are renamed out of its way while it runs and put back when this is disposed.
+        internal static IDisposable HideTextures(string folder)
+        {
+            string materials = Path.Combine(folder, "materials");
+            var hidden = new List<string>();
+            if (Directory.Exists(materials))
+                foreach (string texture in Directory.EnumerateFiles(materials, "*.vtf", SearchOption.AllDirectories).ToList())
+                {
+                    File.Move(texture, texture + HiddenTexture);
+                    hidden.Add(texture);
+                }
+            return new Restore(() =>
+            {
+                foreach (string texture in hidden)
+                    if (File.Exists(texture + HiddenTexture))
+                        File.Move(texture + HiddenTexture, texture, true);
+            });
+        }
+
+        private const string HiddenTexture = ".hidden";
+
+        private sealed class Restore : IDisposable
+        {
+            private Action action;
+            public Restore(Action action) => this.action = action;
+            public void Dispose()
+            {
+                action?.Invoke();
+                action = null;
             }
         }
 

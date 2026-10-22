@@ -265,7 +265,10 @@ namespace Rbx2Source.Export
                     progress?.Report("Compiling the map (vbsp)...");
                     // No t-junction repair: on a large place it overflows vbsp (a road of many parts merges into one face
                     // with too many edges to fix).
-                    string log = Run(vbsp, game + "-notjunc \"" + SourceExporter.ToolPath(vmf) + "\"");
+                    string log;
+                    // The October 2026 vbsp crashes on loose textures like studiomdl (see HideTextures); vrad reads them fine.
+                    using (SourceExporter.HideTextures(folder))
+                        log = Run(vbsp, game + "-notjunc \"" + SourceExporter.ToolPath(vmf) + "\"");
                     File.WriteAllText(Path.Combine(src, "vbsp.log"), log);
                     if (!File.Exists(bsp))
                         throw new InvalidDataException("vbsp could not build the map:" + Environment.NewLine + SourceExporter.ToolFailure(log, vbsp));
@@ -1298,6 +1301,8 @@ namespace Rbx2Source.Export
                 int done = 0;
                 var failures = new List<string>();
                 var options = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 1), CancellationToken = cancellation };
+                // Back for vbsp and vrad once the props are compiled (see HideTextures).
+                using IDisposable textures = SourceExporter.HideTextures(folder);
                 Parallel.ForEach(jobs, options, job =>
                 {
                     string qc = Path.Combine(directory, job.Name + ".qc");

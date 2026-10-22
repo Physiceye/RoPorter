@@ -23,7 +23,7 @@ namespace Rbx2Source.Export
 
         internal const int IconSize = 512;
 
-        // The change note of a Workshop update: "Updated with RoPorter v2.1.0".
+        // The change note of a Workshop update: "Updated with RoPorter v2.0.1".
         internal static string ChangeNote => "Updated with RoPorter v" + typeof(Workshop).Assembly.GetName().Version.ToString(3);
 
         // The icon: the avatar's headshot (with the background the API gives it) filling the icon, or the item's thumbnail
