@@ -1,11 +1,11 @@
 {
     "1" : {
         "text": "Report a bug",
-        "url": "https://discord.gg"
+        "url": "https://github.com/Physiceye/RoPorter/issues"
     },
     "2" : {
         "text": "GitHub",
-        "url": "https://github.com"
+        "url": "https://github.com/Physiceye/RoPorter"
     },
     "3" : {
         "text": "Discord",
