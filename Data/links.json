@@ -1,0 +1,14 @@
+{
+    "1" : {
+        "text": "Report a bug",
+        "url": "https://discord.gg"
+    },
+    "2" : {
+        "text": "GitHub",
+        "url": "https://github.com"
+    },
+    "3" : {
+        "text": "Discord",
+        "url": "https://discord.gg"
+    }
+}
