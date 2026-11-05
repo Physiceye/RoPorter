@@ -42,7 +42,7 @@ namespace Rbx2Source.Export
         public float Scale { get; }
         private float Units => MetresPerStud * Scale;
 
-        public ExportScene(WavefrontModel model, AvatarRig rig = null, FaceShapes face = null, float scale = 1)
+        public ExportScene(WavefrontModel model, AvatarRig rig = null, FaceShapes face = null, float scale = 1, float[] origin = null)
         {
             if (!(scale > 0) || float.IsInfinity(scale))
                 throw new ArgumentOutOfRangeException(nameof(scale), "The export scale must be positive.");
@@ -50,6 +50,11 @@ namespace Rbx2Source.Export
             Model = model ?? throw new ArgumentNullException(nameof(model));
             Rig = rig;
             Face = face != null && face.Shapes.Count > 0 ? face : null;
+            if (origin != null)
+            {
+                Origin = origin;
+                return;
+            }
 
             var used = new HashSet<int>(model.Triangles.SelectMany(triangle => triangle.Corners).Select(corner => corner.Position));
             float minX = float.MaxValue, minY = float.MaxValue, minZ = float.MaxValue;

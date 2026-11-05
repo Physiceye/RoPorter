@@ -34,6 +34,13 @@
     <EmbeddedResource Include="Resources\Images\Configuration_icon.png" LogicalName="RoPorter.Configuration_icon.png" />
     <EmbeddedResource Include="Resources\Images\Starterpack_icon.png" LogicalName="RoPorter.Starterpack_icon.png" />
     <EmbeddedResource Include="Resources\Images\Workspace_icon.png" LogicalName="RoPorter.Workspace_icon.png" />
+    <EmbeddedResource Include="Resources\Images\part_icon.png" LogicalName="RoPorter.part_icon.png" />
+    <!-- The lettering of a replaced Deadlock hero's name logo. -->
+    <EmbeddedResource Include="Resources\Fonts\roblox2013.woff2" LogicalName="RoPorter.roblox2013.woff2" />
+    <!-- Export format icons: model files, and each game's Steam icon. -->
+    <EmbeddedResource Include="Resources\Images\mesh_icon.png" LogicalName="RoPorter.mesh_icon.png" />
+    <EmbeddedResource Include="Resources\Images\source2.png" LogicalName="RoPorter.source2.png" />
+    <EmbeddedResource Include="Resources\Images\*.tga" LogicalName="RoPorter.%(Filename)%(Extension)" />
     <!-- Roblox's material textures, default sky and classic rbxasset:// textures (Export\RobloxContent.cs). -->
     <EmbeddedResource Include="Resources\Roblox\**\*" Exclude="Resources\Roblox\README.md" LogicalName="RoPorter.Roblox.%(RecursiveDir)%(Filename)%(Extension)" />
     <PackageReference Include="Avalonia" Version="12.1.4" />
@@ -41,11 +48,13 @@
     <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.4" />
     <PackageReference Include="Avalonia.Fonts.Inter" Version="12.1.4" />
     <!-- Images (textures, icons, previews); Avalonia draws with the same library. -->
-    <PackageReference Include="SkiaSharp" Version="3.119.4" />
+    <PackageReference Include="SkiaSharp" Version="4.151.1" />
     <!-- Encrypts the settings file for the Windows user (Linux and macOS use a key in the user's config folder). -->
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.13" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
     <PackageReference Include="Openize.Drako" Version="26.2.0" />
     <PackageReference Include="ZstdSharp.Port" Version="0.8.8" />
+    <!-- Reads Deadlock's heroes and writes its .vpk mods. -->
+    <PackageReference Include="ValveResourceFormat" Version="20.1.7467" />
   </ItemGroup>
 </Project>

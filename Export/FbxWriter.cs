@@ -48,12 +48,33 @@ namespace Rbx2Source.Export
 
         private static double[] Translation(float[] t) => new double[] { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, t[0], t[1], t[2], 1 };
 
+        // Another game's conventions: its frame and units, and its own skeleton in place of RoPorter's humanoid rig.
+        public sealed class Options
+        {
+            // The scene's frame (Y up, facing +Z, metres) to the file's, row-major 3x3, and the file's units per metre.
+            public double[] FromScene = Matrix.Identity;
+            public double UnitsPerMetre = 1;
+            // GlobalSettings: the file's axes, and centimetres per unit.
+            public int UpAxis = 1, UpAxisSign = 1, FrontAxis = 2, FrontAxisSign = 1, CoordAxis = 0, CoordAxisSign = 1;
+            public double UnitScaleFactor = 100;
+            // A skeleton in scene space (parents before children) with each rig bone's bone index in it, or null for the rig's.
+            public List<TargetSkeleton.Bone> Bones;
+            public int[] BoneOf;
+            public bool Shapes = true, EmbedTextures = true;
+        }
+
         public static void Write(ExportScene scene, IReadOnlyDictionary<string, string> textures,
-            IReadOnlyDictionary<string, MaterialMaps> maps, string path, CancellationToken cancellation = default)
+            IReadOnlyDictionary<string, MaterialMaps> maps, string path, CancellationToken cancellation = default, Options options = null)
         {
             WavefrontModel model = scene.Model;
             if (model.Triangles.Count == 0)
                 throw new InvalidDataException("The model contains no triangles.");
+            options = options ?? new Options();
+            float[] Out(float[] p)
+            {
+                double[] v = Matrix.Scale(Matrix.Apply(options.FromScene, new double[] { p[0], p[1], p[2] }), options.UnitsPerMetre);
+                return new[] { (float)v[0], (float)v[1], (float)v[2] };
+            }
             maps = maps ?? new Dictionary<string, MaterialMaps>();
             string folder = Path.GetDirectoryName(Path.GetFullPath(path));
             long nextId = 1000000;
@@ -64,7 +85,7 @@ namespace Rbx2Source.Export
             var counts = new Dictionary<string, int>(StringComparer.Ordinal);
             void Count(string type) => counts[type] = (counts.TryGetValue(type, out int n) ? n : 0) + 1;
 
-            Node AddModel(long id, string name, string type, float[] translation)
+            Node AddModel(long id, string name, string type, float[] translation, double[] rotation = null)
             {
                 Count("Model");
                 Node node = objects.Add("Model", id, ObjectName(name, "Model"), type);
@@ -73,6 +94,11 @@ namespace Rbx2Source.Export
                 if (translation != null)
                     properties.Children.Add(Property("Lcl Translation", "Lcl Translation", "", "A",
                         (double)translation[0], (double)translation[1], (double)translation[2]));
+                if (rotation != null)
+                {
+                    double[] euler = Matrix.ToEuler(rotation).Select(r => r * 180 / Math.PI).ToArray();
+                    properties.Children.Add(Property("Lcl Rotation", "Lcl Rotation", "", "A", euler[0], euler[1], euler[2]));
+                }
                 properties.Children.Add(Property("DefaultAttributeIndex", "int", "Integer", "", 0));
                 properties.Children.Add(Property("InheritType", "enum", "", "", 1));
                 node.Add("MultiLayer", 0);
@@ -82,13 +108,30 @@ namespace Rbx2Source.Export
                 return node;
             }
 
-            // Skeleton: an "Armature" null holding the bone hierarchy, as in the glTF export.
+            // Skeleton: an "Armature" null holding the bone hierarchy, as in the glTF export. RoPorter's rig has no bone
+            // rotations; another game's skeleton keeps its own.
             long[] boneIds = null;
             float[][] boneWorld = null;
+            double[][] boneRotation = null;
+            string[] boneNames = null;
+            int[] boneParents = null;
             long armatureId = 0;
             if (scene.Rig != null)
             {
-                List<RigBone> bones = scene.Rig.Bones;
+                if (options.Bones != null)
+                {
+                    boneNames = options.Bones.Select(b => b.Name).ToArray();
+                    boneParents = options.Bones.Select(b => b.Parent).ToArray();
+                    boneWorld = options.Bones.Select(b => Out(b.Position.Select(v => (float)v).ToArray())).ToArray();
+                    boneRotation = options.Bones.Select(b => Matrix.Multiply(options.FromScene, b.Rotation)).ToArray();
+                }
+                else
+                {
+                    List<RigBone> bones = scene.Rig.Bones;
+                    boneNames = bones.Select(b => b.Name).ToArray();
+                    boneParents = bones.Select(b => b.Parent).ToArray();
+                    boneWorld = bones.Select(bone => Out(scene.Point(bone.Position))).ToArray();
+                }
                 armatureId = Id();
                 AddModel(armatureId, "Armature", "Null", null);
                 long armatureAttribute = Id();
@@ -96,22 +139,42 @@ namespace Rbx2Source.Export
                 objects.Add("NodeAttribute", armatureAttribute, ObjectName("Armature", "NodeAttribute"), "Null").Add("TypeFlags", "Null");
                 Connect(armatureAttribute, armatureId);
                 Connect(armatureId, 0);
-                boneWorld = bones.Select(bone => scene.Point(bone.Position)).ToArray();
-                boneIds = bones.Select(_ => Id()).ToArray();
-                for (int i = 0; i < bones.Count; i++)
+                boneIds = boneNames.Select(_ => Id()).ToArray();
+                for (int i = 0; i < boneNames.Length; i++)
                 {
-                    float[] parent = bones[i].Parent >= 0 ? boneWorld[bones[i].Parent] : new float[3];
-                    AddModel(boneIds[i], bones[i].Name, "LimbNode",
-                        new[] { boneWorld[i][0] - parent[0], boneWorld[i][1] - parent[1], boneWorld[i][2] - parent[2] });
+                    int p = boneParents[i];
+                    float[] parent = p >= 0 ? boneWorld[p] : new float[3];
+                    double[] offset = { boneWorld[i][0] - parent[0], boneWorld[i][1] - parent[1], boneWorld[i][2] - parent[2] };
+                    double[] rotation = null;
+                    if (boneRotation != null)
+                    {
+                        double[] inverse = p >= 0 ? Matrix.Transpose(boneRotation[p]) : Matrix.Identity;
+                        offset = Matrix.Apply(inverse, offset);
+                        rotation = Matrix.Multiply(inverse, boneRotation[i]);
+                    }
+                    AddModel(boneIds[i], boneNames[i], "LimbNode", offset.Select(v => (float)v).ToArray(), rotation);
                     long attribute = Id();
                     Count("NodeAttribute");
-                    Node node = objects.Add("NodeAttribute", attribute, ObjectName(bones[i].Name, "NodeAttribute"), "LimbNode");
+                    Node node = objects.Add("NodeAttribute", attribute, ObjectName(boneNames[i], "NodeAttribute"), "LimbNode");
                     node.Add("Properties70").Children.Add(Property("Size", "double", "Number", "", 10.0));
                     node.Add("TypeFlags", "Skeleton");
                     Connect(attribute, boneIds[i]);
                 }
-                for (int i = 0; i < bones.Count; i++)
-                    Connect(boneIds[i], bones[i].Parent >= 0 ? boneIds[bones[i].Parent] : armatureId);
+                for (int i = 0; i < boneNames.Length; i++)
+                    Connect(boneIds[i], boneParents[i] >= 0 ? boneIds[boneParents[i]] : armatureId);
+            }
+            // A bone's world matrix (column-major 4x4) and its inverse.
+            double[] BoneMatrix(int bone)
+            {
+                double[] r = boneRotation?[bone] ?? Matrix.Identity;
+                float[] t = boneWorld[bone];
+                return new double[] { r[0], r[3], r[6], 0, r[1], r[4], r[7], 0, r[2], r[5], r[8], 0, t[0], t[1], t[2], 1 };
+            }
+            double[] InverseBoneMatrix(int bone)
+            {
+                double[] r = Matrix.Transpose(boneRotation?[bone] ?? Matrix.Identity);
+                double[] t = Matrix.Scale(Matrix.Apply(r, boneWorld[bone].Select(v => (double)v).ToArray()), -1);
+                return new double[] { r[0], r[3], r[6], 0, r[1], r[4], r[7], 0, r[2], r[5], r[8], 0, t[0], t[1], t[2], 1 };
             }
 
             // Materials and their textures, shared by every mesh that uses them.
@@ -134,7 +197,8 @@ namespace Rbx2Source.Export
                 clip.Add("UseMipMap", 0);
                 clip.Add("Filename", fileName);
                 clip.Add("RelativeFilename", fileName);
-                clip.Add("Content", File.ReadAllBytes(full));
+                if (options.EmbedTextures)
+                    clip.Add("Content", File.ReadAllBytes(full));
                 Count("Texture");
                 Node node = objects.Add("Texture", texture, ObjectName(name, "Texture"), "");
                 node.Add("Type", "TextureVideoClip");
@@ -199,7 +263,7 @@ namespace Rbx2Source.Export
             }
 
             var parts = new List<KeyValuePair<string, List<ObjTriangle>>>();
-            if (scene.Face != null)
+            if (scene.Face != null && options.Shapes)
             {
                 parts.Add(new KeyValuePair<string, List<ObjTriangle>>("Body", model.Triangles.Where(t => !scene.Face.IsFace(t.Group)).ToList()));
                 parts.Add(new KeyValuePair<string, List<ObjTriangle>>("Face", model.Triangles.Where(t => scene.Face.IsFace(t.Group)).ToList()));
@@ -233,7 +297,7 @@ namespace Rbx2Source.Export
                 Node geometry = objects.Add("Geometry", geometryId, ObjectName(part.Key, "Geometry"), "Mesh");
                 geometry.Add("Properties70");
                 geometry.Add("GeometryVersion", 124);
-                geometry.Add("Vertices", points.SelectMany(p => scene.Point(model.Positions[p]).Select(v => (double)v)).ToArray());
+                geometry.Add("Vertices", points.SelectMany(p => Out(scene.Point(model.Positions[p])).Select(v => (double)v)).ToArray());
                 geometry.Add("PolygonVertexIndex", triangles.SelectMany(t => new[]
                 {
                     local[t.Corners[0].Position], local[t.Corners[1].Position], -local[t.Corners[2].Position] - 1
@@ -245,8 +309,9 @@ namespace Rbx2Source.Export
                 normals.Add("ReferenceInformationType", "Direct");
                 normals.Add("Normals", triangles.SelectMany(t => t.Corners).SelectMany(c =>
                 {
-                    float[] n = ExportScene.Direction(model.Normals[c.Normal]);
-                    double length = Math.Sqrt(n.Sum(v => (double)v * v));
+                    float[] direction = ExportScene.Direction(model.Normals[c.Normal]);
+                    double[] n = Matrix.Apply(options.FromScene, new double[] { direction[0], direction[1], direction[2] });
+                    double length = Math.Sqrt(n.Sum(v => v * v));
                     return n.Select(v => length > 0 ? v / length : 0);
                 }).ToArray());
                 int cornerCount = triangles.Count * 3;
@@ -288,35 +353,43 @@ namespace Rbx2Source.Export
                     var indexes = boneIds.Select(_ => new List<int>()).ToArray();
                     var weights = boneIds.Select(_ => new List<double>()).ToArray();
                     for (int i = 0; i < points.Count; i++)
+                    {
+                        // Rig bones that share a bone in another game's skeleton add up.
+                        var merged = new Dictionary<int, double>();
                         for (int k = 0; k < 4; k++)
                         {
                             float w = scene.Rig.Weights[points[i]][k];
                             if (w <= 0)
                                 continue;
-                            int bone = scene.Rig.Joints[points[i]][k];
-                            indexes[bone].Add(i);
-                            weights[bone].Add(w);
+                            int joint = scene.Rig.Joints[points[i]][k];
+                            int bone = options.BoneOf != null ? options.BoneOf[joint] : joint;
+                            merged[bone] = (merged.TryGetValue(bone, out double existing) ? existing : 0) + w;
                         }
+                        foreach (var pair in merged)
+                        {
+                            indexes[pair.Key].Add(i);
+                            weights[pair.Key].Add(pair.Value);
+                        }
+                    }
                     for (int bone = 0; bone < boneIds.Length; bone++)
                     {
                         if (indexes[bone].Count == 0)
                             continue;
                         long cluster = Id();
                         Count("Deformer");
-                        Node node = objects.Add("Deformer", cluster, ObjectName(scene.Rig.Bones[bone].Name, "SubDeformer"), "Cluster");
+                        Node node = objects.Add("Deformer", cluster, ObjectName(boneNames[bone], "SubDeformer"), "Cluster");
                         node.Add("Version", 100);
                         node.Add("UserData", "", "");
                         node.Add("Indexes", indexes[bone].ToArray());
                         node.Add("Weights", weights[bone].ToArray());
-                        float[] p = boneWorld[bone];
-                        node.Add("Transform", Translation(new[] { -p[0], -p[1], -p[2] }));
-                        node.Add("TransformLink", Translation(p));
+                        node.Add("Transform", InverseBoneMatrix(bone));
+                        node.Add("TransformLink", BoneMatrix(bone));
                         Connect(cluster, skin);
                         Connect(boneIds[bone], cluster);
                     }
                 }
 
-                if (scene.Face != null && part.Key == "Face")
+                if (scene.Face != null && options.Shapes && part.Key == "Face")
                 {
                     long blend = Id();
                     Count("Deformer");
@@ -327,7 +400,8 @@ namespace Rbx2Source.Export
                         cancellation.ThrowIfCancellationRequested();
                         var entries = shape.Deltas.Where(pair => local.ContainsKey(pair.Key)).OrderBy(pair => local[pair.Key]).ToList();
                         int[] index = entries.Select(pair => local[pair.Key]).ToArray();
-                        double[] deltas = entries.SelectMany(pair => scene.Delta(pair.Value).Select(v => (double)v)).ToArray();
+                        double[] deltas = entries.SelectMany(pair => Matrix.Scale(Matrix.Apply(options.FromScene,
+                            scene.Delta(pair.Value).Select(v => (double)v).ToArray()), options.UnitsPerMetre)).ToArray();
                         if (index.Length == 0)
                         {
                             // Keep empty shapes (such as vrc.v_sil) as one zero delta so importers don't drop them.
@@ -355,7 +429,7 @@ namespace Rbx2Source.Export
             if (scene.Rig != null)
             {
                 for (int i = 0; i < boneIds.Length; i++)
-                    pose.Add(new KeyValuePair<long, double[]>(boneIds[i], Translation(boneWorld[i])));
+                    pose.Add(new KeyValuePair<long, double[]>(boneIds[i], BoneMatrix(i)));
                 long poseId = Id();
                 Count("Pose");
                 Node node = objects.Add("Pose", poseId, ObjectName("BindPose", "Pose"), "BindPose");
@@ -386,11 +460,12 @@ namespace Rbx2Source.Export
             Node global = new Node("GlobalSettings");
             global.Add("Version", 1000);
             Node settings = global.Add("Properties70");
-            foreach (var axis in new[] { ("UpAxis", 1), ("UpAxisSign", 1), ("FrontAxis", 2), ("FrontAxisSign", 1), ("CoordAxis", 0),
-                ("CoordAxisSign", 1), ("OriginalUpAxis", 1), ("OriginalUpAxisSign", 1) })
+            foreach (var axis in new[] { ("UpAxis", options.UpAxis), ("UpAxisSign", options.UpAxisSign), ("FrontAxis", options.FrontAxis),
+                ("FrontAxisSign", options.FrontAxisSign), ("CoordAxis", options.CoordAxis), ("CoordAxisSign", options.CoordAxisSign),
+                ("OriginalUpAxis", options.UpAxis), ("OriginalUpAxisSign", options.UpAxisSign) })
                 settings.Children.Add(Property(axis.Item1, "int", "Integer", "", axis.Item2));
-            settings.Children.Add(Property("UnitScaleFactor", "double", "Number", "", 100.0));
-            settings.Children.Add(Property("OriginalUnitScaleFactor", "double", "Number", "", 100.0));
+            settings.Children.Add(Property("UnitScaleFactor", "double", "Number", "", options.UnitScaleFactor));
+            settings.Children.Add(Property("OriginalUnitScaleFactor", "double", "Number", "", options.UnitScaleFactor));
             settings.Children.Add(Property("AmbientColor", "ColorRGB", "Color", "", 0.0, 0.0, 0.0));
             settings.Children.Add(Property("DefaultCamera", "KString", "", "", "Producer Perspective"));
             settings.Children.Add(Property("TimeMode", "enum", "", "", 11));

@@ -4,6 +4,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Avalonia;
@@ -26,18 +27,33 @@ namespace Rbx2Source
     // Discord, GitHub and bug-report links along the bottom. Runs on Windows, Linux and macOS.
     public sealed class MainWindow : Window
     {
-        public const string DefaultApiBase = "https://api.ocublox.tv";
-        private static readonly ExportFormat[] Formats = { ExportFormat.Glb, ExportFormat.Gltf, ExportFormat.Fbx, ExportFormat.GarrysMod, ExportFormat.SourceFilmmaker };
-        private static readonly string[] FormatNames = { "GLB", "glTF", "FBX", "Garry's Mod", "Source Filmmaker" };
-        private const string FolderSetting = "folder", DarkModeSetting = "darkmode", CacheSetting = "cache", CloudKeySetting = "cloudkey";
+        public const string DefaultApiBase = "https://api.physiceye.com";
+        // Source 2 (ExportFormat.Source2, icon "source2.png") is left out of the list for now.
+        private static readonly ExportFormat[] Formats = { ExportFormat.Glb, ExportFormat.Gltf, ExportFormat.Fbx, ExportFormat.GarrysMod, ExportFormat.SourceFilmmaker,
+            ExportFormat.TowerUnite, ExportFormat.Deadlock };
+        private static readonly string[] FormatNames = { "GLB", "glTF", "FBX", "Garry's Mod", "Source Filmmaker", "Tower Unite", "Deadlock" };
+        // Model files share one icon; each game has its Steam icon.
+        private static readonly string[] FormatIcons = { "mesh_icon.png", "mesh_icon.png", "mesh_icon.png", "gmod.tga", "sfm.tga", "towerunite.tga", "deadlock.tga" };
+        private const string FolderSetting = "folder", DarkModeSetting = "darkmode", CacheSetting = "cache", CloudKeySetting = "cloudkey", HeroSetting = "deadlockhero";
         private static readonly string[] SettingNames = { FolderSetting, DarkModeSetting, "singletexture", "vrchat", "facetracking", "connectjoints", "discord", "mood", "ownfolder",
-            CacheSetting, CloudKeySetting };
+            CacheSetting, CloudKeySetting, HeroSetting, "r6leftarm", "r6rightarm", "r6leftleg", "r6rightleg", "r6torso", "r6head" };
         private static readonly Dictionary<string, string> Saved = SettingsStore.Load(SettingNames, FolderSetting);
 
-        private const string GitHubPage = "https://github.com/Physiceye/RoPorter";
-        private const string IssuesPage = "https://github.com/Physiceye/RoPorter/issues";
-        private const string DiscordInvite = "https://discord.gg/AxWmaeWJJD";
+        // The buttons in the bottom right, from the repository (Data/links.json) so they can change without a new release:
+        // { "1": { "text": "...", "url": "https://..." }, "2": ... }, in key order. The last copy downloaded is kept beside the
+        // settings and shown until (or if) a new one arrives.
+        private const string LinksUrl = "https://raw.githubusercontent.com/Physiceye/RoPorter/refs/heads/main/Data/links.json";
+        private static readonly string LinksCache = Path.Combine(Export.ContentCache.DataFolder, "links.json");
+        private readonly StackPanel links = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
         private const string CloudKeysPage = "https://create.roblox.com/dashboard/credentials?activeTab=ApiKeysTab";
+        // The steps behind the "How to set up a key" button: the permissions RoPorter's direct requests use.
+        private const string CloudKeyHowTo =
+            "1. Click the \"Roblox Open Cloud\" button (create.roblox.com/dashboard/credentials?activeTab=ApiKeysTab).\n" +
+            "2. Click \"Create API Key\".\n" +
+            "3. Give the key a name.\n" +
+            "4. In \"Access Permissions\" add \"legacy-asset\" and give it the operation \"manage\", then add \"thumbnail\" and give it \"read\".\n" +
+            "5. Scroll to the top or bottom and click \"Save & Generate Key\".\n" +
+            "6. Copy the key into the \"Your own API key\" box. Then you're done!";
         private const string ReleasesApi = "https://api.github.com/repos/Physiceye/RoPorter/releases/latest";
 
         // Export types: 0 Avatar (a user), 1 Catalog Item, 2 Bundle (exported like an avatar wearing it), 3 Model (a .rbxm or
@@ -48,6 +64,10 @@ namespace Rbx2Source
 
         private readonly ComboBox exportType = new ComboBox { HorizontalAlignment = HorizontalAlignment.Stretch, HorizontalContentAlignment = HorizontalAlignment.Left };
         private readonly ComboBox exportFormat = new ComboBox { Width = 185 };
+        private readonly Button r6PartsButton = new Button { Content = "R6 Configuration", IsVisible = false };
+        // The Deadlock hero the avatar replaces, listed from the game the first time Deadlock is chosen.
+        private readonly ComboBox deadlockHero = new ComboBox { Width = 170, IsVisible = false, PlaceholderText = "Hero to replace" };
+        private List<DeadlockHero> heroes;
         private readonly TextBox input = new TextBox();
         private readonly TextBlock inputLabel = new TextBlock { Text = "User ID:", VerticalAlignment = VerticalAlignment.Center };
         private readonly Button openModel = new Button { Content = "Open...", IsVisible = false, Margin = new Thickness(6, 0, 0, 0) };
@@ -71,7 +91,9 @@ namespace Rbx2Source
         private readonly Image preview = new Image { Width = 128, Height = 128, Stretch = Stretch.Uniform };
         private readonly Border previewFrame = new Border { BorderThickness = new Thickness(1), Margin = new Thickness(10, 0, 0, 0), VerticalAlignment = VerticalAlignment.Top };
         private readonly Bitmap brokenPreview = LoadBitmap("BrokenPreview.png");
+        private readonly Bitmap partIcon = LoadBitmap("part_icon.png");
         private readonly Bitmap[] typeBitmaps = TypeIcons.Select(name => LoadBitmap(name + ".png")).ToArray();
+        private readonly Bitmap[] formatBitmaps = FormatIcons.Select(LoadBitmap).ToArray();
 
         // Settings page.
         private readonly CheckBox darkMode = new CheckBox { Content = "Dark mode" };
@@ -89,7 +111,13 @@ namespace Rbx2Source
         private readonly TextBox cloudKey = new TextBox { PasswordChar = '•', Width = 340, HorizontalAlignment = HorizontalAlignment.Left };
         private readonly CheckBox showCloudKey = new CheckBox { Content = "Show key" };
 
-        private readonly Button exportTab = new Button(), settingsTab = new Button();
+        private readonly Button exportTab = new Button(), settingsTab = new Button(), libraryTab = new Button();
+        // The Library page: every export in the output folder, as cards that open its folder.
+        private readonly WrapPanel libraryCards = new WrapPanel { Orientation = Orientation.Horizontal };
+        private readonly ComboBox libraryFilter = new ComboBox { Width = 160 };
+        private readonly TextBlock libraryInfo = new TextBlock { VerticalAlignment = VerticalAlignment.Center };
+        private static readonly string[] LibraryFilters = { "All", "Avatars", "Catalog items", "Bundles", "Models", "Places" };
+        private Control libraryPage;
         private readonly Control exportPage, settingsPage;
 
         private readonly DiscordPresence discord = new DiscordPresence();
@@ -116,6 +144,9 @@ namespace Rbx2Source
         private bool IsPlace => exportType.SelectedIndex == PlaceType;
         private bool IsFile => IsModel || IsPlace;
         private bool IsAvatarLike => exportType.SelectedIndex == 0 || exportType.SelectedIndex == 2;
+        private bool IsDeadlock => Formats[Math.Max(0, exportFormat.SelectedIndex)] == ExportFormat.Deadlock;
+        // Deadlock replaces a hero, so it takes avatars and bundles only.
+        private bool TypeAllowed(int type) => !IsDeadlock || type == 0 || type == 2;
         private static int InputSlot(int type) => type == ModelType || type == PlaceType ? type : 0;
 
         public MainWindow()
@@ -135,12 +166,15 @@ namespace Rbx2Source
             exportType.ItemTemplate = new FuncDataTemplate<int>((i, scope) => IconText(typeBitmaps[i], TypeNames[i]));
             exportType.SelectionBoxItemTemplate = exportType.ItemTemplate;
             exportType.ItemsSource = Enumerable.Range(0, TypeNames.Length).ToList();
+            exportType.ContainerPrepared += (sender, args) => args.Container.IsEnabled = TypeAllowed(args.Index);
             exportType.SelectedIndex = 0;
-            foreach (string name in FormatNames)
-                exportFormat.Items.Add(new ComboBoxItem { Content = name });
+            exportFormat.ItemTemplate = new FuncDataTemplate<int>((i, scope) => IconText(formatBitmaps[i], FormatNames[i]));
+            exportFormat.SelectionBoxItemTemplate = exportFormat.ItemTemplate;
+            exportFormat.ItemsSource = Enumerable.Range(0, FormatNames.Length).ToList();
             exportFormat.SelectedIndex = 0;
             SetTab(exportTab, "Configuration_icon.png", "Export");
             SetTab(settingsTab, "Starterpack_icon.png", "Settings");
+            SetTab(libraryTab, "Workspace_icon.png", "Library");
             preview.Source = brokenPreview;
             previewFrame.Child = preview;
             scaleRow.Children.Add(new TextBlock { Text = "Scale:", VerticalAlignment = VerticalAlignment.Center });
@@ -150,17 +184,16 @@ namespace Rbx2Source
             exportPage = BuildExportPage();
             settingsPage = BuildSettingsPage();
             settingsPage.IsVisible = false;
+            libraryPage = BuildLibraryPage();
+            libraryPage.IsVisible = false;
 
             var tabs = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2, Margin = new Thickness(12, 8, 12, 0) };
             tabs.Children.Add(exportTab);
             tabs.Children.Add(settingsTab);
+            tabs.Children.Add(libraryTab);
             var bottom = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto"), Margin = new Thickness(12, 0, 12, 10) };
             bottom.Children.Add(new TextBlock { Text = "v" + typeof(MainWindow).Assembly.GetName().Version.ToString(3), VerticalAlignment = VerticalAlignment.Center });
-            // Discord in the right corner, then GitHub and the bug report button.
-            var links = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
-            links.Children.Add(LinkButton("Report a bug", IssuesPage, "Opens RoPorter's GitHub issues page to report a bug."));
-            links.Children.Add(LinkButton("GitHub", GitHubPage, "Opens RoPorter's GitHub page."));
-            links.Children.Add(LinkButton("Discord", DiscordInvite, "Opens an invite to RoPorter's Discord server."));
+            ShowLinks(ReadCachedLinks());
             Grid.SetColumn(links, 1);
             bottom.Children.Add(links);
             var root = new DockPanel();
@@ -168,25 +201,30 @@ namespace Rbx2Source
             DockPanel.SetDock(bottom, Dock.Bottom);
             root.Children.Add(tabs);
             root.Children.Add(bottom);
-            root.Children.Add(new Panel { Children = { exportPage, settingsPage } });
+            root.Children.Add(new Panel { Children = { exportPage, settingsPage, libraryPage } });
             Content = root;
 
-            exportTab.Click += (sender, args) => ShowPage(false);
+            exportTab.Click += (sender, args) => ShowPage(ExportPageIndex);
             settingsTab.Click += async (sender, args) =>
             {
-                ShowPage(true);
+                ShowPage(SettingsPageIndex);
                 await UpdateCacheSizeAsync();
+            };
+            libraryTab.Click += async (sender, args) =>
+            {
+                ShowPage(LibraryPageIndex);
+                await RefreshLibraryAsync();
             };
             WireExportPage();
             BindSetting(darkMode, DarkModeSetting);
             darkMode.IsCheckedChanged += (sender, args) => ApplyTheme();
             ApplyTheme();
-            ShowPage(false);
+            ShowPage(ExportPageIndex);
 
             Opened += async (sender, args) =>
             {
                 ShowPresence("Browsing", null);
-                await CheckForUpdatesAsync();
+                await Task.WhenAll(UpdateLinksAsync(), CheckForUpdatesAsync());
             };
             Closing += (sender, args) =>
             {
@@ -235,7 +273,7 @@ namespace Rbx2Source
             Grid.SetRowSpan(previewFrame, 5);
             Place(previewFrame, 0, 2);
             var actions = new WrapPanel { Orientation = Orientation.Horizontal };
-            foreach (Control control in new Control[] { exportFormat, export, upload, cancel, openFolder })
+            foreach (Control control in new Control[] { exportFormat, deadlockHero, export, upload, cancel, openFolder, r6PartsButton })
             {
                 control.Margin = new Thickness(0, 0, 6, 0);
                 actions.Children.Add(control);
@@ -246,8 +284,6 @@ namespace Rbx2Source
             ToolTip.SetTip(openModel, "Choose a model (.rbxm, .rbxmx) or place (.rbxl, .rbxlx) saved from Roblox Studio. You can also drop one on the window.");
             ToolTip.SetTip(scale, "Scales the exported model down. 1 is full size, 0.8 is the default and 0.1 is the smallest.");
             ToolTip.SetTip(upload, "Packs the exported Garry's Mod addon and uploads it to the Steam Workshop. Steam must be running.");
-            ToolTip.SetTip(exportFormat, "Garry's Mod builds an addon folder: avatars become a playermodel that also works as a ragdoll, catalog items and " +
-                "models become props, places become a map.\nSource Filmmaker compiles the model with SFM's own tools; copy its models and materials folders into SFM's game\\usermod folder.");
             return layout;
         }
 
@@ -283,7 +319,9 @@ namespace Rbx2Source
             ToolTip.SetTip(vrchatShapes, "Adds VRChat visemes.");
             ToolTip.SetTip(faceTracking, "Adds Unified Expressions face shapes for VRCFaceTracking.");
             ToolTip.SetTip(connectJoints, "Blends the body's weights across its joints so the surface stretches when they bend, instead of each " +
-                "part moving on its own. For UGC bundles modelled as one connected body; R6 avatars stay blocky.");
+                "part moving on its own. For UGC bundles modelled as one connected body; R6 avatars stay blocky. " +
+                "Deadlock always puts the arms and legs on the hero's joints so its animations work; this option only chooses " +
+                "whether the surface stretches across the joints or the parts stay separate blocks.");
             ToolTip.SetTip(applyMood, "Gives the face the avatar's equipped Mood (its resting expression, e.g. a smile). " +
                 "Off, the face is neutral; GLB, glTF and FBX keep the mood as a \"Default\" shape key you can turn on.");
             ToolTip.SetTip(ownFolder, "Each export gets a folder named after the avatar or item. Off, exports go straight into the output folder, " +
@@ -326,7 +364,8 @@ namespace Rbx2Source
             page.Children.Add(new TextBlock { Text = "Your own API key (optional):" });
             page.Children.Add(cloudKey);
             var openCloudKeys = new Button { Content = "Roblox Open Cloud" };
-            page.Children.Add(new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12, Children = { showCloudKey, openCloudKeys } });
+            var keyHowTo = new Button { Content = "How to set up a key" };
+            page.Children.Add(new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12, Children = { showCloudKey, openCloudKeys, keyHowTo } });
             cloudKey.Text = Saved.TryGetValue(CloudKeySetting, out string key) ? key : "";
             RobloxModelDownloader.CloudKey = cloudKey.Text;
             cloudKey.TextChanged += (sender, args) =>
@@ -336,10 +375,13 @@ namespace Rbx2Source
             };
             showCloudKey.IsCheckedChanged += (sender, args) => cloudKey.PasswordChar = showCloudKey.IsChecked == true ? '\0' : '•';
             openCloudKeys.Click += async (sender, args) => await OpenAsync(CloudKeysPage);
+            keyHowTo.Click += async (sender, args) => await Dialogs.Show(this, CloudKeyHowTo, "Setting up a Roblox API key");
             ToolTip.SetTip(cloudKey, "An API key you create on the Creator Dashboard (create.roblox.com > Open Cloud > API Keys).\n" +
-                "RoPorter sends it to its API, which then makes your Roblox requests with your key and your own rate limits instead of the shared ones.\n" +
-                "Leave it empty to use the shared limits.");
+                "With a key, RoPorter downloads from Roblox directly, so exports keep working even when RoPorter's server is down. " +
+                "Anything Roblox refuses the key for still goes through the server.\n" +
+                "Leave it empty to download through RoPorter's server.");
             ToolTip.SetTip(openCloudKeys, "Opens the API Keys page of Roblox's Creator Dashboard in your browser, where you can create a key.");
+            ToolTip.SetTip(keyHowTo, "Shows which permissions the key needs and how to create it.");
             return new ScrollViewer { Content = page };
         }
 
@@ -400,16 +442,34 @@ namespace Rbx2Source
                     scaleValue.Text = (Math.Round(scale.Value) / 100.0).ToString("0.00", CultureInfo.CurrentCulture);
             };
             scaleValue.Text = (scale.Value / 100.0).ToString("0.00", CultureInfo.CurrentCulture);
-            exportFormat.SelectionChanged += (sender, args) =>
+            exportFormat.SelectionChanged += async (sender, args) =>
             {
                 UpdateFaceOptions(false);
                 UpdateUpload();
+                deadlockHero.IsVisible = IsDeadlock;
+                // Deadlock mods don't go on the Workshop; the hero list takes the button's place in the row.
+                upload.IsVisible = !deadlockHero.IsVisible;
+                UpdateScale(false);
+                for (int type = 0; type < TypeNames.Length; type++)
+                    if (exportType.ContainerFromIndex(type) is Control item)
+                        item.IsEnabled = TypeAllowed(type);
+                if (IsDeadlock && !IsAvatarLike)
+                    exportType.SelectedIndex = 0;
+                if (deadlockHero.IsVisible)
+                    await LoadHeroesAsync();
+            };
+            deadlockHero.SelectionChanged += (sender, args) =>
+            {
+                if (deadlockHero.SelectedIndex >= 0)
+                    SaveSetting(HeroSetting, heroes[deadlockHero.SelectedIndex].Key);
             };
             previewTimer.Tick += async (sender, args) =>
             {
                 previewTimer.Stop();
                 await UpdatePreviewAsync();
             };
+            r6PartsButton.Click += async (sender, args) => await ShowR6PartsAsync();
+            ToolTip.SetTip(r6PartsButton, "This avatar is R6: choose which bone each body part moves with.");
             browse.Click += async (sender, args) => await BrowseAsync();
             export.Click += async (sender, args) => await ExportAsync();
             upload.Click += async (sender, args) => await UploadAsync();
@@ -448,14 +508,171 @@ namespace Rbx2Source
             return button;
         }
 
-        private void ShowPage(bool settings)
+        // The buttons from links.json: at most eight, each with some text and a web address (anything else is skipped).
+        private static List<KeyValuePair<string, string>> ParseLinks(string json)
         {
-            exportPage.IsVisible = !settings;
-            settingsPage.IsVisible = settings;
-            exportTab.FontWeight = settings ? FontWeight.Normal : FontWeight.Bold;
-            settingsTab.FontWeight = settings ? FontWeight.Bold : FontWeight.Normal;
-            exportTab.Background = settings ? Brushes.Transparent : null;
-            settingsTab.Background = settings ? null : Brushes.Transparent;
+            var result = new List<KeyValuePair<string, string>>();
+            if (string.IsNullOrWhiteSpace(json))
+                return result;
+            try
+            {
+                var entries = Newtonsoft.Json.Linq.JObject.Parse(json).Properties()
+                    .OrderBy(p => int.TryParse(p.Name, NumberStyles.Integer, CultureInfo.InvariantCulture, out int n) ? n : int.MaxValue)
+                    .ThenBy(p => p.Name, StringComparer.Ordinal);
+                foreach (var entry in entries)
+                {
+                    if (!(entry.Value is Newtonsoft.Json.Linq.JObject link))
+                        continue;
+                    string text = link.Value<string>("text")?.Trim(), url = link.Value<string>("url")?.Trim();
+                    if (string.IsNullOrEmpty(text) || text.Length > 40 || !Uri.TryCreate(url, UriKind.Absolute, out Uri uri) ||
+                        (uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != Uri.UriSchemeHttp))
+                        continue;
+                    result.Add(new KeyValuePair<string, string>(text, uri.AbsoluteUri));
+                    if (result.Count == 8)
+                        break;
+                }
+            }
+            catch (Newtonsoft.Json.JsonException)
+            {
+            }
+            return result;
+        }
+
+        private static List<KeyValuePair<string, string>> ReadCachedLinks()
+        {
+            try
+            {
+                return File.Exists(LinksCache) ? ParseLinks(File.ReadAllText(LinksCache)) : new List<KeyValuePair<string, string>>();
+            }
+            catch (Exception error) when (error is IOException || error is UnauthorizedAccessException)
+            {
+                return new List<KeyValuePair<string, string>>();
+            }
+        }
+
+        private void ShowLinks(List<KeyValuePair<string, string>> entries)
+        {
+            links.Children.Clear();
+            foreach (var entry in entries)
+                links.Children.Add(LinkButton(entry.Key, entry.Value, "Opens " + entry.Value));
+        }
+
+        // Downloads the current links.json; the buttons change only if it holds at least one usable link, and it is kept for
+        // the next start.
+        private async Task UpdateLinksAsync()
+        {
+            try
+            {
+                string json;
+                using (var client = new HttpClient { Timeout = TimeSpan.FromSeconds(15) })
+                {
+                    client.DefaultRequestHeaders.UserAgent.ParseAdd("RoPorter/" + RobloxModelDownloader.AppVersion);
+                    json = await client.GetStringAsync(LinksUrl);
+                }
+                var entries = ParseLinks(json);
+                if (entries.Count == 0)
+                    return;
+                ShowLinks(entries);
+                try
+                {
+                    File.WriteAllText(LinksCache, json);
+                }
+                catch (Exception error) when (error is IOException || error is UnauthorizedAccessException)
+                {
+                }
+            }
+            catch (Exception error) when (error is HttpRequestException || error is TaskCanceledException)
+            {
+                // Offline or GitHub unreachable: the buttons from the last start stay.
+            }
+        }
+
+        private const int ExportPageIndex = 0, SettingsPageIndex = 1, LibraryPageIndex = 2;
+
+        private void ShowPage(int page)
+        {
+            var pages = new[] { (exportPage, exportTab), (settingsPage, settingsTab), (libraryPage, libraryTab) };
+            for (int i = 0; i < pages.Length; i++)
+            {
+                pages[i].Item1.IsVisible = i == page;
+                pages[i].Item2.FontWeight = i == page ? FontWeight.Bold : FontWeight.Normal;
+                pages[i].Item2.Background = i == page ? null : Brushes.Transparent;
+            }
+        }
+
+        // The Library page: a filter, the folder being shown, and the export cards.
+        private Control BuildLibraryPage()
+        {
+            foreach (string filter in LibraryFilters)
+                libraryFilter.Items.Add(new ComboBoxItem { Content = filter });
+            libraryFilter.SelectedIndex = 0;
+            libraryFilter.SelectionChanged += async (sender, args) => await RefreshLibraryAsync();
+            var refresh = new Button { Content = "Refresh" };
+            refresh.Click += async (sender, args) => await RefreshLibraryAsync();
+            var open = new Button { Content = "Open folder" };
+            open.Click += async (sender, args) =>
+            {
+                if (Directory.Exists(outputFolder.Text))
+                    await OpenAsync(outputFolder.Text);
+            };
+            ToolTip.SetTip(refresh, "Looks through the output folder again.");
+            ToolTip.SetTip(open, "Opens the output folder.");
+            var bar = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Margin = new Thickness(12, 12, 12, 6) };
+            bar.Children.Add(new TextBlock { Text = "Show:", VerticalAlignment = VerticalAlignment.Center });
+            bar.Children.Add(libraryFilter);
+            bar.Children.Add(refresh);
+            bar.Children.Add(open);
+            bar.Children.Add(libraryInfo);
+            var page = new DockPanel();
+            DockPanel.SetDock(bar, Dock.Top);
+            page.Children.Add(bar);
+            page.Children.Add(new ScrollViewer { Content = libraryCards, Margin = new Thickness(6, 0, 6, 6) });
+            return page;
+        }
+
+        // Lists the exports in the output folder (read off the UI thread; a folder of Garry's Mod addons can be large).
+        private async Task RefreshLibraryAsync()
+        {
+            string folder = outputFolder.Text ?? "";
+            string type = new[] { null, "Avatar", "Catalog Item", "Bundle", "Model", "Place" }[Math.Max(0, libraryFilter.SelectedIndex)];
+            List<ExportLibrary.Entry> entries = await Task.Run(() => ExportLibrary.List(folder));
+            var shown = entries.Where(e => type == null || e.Type == type).ToList();
+            libraryCards.Children.Clear();
+            libraryInfo.Text = !Directory.Exists(folder) ? "The output folder doesn't exist yet." : shown.Count == 0 ? "Nothing exported here yet."
+                : shown.Count + " export" + (shown.Count == 1 ? "" : "s") + " in " + folder;
+            foreach (ExportLibrary.Entry entry in shown)
+                libraryCards.Children.Add(LibraryCard(entry));
+        }
+
+        private Control LibraryCard(ExportLibrary.Entry entry)
+        {
+            Bitmap picture = null;
+            try
+            {
+                if (entry.Picture != null && File.Exists(entry.Picture))
+                    picture = ToBitmap(File.ReadAllBytes(entry.Picture));
+            }
+            catch (Exception error) when (error is IOException || error is UnauthorizedAccessException || error is ArgumentException)
+            {
+            }
+            int typeIcon = Array.IndexOf(TypeNames, entry.Type);
+            var content = new StackPanel { Spacing = 4, Width = 150 };
+            content.Children.Add(new Border
+            {
+                Width = 150, Height = 150, Background = new SolidColorBrush(Color.FromArgb(40, 128, 128, 128)), CornerRadius = new CornerRadius(4),
+                Child = new Image
+                {
+                    Source = picture ?? (typeIcon >= 0 ? typeBitmaps[typeIcon] : partIcon),
+                    Stretch = Stretch.Uniform, Width = picture != null ? 150 : 48, Height = picture != null ? 150 : 48
+                }
+            });
+            content.Children.Add(new TextBlock { Text = entry.Name, FontWeight = FontWeight.Bold, TextTrimming = TextTrimming.CharacterEllipsis });
+            content.Children.Add(new TextBlock { Text = entry.Type + " · " + entry.Format, FontSize = 12, TextTrimming = TextTrimming.CharacterEllipsis });
+            content.Children.Add(new TextBlock { Text = entry.Date.ToString("g", CultureInfo.CurrentCulture), FontSize = 12, Opacity = 0.7 });
+            var card = new Button { Content = content, Margin = new Thickness(6), Padding = new Thickness(8), VerticalAlignment = VerticalAlignment.Top };
+            ToolTip.SetTip(card, "Opens " + entry.Folder + "\n" + entry.File);
+            card.Click += async (sender, args) => await OpenAsync(entry.Folder);
+            return card;
         }
 
         private void ApplyTheme()
@@ -472,7 +689,43 @@ namespace Rbx2Source
         private static Bitmap LoadBitmap(string name)
         {
             using (Stream stream = Resource(name))
-                return stream == null ? null : new Bitmap(stream);
+            {
+                if (stream == null)
+                    return null;
+                if (!name.EndsWith(".tga", StringComparison.OrdinalIgnoreCase))
+                    return new Bitmap(stream);
+                using (var data = new MemoryStream())
+                {
+                    stream.CopyTo(data);
+                    byte[] png = TgaToPng(data.ToArray());
+                    return png != null ? ToBitmap(png) : null;
+                }
+            }
+        }
+
+        // An uncompressed 24- or 32-bit TGA (the Steam game icons) as a PNG, which Avalonia can load; null for anything else.
+        private static byte[] TgaToPng(byte[] tga)
+        {
+            if (tga.Length < 18 || tga[2] != 2 || (tga[16] != 24 && tga[16] != 32))
+                return null;
+            int width = tga[12] | tga[13] << 8, height = tga[14] | tga[15] << 8, bytes = tga[16] / 8;
+            int start = 18 + tga[0];
+            bool topDown = (tga[17] & 0x20) != 0;
+            if (width == 0 || height == 0 || start + width * height * bytes > tga.Length)
+                return null;
+            var pixels = new int[width * height];
+            for (int y = 0; y < height; y++)
+                for (int x = 0; x < width; x++)
+                {
+                    int at = start + ((topDown ? y : height - 1 - y) * width + x) * bytes;
+                    int alpha = bytes == 4 ? tga[at + 3] : 255;
+                    pixels[y * width + x] = alpha << 24 | tga[at + 2] << 16 | tga[at + 1] << 8 | tga[at];
+                }
+            using (var picture = new Export.Picture(width, height))
+            {
+                picture.SetPixels(pixels);
+                return picture.Encode(Export.PictureFormat.Png);
+            }
         }
 
         private static Bitmap ToBitmap(byte[] image)
@@ -576,7 +829,7 @@ namespace Rbx2Source
             string name = Path.GetFileNameWithoutExtension(file);
             string description = name + ": " + parts + (parts == 1 ? " part" : " parts");
             // Nothing visible to draw: the type's icon instead.
-            ShowPreview(picture != null ? ToBitmap(picture) : typeBitmaps[place ? PlaceType : ModelType], description);
+            ShowPreview(picture != null ? ToBitmap(picture) : typeBitmaps[place ? PlaceType : ModelType], description, picture);
             SetLoaded(true);
             Title = "RoPorter - " + name;
             loadedName = name;
@@ -604,7 +857,7 @@ namespace Rbx2Source
                             return render?.Encode(PictureFormat.Png);
                     }, token);
                     if (picture != null && current == previewCancellation)
-                        ShowPreview(ToBitmap(picture), description);
+                        ShowPreview(ToBitmap(picture), description, picture);
                 }
             }
             catch (Exception error) when (!(error is OutOfMemoryException))
@@ -634,11 +887,15 @@ namespace Rbx2Source
             previewTimer.Start();
         }
 
-        private void ShowPreview(Bitmap image, string description)
+        // bytes: the picture's file (PNG or JPEG), kept for the Library when the item is exported.
+        private void ShowPreview(Bitmap image, string description, byte[] bytes = null)
         {
             preview.Source = image ?? brokenPreview;
+            previewBytes = image != null ? bytes : null;
             ToolTip.SetTip(previewFrame, description);
         }
+
+        private byte[] previewBytes;
 
         // Shows the avatar's headshot or the item's thumbnail; anything that can't be loaded shows the broken preview.
         private async Task UpdatePreviewAsync()
@@ -647,6 +904,7 @@ namespace Rbx2Source
             var current = previewCancellation = new CancellationTokenSource();
             string text = (input.Text ?? "").Trim();
             bool avatar = exportType.SelectedIndex == 0, bundle = IsBundle;
+            r6PartsButton.IsVisible = false;
             Title = "RoPorter";
             loadedBundle = null;
             if (text.Length == 0)
@@ -674,10 +932,12 @@ namespace Rbx2Source
                         long bundleId = long.Parse(text, CultureInfo.InvariantCulture);
                         RobloxModelDownloader.BundleInfo details = await downloader.GetBundleAsync(bundleId, current.Token);
                         Bitmap picture = null;
+                        byte[] pictureBytes = null;
                         string problem = null;
                         try
                         {
-                            picture = ToBitmap(await downloader.DownloadBundleThumbnailAsync(bundleId, current.Token));
+                            pictureBytes = await downloader.DownloadBundleThumbnailAsync(bundleId, current.Token);
+                            picture = ToBitmap(pictureBytes);
                         }
                         catch (Exception error) when (!(error is OperationCanceledException) && !(error is ApiMessageException))
                         {
@@ -685,7 +945,7 @@ namespace Rbx2Source
                         }
                         if (current != previewCancellation)
                             return;
-                        ShowPreview(picture, picture != null ? "Bundle " + bundleId : "No picture: " + problem);
+                        ShowPreview(picture, picture != null ? "Bundle " + bundleId : "No picture: " + problem, pictureBytes);
                         loadedBundle = details;
                         SetLoaded(true);
                         Title = "RoPorter - " + details.Name;
@@ -697,9 +957,15 @@ namespace Rbx2Source
                     byte[] bytes = await downloader.DownloadThumbnailAsync(id, avatar, current.Token);
                     if (current != previewCancellation)
                         return;
-                    ShowPreview(ToBitmap(bytes), (avatar ? "User " : "Item ") + id);
+                    ShowPreview(ToBitmap(bytes), (avatar ? "User " : "Item ") + id, bytes);
                     SetLoaded(true);
                     await ShowTitleAsync(downloader, id, avatar, current);
+                    if (avatar)
+                    {
+                        string rig = await downloader.GetAvatarTypeAsync(id, current.Token);
+                        if (current == previewCancellation)
+                            r6PartsButton.IsVisible = rig == "R6";
+                    }
                 }
             }
             catch (OperationCanceledException)
@@ -765,13 +1031,29 @@ namespace Rbx2Source
                     return;
                 AppendLog("RoPorter " + tag + " is available (this is v" + current.ToString(3) + ").");
                 if (Uri.TryCreate(release.Value<string>("html_url"), UriKind.Absolute, out Uri page) && page.Host == "github.com" &&
-                    await Dialogs.Ask(this, "RoPorter " + tag + " is available. You have v" + current.ToString(3) + ".\n\nOpen the download page?", "RoPorter update"))
+                    await Dialogs.Ask(this, "RoPorter " + tag + " is available. You have v" + current.ToString(3) + ".\n\nOpen the download page?", "RoPorter update",
+                        details: ReleaseNotes(release.Value<string>("body"))))
                     await OpenAsync(page.AbsoluteUri);
             }
             catch (Exception error) when (error is HttpRequestException || error is TaskCanceledException || error is Newtonsoft.Json.JsonException)
             {
                 AppendLog("Could not check for updates: " + error.Message);
             }
+        }
+
+        // A GitHub release's Markdown as plain text: no images or HTML tags, links as their text, no bold or italic marks.
+        private static string ReleaseNotes(string body)
+        {
+            if (string.IsNullOrWhiteSpace(body))
+                return null;
+            string text = body.Replace("\r\n", "\n");
+            text = Regex.Replace(text, @"!\[[^\]]*\]\([^)]*\)", "");
+            text = Regex.Replace(text, @"\[([^\]]*)\]\([^)]*\)", "$1");
+            text = Regex.Replace(text, @"<[^>\n]+>", "");
+            text = Regex.Replace(text, @"\*\*(.+?)\*\*|__(.+?)__", "$1$2");
+            text = Regex.Replace(text, @"(?<![\w*])[*_]([^\s*_](?:[^\n]*?[^\s])?)[*_](?![\w*])", "$1");
+            text = Regex.Replace(text, @"^#+\s*", "", RegexOptions.Multiline);
+            return Regex.Replace(text, @"\n{3,}", "\n\n").Trim();
         }
 
         // Missing version parts count as zero, so "1.0.0" equals assembly version 1.0.0.0.
@@ -829,6 +1111,11 @@ namespace Rbx2Source
                     throw new InvalidDataException("The bundle's details have not loaded yet.");
                 string selection = input.Text ?? "";
                 ExportFormat format = Formats[exportFormat.SelectedIndex];
+                string hero = format == ExportFormat.Deadlock && deadlockHero.SelectedIndex >= 0 ? heroes[deadlockHero.SelectedIndex].Key : null;
+                if (format == ExportFormat.Deadlock && hero == null)
+                    throw new InvalidDataException("Choose the hero to replace.");
+                if (format == ExportFormat.Deadlock && !avatar)
+                    throw new InvalidDataException("Only avatars and bundles can replace a Deadlock hero.");
                 string folder = Path.GetFullPath(outputFolder.Text ?? "");
                 SaveSetting(FolderSetting, folder);
                 var progress = new Progress<string>(AppendLog);
@@ -842,11 +1129,13 @@ namespace Rbx2Source
                     var downloader = new RobloxModelDownloader(client, DefaultApiBase);
                     string modelFile = IsFile ? Path.GetFullPath(selection.Trim()) : null;
                     long id = modelFile != null ? 0 : bundle?.Id ?? await downloader.ResolveIdAsync(selection, avatar, cancellation.Token);
+                    var r6 = R6Attachments();
                     CancellationToken token = cancellation.Token;
                     // Off the UI thread: building and compiling take a while.
                     string path = await Task.Run(() => downloader.ExportAsync(id, avatar, "", folder, progress, token, format,
-                        avatar && faces, vrchat, single, size, avatar && joints, bundle, mood, own, modelFile));
+                        avatar && faces, vrchat, single, size, avatar && joints, bundle, mood, own, modelFile, r6, hero));
                     AppendLog("Export complete: " + path);
+                    RecordExport(path, downloader.ExportFolder, id, format, name);
                     ShowPresence("Exported " + name, "To " + FormatNames[exportFormat.SelectedIndex]);
                     if (downloader.ExportFolder != null && format == ExportFormat.GarrysMod && Workshop.IsAddon(downloader.ExportFolder) ||
                         downloader.ExportFolder != null && format == ExportFormat.SourceFilmmaker && SfmWorkshop.IsExport(downloader.ExportFolder))
@@ -875,17 +1164,120 @@ namespace Rbx2Source
             }
         }
 
+        // Fills the hero list from the installed game.
+        private async Task LoadHeroesAsync()
+        {
+            if (heroes != null)
+                return;
+            try
+            {
+                DeadlockInstall install = DeadlockInstall.Find();
+                if (install == null)
+                {
+                    AppendLog("Deadlock wasn't found in your Steam libraries.");
+                    return;
+                }
+                heroes = await Task.Run(() => DeadlockExporter.Heroes(install));
+                foreach (DeadlockHero hero in heroes)
+                    deadlockHero.Items.Add(new ComboBoxItem { Content = hero.Name });
+                if (Saved.TryGetValue(HeroSetting, out string key))
+                    deadlockHero.SelectedIndex = heroes.FindIndex(hero => hero.Key == key);
+            }
+            catch (Exception error) when (error is IOException || error is UnauthorizedAccessException || error is InvalidDataException)
+            {
+                heroes = null;
+                AppendLog("Deadlock's heroes couldn't be read: " + error.Message);
+            }
+        }
+
+        // What each R6 body part can be attached to (the first choice is the default). An R6 limb is one rigid block found as its
+        // middle part, so that part names it. Nothing is applied to R15 avatars.
+        private static readonly (string Label, BodyPart Part, string Setting, (string Text, string Bone)[] Choices)[] R6Parts =
+        {
+            ("Left arm", BodyPart.LeftLowerArm, "r6leftarm", new[] { ("Wrist (hand)", "LeftHand"), ("Elbow (forearm)", "LeftLowerArm"), ("Shoulder (upper arm)", "LeftUpperArm") }),
+            ("Right arm", BodyPart.RightLowerArm, "r6rightarm", new[] { ("Wrist (hand)", "RightHand"), ("Elbow (forearm)", "RightLowerArm"), ("Shoulder (upper arm)", "RightUpperArm") }),
+            ("Left leg", BodyPart.LeftLowerLeg, "r6leftleg", new[] { ("Ankle (foot)", "LeftFoot"), ("Knee (calf)", "LeftLowerLeg"), ("Hip (thigh)", "LeftUpperLeg") }),
+            ("Right leg", BodyPart.RightLowerLeg, "r6rightleg", new[] { ("Ankle (foot)", "RightFoot"), ("Knee (calf)", "RightLowerLeg"), ("Hip (thigh)", "RightUpperLeg") }),
+            ("Torso", BodyPart.UpperTorso, "r6torso", new[] { ("Spine", "Spine"), ("Chest", "Chest"), ("Upper chest", "UpperChest"), ("Hips", "Hips") }),
+            ("Head", BodyPart.Head, "r6head", new[] { ("Head", "Head"), ("Neck", "Neck") }),
+        };
+
+        private static Dictionary<BodyPart, string> R6Attachments()
+        {
+            var attachments = new Dictionary<BodyPart, string>();
+            foreach (var part in R6Parts)
+                attachments[part.Part] = Saved.TryGetValue(part.Setting, out string bone) && part.Choices.Any(choice => choice.Bone == bone) ? bone : part.Choices[0].Bone;
+            return attachments;
+        }
+
+        // The R6 Configuration window: a dropdown per part, saved as soon as it changes.
+        private async Task ShowR6PartsAsync()
+        {
+            var dialog = new Window
+            {
+                Title = "R6 Configuration", SizeToContent = SizeToContent.WidthAndHeight, CanResize = false, Icon = Icon,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner, ShowInTaskbar = false
+            };
+            var grid = new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,240"), RowSpacing = 8, ColumnSpacing = 12 };
+            var boxes = new List<ComboBox>();
+            for (int i = 0; i < R6Parts.Length; i++)
+            {
+                var part = R6Parts[i];
+                grid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
+                var label = new TextBlock { Text = part.Label + ":", VerticalAlignment = VerticalAlignment.Center };
+                var box = new ComboBox { HorizontalAlignment = HorizontalAlignment.Stretch };
+                foreach (var choice in part.Choices)
+                    box.Items.Add(new ComboBoxItem { Content = choice.Text });
+                int saved = Saved.TryGetValue(part.Setting, out string bone) ? Array.FindIndex(part.Choices, choice => choice.Bone == bone) : 0;
+                box.SelectedIndex = Math.Max(0, saved);
+                box.SelectionChanged += (sender, args) => SaveSetting(part.Setting, part.Choices[Math.Max(0, box.SelectedIndex)].Bone);
+                Grid.SetRow(label, i);
+                Grid.SetRow(box, i);
+                Grid.SetColumn(box, 1);
+                grid.Children.Add(label);
+                grid.Children.Add(box);
+                boxes.Add(box);
+            }
+            var reset = new Button { Content = "Reset" };
+            reset.Click += (sender, args) =>
+            {
+                foreach (ComboBox box in boxes)
+                    box.SelectedIndex = 0;
+            };
+            var done = new Button { Content = "OK", MinWidth = 80, HorizontalContentAlignment = HorizontalAlignment.Center, IsDefault = true };
+            done.Click += (sender, args) => dialog.Close();
+            var content = new StackPanel { Margin = new Thickness(20), Spacing = 16 };
+            content.Children.Add(new TextBlock { Text = "What each body part moves with. Applies to the next export.", TextWrapping = TextWrapping.Wrap, MaxWidth = 340 });
+            content.Children.Add(grid);
+            content.Children.Add(new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Spacing = 8, Children = { reset, done } });
+            dialog.Content = content;
+            await dialog.ShowDialog(this);
+        }
+
+        // Adds the export to the Library, with the preview picture shown while it was exported.
+        private void RecordExport(string path, string exportFolder, long id, ExportFormat format, string name)
+        {
+            byte[] picture = previewBytes;
+            ExportLibrary.Add(new ExportLibrary.Entry
+            {
+                // A model or place file is named by its file name, not the path typed in.
+                Name = IsFile ? Path.GetFileNameWithoutExtension(name.Trim()) : name, Type = TypeNames[exportType.SelectedIndex], Format = FormatNames[Array.IndexOf(Formats, format)], Id = id,
+                Date = DateTime.Now, File = path, Folder = exportFolder ?? Path.GetDirectoryName(path)
+            }, picture);
+        }
+
         // Places always export at full size, so the slider is hidden while the Place type is selected (keeping the scale chosen
         // for the other types).
         private void UpdateScale(bool busy)
         {
             scaleRow.IsVisible = !IsPlace;
-            scale.IsEnabled = !busy;
+            // A Deadlock hero sets the avatar's size.
+            scale.IsEnabled = !busy && !IsDeadlock;
         }
 
         private void SetBusy(bool busy)
         {
-            foreach (Control control in new Control[] { exportType, exportFormat, input, openModel, outputFolder, browse, singleTexture, ownFolder, scale })
+            foreach (Control control in new Control[] { exportType, exportFormat, deadlockHero, input, openModel, outputFolder, browse, singleTexture, ownFolder, scale })
                 control.IsEnabled = !busy;
             export.IsEnabled = !busy && loaded;
             UpdateFaceOptions(busy);
@@ -944,7 +1336,9 @@ namespace Rbx2Source
         private void UpdateFaceOptions(bool busy)
         {
             ExportFormat chosen = Formats[Math.Max(0, exportFormat.SelectedIndex)];
-            bool avatar = IsAvatarLike && chosen != ExportFormat.GarrysMod && chosen != ExportFormat.SourceFilmmaker;
+            // The game formats bake the face's mood into the mesh instead of keeping shape keys.
+            bool avatar = IsAvatarLike && chosen != ExportFormat.GarrysMod && chosen != ExportFormat.SourceFilmmaker &&
+                chosen != ExportFormat.TowerUnite && chosen != ExportFormat.Source2 && chosen != ExportFormat.Deadlock;
             vrchatShapes.IsEnabled = !busy && avatar;
             faceTracking.IsEnabled = !busy && avatar;
             // Joint blending applies to avatars and bundles in every format.

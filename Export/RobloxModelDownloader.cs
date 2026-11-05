@@ -29,17 +29,29 @@ namespace Rbx2Source.Export
         public ApiMessageException(string message) : base(message) { }
     }
 
-    // Every request goes to RoPorter's API (api.ocublox.tv, or a local copy of it): its own routes, and Roblox CDN files (3D
-    // models, textures, thumbnails) through its /v1/cdn route. RoPorter never contacts Roblox directly.
+    // Requests go to RoPorter's API (api.physiceye.com, or a local copy of it): its own routes, and Roblox CDN files (3D models,
+    // textures, thumbnails) through its /v1/cdn route. With the user's own Open Cloud key, they go to Roblox directly instead
+    // (so exports keep working while the API is down), each API route to the Roblox endpoint it stands for; a request Roblox
+    // refuses the key for still goes through the API.
     public sealed class RobloxModelDownloader
     {
-        public const string DefaultApi = "https://api.ocublox.tv";
+        public const string DefaultApi = "https://api.physiceye.com";
 
-        // The user's own Roblox Open Cloud API key (a setting), or null. It is sent to the API with every request, in the
-        // X-Roblox-Cloud-Key header, so the API can make its Roblox requests for this user with the user's own key and rate
-        // limits instead of the shared ones. RoPorter itself still only talks to the API.
-        public static string CloudKey { get; set; }
+        // The user's own Roblox Open Cloud API key (a setting), or null. Requests go to Roblox directly with it (x-api-key);
+        // anything that still goes through the API carries it in the X-Roblox-Cloud-Key header, so the API can use the user's
+        // own key and rate limits instead of the shared ones.
+        public static string CloudKey
+        {
+            get => cloudKey;
+            set => cloudKey = string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+        }
+        private static string cloudKey;
         public const string CloudKeyHeader = "X-Roblox-Cloud-Key";
+
+        // This build's version (e.g. "2.1.1"), sent with every request in the X-RoPorter-Version header and the User-Agent
+        // ("RoPorter/2.1.1"), so the API can tell which version is asking.
+        public static readonly string AppVersion = typeof(RobloxModelDownloader).Assembly.GetName().Version?.ToString(3) ?? "0.0.0";
+        public const string VersionHeader = "X-RoPorter-Version";
 
         private readonly HttpClient client;
         private readonly string apiBase;
@@ -178,16 +190,54 @@ namespace Rbx2Source.Export
         private static bool IsRobloxCdn(Uri uri) => uri.Scheme == Uri.UriSchemeHttps && uri.IsDefaultPort && uri.UserInfo.Length == 0 &&
             uri.Host.EndsWith(".rbxcdn.com", StringComparison.OrdinalIgnoreCase);
 
-        // Where a request really goes: the API's own routes as they are, and Roblox CDN files through its /v1/cdn route. Any
-        // other host is refused, so nothing is ever requested from Roblox directly.
+        // Where a request goes through the API: its own routes as they are, and Roblox CDN files through its /v1/cdn route. Any
+        // other host is refused.
         private Uri ToApi(Uri uri)
         {
             if (IsApi(uri))
                 return uri;
             if (IsRobloxCdn(uri))
                 return new Uri(apiBase + "/v1/cdn?url=" + Uri.EscapeDataString(uri.AbsoluteUri));
-            throw new InvalidDataException("RoPorter only downloads through its API, not from " + uri.Host + ".");
+            throw new InvalidDataException("RoPorter only downloads through its API or with your cloud key, not from " + uri.Host + ".");
         }
+
+        // With a cloud key: the Roblox endpoint an API route stands for (the API answers with that endpoint's own JSON), or a
+        // CDN file as it is. Null for a route with no public Roblox endpoint (the profile background), which stays on the API.
+        private Uri ToRoblox(Uri uri)
+        {
+            if (cloudKey == null)
+                return null;
+            if (IsRobloxCdn(uri))
+                return uri;
+            if (!IsApi(uri))
+                return null;
+            string path = uri.AbsolutePath.TrimEnd('/');
+            var query = System.Web.HttpUtility.ParseQueryString(uri.Query);
+            string Id(string name) => long.TryParse(query[name], NumberStyles.None, CultureInfo.InvariantCulture, out long id) && id > 0
+                ? id.ToString(CultureInfo.InvariantCulture) : null;
+            string url;
+            switch (path)
+            {
+                case "/v1/users/avatar-3d": url = Id("userId") is string user3d ? "https://thumbnails.roblox.com/v1/users/avatar-3d?userId=" + user3d : null; break;
+                case "/v1/assets-thumbnail-3d": url = Id("assetId") is string asset3d ? "https://thumbnails.roblox.com/v1/assets-thumbnail-3d?assetId=" + asset3d : null; break;
+                case "/v1/users/outfit-3d": url = Id("outfitId") is string outfit ? "https://thumbnails.roblox.com/v1/users/outfit-3d?outfitId=" + outfit : null; break;
+                case "/v1/users/headshot": url = Id("userId") is string head ? "https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=" + head + "&size=420x420&format=Png" : null; break;
+                case "/v1/users/avatar": url = Id("userId") is string body ? "https://thumbnails.roblox.com/v1/users/avatar?userIds=" + body + "&size=720x720&format=Png" : null; break;
+                case "/v1/catalog/thumbnail": url = Id("assetId") is string icon ? "https://thumbnails.roblox.com/v1/assets?assetIds=" + icon + "&size=420x420&format=Png" : null; break;
+                case "/v1/bundle/thumbnail": url = Id("bundleId") is string picture ? "https://thumbnails.roblox.com/v1/bundles/thumbnails?bundleIds=" + picture + "&size=420x420&format=Png" : null; break;
+                case "/v1/users": url = Id("userId") is string named ? "https://users.roblox.com/v1/users/" + named : null; break;
+                case "/v1/users/avatar-details": url = Id("userId") is string worn ? "https://avatar.roblox.com/v1/users/" + worn + "/avatar" : null; break;
+                case "/v1/catalog": url = Id("itemId") is string item ? "https://catalog.roblox.com/v1/catalog/items/" + item + "/details?itemType=Asset" : null; break;
+                case "/v1/bundle": url = Id("bundleId") is string bundle ? "https://catalog.roblox.com/v1/bundles/" + bundle + "/details" : null; break;
+                // Open Cloud asset delivery answers with the asset's temporary CDN location (see GetAssetBytesAsync).
+                case "/v1/asset": url = Id("id") is string asset ? "https://apis.roblox.com/asset-delivery-api/v1/assetId/" + asset : null; break;
+                default: url = null; break;
+            }
+            return url != null ? new Uri(url) : null;
+        }
+
+        private static bool IsRobloxApi(Uri uri) => uri.Scheme == Uri.UriSchemeHttps && uri.IsDefaultPort &&
+            (uri.Host == "apis.roblox.com" || uri.Host.EndsWith(".roblox.com", StringComparison.OrdinalIgnoreCase));
 
         // A file the API points to: one of its own (absolute, or relative like "/v1/asset?id=...") or a Roblox CDN file.
         private Uri Hosted(string reference, string what)
@@ -200,17 +250,43 @@ namespace Rbx2Source.Export
         // Requests the API; the "Roblox-AssetFormat" header asks its asset route for a particular build of an asset. The API
         // passes on Roblox's rate limit (HTTP 429), so a limited request is tried again a couple of times, after the wait
         // the API asks for (Retry-After) or 2 and then 4 seconds.
+        // With a cloud key the request goes to Roblox first; if Roblox refuses the key for it (HTTP 401 or 403: a permission
+        // the key lacks, or an asset it may not download), it goes through the API instead.
         private async Task<HttpResponseMessage> GetAsync(Uri uri, string assetFormat, CancellationToken cancellation)
+        {
+            Uri direct = ToRoblox(uri);
+            if (direct != null)
+            {
+                HttpResponseMessage response = await SendAsync(direct, assetFormat, cancellation).ConfigureAwait(false);
+                int status = (int)response.StatusCode;
+                if ((status != 401 && status != 403) || IsRobloxCdn(uri))
+                    return response;
+                response.Dispose();
+            }
+            return await SendAsync(ToApi(uri), assetFormat, cancellation).ConfigureAwait(false);
+        }
+
+        private async Task<HttpResponseMessage> SendAsync(Uri target, string assetFormat, CancellationToken cancellation)
         {
             for (int attempt = 0; ; attempt++)
             {
-                using (var request = new HttpRequestMessage(HttpMethod.Get, ToApi(uri)))
+                using (var request = new HttpRequestMessage(HttpMethod.Get, target))
                 {
-                    // Signed CDN locations do not need the format header; the API's asset route does.
-                    if (assetFormat != null && !IsRobloxCdn(uri))
+                    // Roblox's public endpoints (users, avatars, catalog, 2D thumbnails) need no key, and a key without their
+                    // permission could be refused; only asset delivery and the 3D renders get it.
+                    bool needsKey = IsRobloxApi(target) && (target.Host == "apis.roblox.com" ||
+                        target.Host == "thumbnails.roblox.com" && target.AbsolutePath.EndsWith("-3d", StringComparison.Ordinal));
+                    // Signed CDN locations do not need the format header; asset routes do.
+                    if (assetFormat != null && !IsRobloxCdn(target))
                         request.Headers.TryAddWithoutValidation("Roblox-AssetFormat", assetFormat);
-                    if (!string.IsNullOrWhiteSpace(CloudKey))
-                        request.Headers.TryAddWithoutValidation(CloudKeyHeader, CloudKey.Trim());
+                    // The key goes only to the Roblox endpoints that need it, or to the API (which uses it for this user's requests).
+                    if (cloudKey != null && needsKey)
+                        request.Headers.TryAddWithoutValidation("x-api-key", cloudKey);
+                    else if (cloudKey != null && IsApi(target))
+                        request.Headers.TryAddWithoutValidation(CloudKeyHeader, cloudKey);
+                    if (IsApi(target))
+                        request.Headers.TryAddWithoutValidation(VersionHeader, AppVersion);
+                    request.Headers.TryAddWithoutValidation("User-Agent", "RoPorter/" + AppVersion);
                     HttpResponseMessage response = await client.SendAsync(request, cancellation).ConfigureAwait(false);
                     if ((int)response.StatusCode != 429 || attempt >= RateLimitRetries)
                         return response;
@@ -234,7 +310,7 @@ namespace Rbx2Source.Export
             using (HttpResponseMessage response = await GetAsync(uri, null, cancellation).ConfigureAwait(false))
             {
                 if (!response.IsSuccessStatusCode)
-                    throw await FailureAsync(response, ToApi(uri)).ConfigureAwait(false);
+                    throw await FailureAsync(response, response.RequestMessage?.RequestUri ?? ToApi(uri)).ConfigureAwait(false);
                 byte[] data = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
                 cancellation.ThrowIfCancellationRequested();
                 data = await DecodeAsync(data, uri.Host, cancellation).ConfigureAwait(false);
@@ -261,7 +337,7 @@ namespace Rbx2Source.Export
             }
             string detail = (body?["errors"] as JArray)?.OfType<JObject>().Select(entry => entry["message"]?.ToString())
                 .FirstOrDefault(message => !string.IsNullOrWhiteSpace(message)) ?? (body?["message"] ?? body?["error"])?.ToString();
-            string message = "The API answered HTTP " + (int)response.StatusCode + (string.IsNullOrEmpty(response.ReasonPhrase) ? "" : " (" + response.ReasonPhrase + ")") +
+            string message = (IsRobloxApi(uri) || IsRobloxCdn(uri) ? "Roblox" : "The API") + " answered HTTP " + (int)response.StatusCode + (string.IsNullOrEmpty(response.ReasonPhrase) ? "" : " (" + response.ReasonPhrase + ")") +
                 " for " + uri.AbsolutePath + (string.IsNullOrWhiteSpace(detail) ? "." : ": " + detail.Trim().TrimEnd('.') + ".");
             return assetAccess ? new AssetAccessException(message) : (Exception)new HttpRequestException(message);
         }
@@ -300,10 +376,19 @@ namespace Rbx2Source.Export
         {
             for (int hop = 0; hop < 5; hop++)
             {
-                Uri requested = ToApi(uri);
                 using (HttpResponseMessage response = await GetAsync(uri, assetFormat, cancellation).ConfigureAwait(false))
                 {
+                    Uri requested = response.RequestMessage?.RequestUri ?? ToApi(uri);
                     int status = (int)response.StatusCode;
+                    // Open Cloud asset delivery answers with JSON naming the asset's temporary CDN location.
+                    if (response.IsSuccessStatusCode && requested.Host == "apis.roblox.com" &&
+                        requested.AbsolutePath.StartsWith("/asset-delivery-api/", StringComparison.Ordinal))
+                    {
+                        string location = JObject.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false)).Value<string>("location");
+                        if (location == null || !Uri.TryCreate(location, UriKind.Absolute, out uri) || !IsRobloxCdn(uri))
+                            throw new InvalidDataException("Roblox's asset delivery gave no CDN location for the asset.");
+                        continue;
+                    }
                     if (status >= 300 && status < 400 && response.Headers.Location != null)
                     {
                         uri = response.Headers.Location.IsAbsoluteUri ? response.Headers.Location : new Uri(requested, response.Headers.Location);
@@ -670,6 +755,29 @@ namespace Rbx2Source.Export
             return (JObject.Parse(json)["assets"] as JArray)?.OfType<JObject>().ToList() ?? new List<JObject>();
         }
 
+        // "R6" or "R15": the avatar's rig type, from the same details as its worn items (the copy saved by an earlier export if the
+        // API can't answer). Null when neither is available.
+        public async Task<string> GetAvatarTypeAsync(long userId, CancellationToken cancellation)
+        {
+            try
+            {
+                string json = Encoding.UTF8.GetString(await DownloadAsync(new Uri(GetAvatarDetailsUrl(userId, apiBase)), cancellation).ConfigureAwait(false));
+                return JObject.Parse(json).Value<string>("playerAvatarType");
+            }
+            catch (Exception error) when (error is HttpRequestException || error is JsonException || error is InvalidDataException)
+            {
+                string saved = Path.Combine(SavedAvatars, userId.ToString(CultureInfo.InvariantCulture) + ".json");
+                try
+                {
+                    return File.Exists(saved) ? JObject.Parse(File.ReadAllText(saved)).Value<string>("playerAvatarType") : null;
+                }
+                catch (Exception readError) when (readError is IOException || readError is UnauthorizedAccessException || readError is JsonException)
+                {
+                    return null;
+                }
+            }
+        }
+
         // Roblox usernames are 3-20 letters, digits, and underscores, so they are safe as file and Source model names.
         public async Task<string> GetUsernameAsync(long userId, CancellationToken cancellation)
         {
@@ -864,8 +972,11 @@ namespace Rbx2Source.Export
         public async Task<string> ExportAsync(long id, bool avatar, string descriptorUrl, string outputFolder,
             IProgress<string> progress, CancellationToken cancellation, ExportFormat format = ExportFormat.Glb, bool faceTracking = false,
             bool vrchatShapes = true, bool singleTexture = false, float scale = 1, bool connectJoints = false, BundleInfo bundle = null,
-            bool applyMood = true, bool ownFolder = true, string modelFile = null)
+            bool applyMood = true, bool ownFolder = true, string modelFile = null, IReadOnlyDictionary<BodyPart, string> r6Attachments = null, string deadlockHero = null)
         {
+            // Deadlock's animations turn hands and feet far more than other games': a limb hung from one swings wildly.
+            if (format == ExportFormat.Deadlock)
+                r6Attachments = null;
             // A model file (.rbxm / .rbxmx) exports like a catalog item: a prop named after the file.
             if (modelFile != null)
             {
@@ -878,9 +989,16 @@ namespace Rbx2Source.Export
                 avatar = true;
                 id = bundle.Id;
             }
-            if (format != ExportFormat.Glb && format != ExportFormat.Gltf && format != ExportFormat.Fbx && format != ExportFormat.GarrysMod &&
-                format != ExportFormat.SourceFilmmaker)
+            if (!Enum.IsDefined(typeof(ExportFormat), format))
                 throw new ArgumentOutOfRangeException(nameof(format));
+            // Tower Unite player models are rigged to the mannequin skeleton from Tower Unite's own SDK, with one texture.
+            TowerUniteInstall towerUnite = null;
+            if (format == ExportFormat.TowerUnite && avatar)
+            {
+                towerUnite = TowerUniteInstall.Find() ?? throw new InvalidDataException(
+                    "Tower Unite was not found. Install it through Steam: player models are rigged to the skeleton in its Workshop SDK.");
+                singleTexture = true;
+            }
             if (!(scale >= MinimumScale && scale <= 1))
                 throw new ArgumentOutOfRangeException(nameof(scale), "The export scale must be between " + MinimumScale.ToString(CultureInfo.InvariantCulture) + " and 1.");
             // Both Source formats build the same Source model; Valve's player skeleton is read from Garry's Mod's files.
@@ -946,6 +1064,7 @@ namespace Rbx2Source.Export
             AvatarRig rig = null;
             FaceShapes face = null;
             HashSet<string> gearGroups = null;
+            Dictionary<string, string> accessoryBodygroups = null;
             if (avatar)
             {
                 List<JObject> avatarAssets = null;
@@ -961,7 +1080,7 @@ namespace Rbx2Source.Export
                         "Layered clothing gets estimated weights instead of Roblox's own; export again later for those.");
                 }
                 progress?.Report("Building humanoid rig...");
-                rig = AvatarRig.Build(model, accessories, cancellation, connectJoints);
+                rig = AvatarRig.Build(model, accessories, cancellation, connectJoints, r6Attachments);
                 progress?.Report("Rig parts: " + rig.Describe());
                 // Accessories whose MeshPart is DoubleSided are drawn from both sides; everything else is culled like Roblox.
                 foreach (ObjTriangle triangle in model.Triangles)
@@ -983,6 +1102,10 @@ namespace Rbx2Source.Export
                         progress?.Report("Left out gear: " + names + ".");
                     }
                 }
+                // Garry's Mod and SFM keep each worn accessory as its own bodygroup, so it can be toggled in-game.
+                if (source && rig.AccessoryGroups.Count > 0)
+                    accessoryBodygroups = rig.AccessoryGroups.Where(pair => !rig.HeldGroups.Contains(pair.Key))
+                        .ToDictionary(pair => pair.Key, pair => string.IsNullOrWhiteSpace(pair.Value.Name) ? pair.Key : pair.Value.Name, StringComparer.Ordinal);
                 try
                 {
                     if (avatarAssets == null)
@@ -1240,7 +1363,7 @@ namespace Rbx2Source.Export
                         maps.Values.Count(m => m.Emissive != null) + " emissive.");
 
                 TextureAtlas.Result atlas = null;
-                if (singleTexture)
+                if (singleTexture || format == ExportFormat.Deadlock)
                 {
                     progress?.Report("Merging " + model.Triangles.Select(t => t.Material).Distinct().Count() + " materials into one texture set...");
                     atlas = TextureAtlas.Build(model, staging, textures, maps, name, cancellation);
@@ -1253,12 +1376,13 @@ namespace Rbx2Source.Export
                 string fileName = name + (format == ExportFormat.Glb ? ".glb" : format == ExportFormat.Gltf ? ".gltf" : ".fbx");
                 if (scale < 1)
                     progress?.Report("Scale: " + scale.ToString("0.##", CultureInfo.InvariantCulture) + " of full size.");
-                if (!source)
+                bool game = format == ExportFormat.TowerUnite || format == ExportFormat.Source2 || format == ExportFormat.Deadlock;
+                if (!source && !game)
                     progress?.Report("Writing " + format.ToString().ToUpperInvariant() + ": " + model.Triangles.Count + " triangles...");
                 if (format == ExportFormat.SourceFilmmaker)
                 {
                     fileName = SourceExporter.Export(new ExportScene(model, rig, face, scale), textures, maps, staging, name, garrysMod, progress, cancellation,
-                        username, itemLabel, itemType, gearGroups, sfm);
+                        username, itemLabel, itemType, gearGroups, sfm, accessoryGroups: accessoryBodygroups);
                     Directory.Delete(Path.Combine(staging, textureDir), true);
                     foreach (string file in atlas?.Files ?? new List<string>())
                         if (File.Exists(Full(file)))
@@ -1314,7 +1438,7 @@ namespace Rbx2Source.Export
                     // Playermodels are listed under the account's username so players can find their avatar. Bundles have their
                     // own spawn menu category.
                     fileName = SourceExporter.Export(new ExportScene(model, rig, face, scale), textures, maps, staging, name, garrysMod, progress, cancellation,
-                        username, itemLabel, itemType, gearGroups, playerCategory: bundle != null ? "Bundles" : null);
+                        username, itemLabel, itemType, gearGroups, playerCategory: bundle != null ? "Bundles" : null, accessoryGroups: accessoryBodygroups);
                     Directory.Delete(Path.Combine(staging, textureDir), true);
                     // The merged PNGs are source art for a Source model; keep them with the other sources.
                     foreach (string file in atlas?.Files ?? new List<string>())
@@ -1365,6 +1489,31 @@ namespace Rbx2Source.Export
                     if (published.HasValue)
                         Workshop.SetPublishedId(staging, published.Value);
                 }
+                else if (game)
+                {
+                    // A Deadlock hero takes the player's head for its icons and their headshot with its background for its cards.
+                    byte[] head = null, portrait = null;
+                    if (format == ExportFormat.Deadlock && avatar && bundle == null && modelFile == null)
+                        try
+                        {
+                            head = await DownloadThumbnailAsync(id, avatar, cancellation).ConfigureAwait(false);
+                            portrait = await DownloadThumbnailAsync(id, avatar, cancellation, background: true).ConfigureAwait(false);
+                        }
+                        catch (Exception error) when (error is HttpRequestException || error is InvalidDataException || error is JsonException)
+                        {
+                            progress?.Report("Head picture unavailable (" + error.Message + "); the hero keeps the icons it has.");
+                        }
+                    // The game's files are written beside the model with their own names; the downloads are no longer needed.
+                    fileName = format == ExportFormat.Deadlock
+                        ? DeadlockExporter.Export(new ExportScene(model, rig, face, scale), textures, staging, name, deadlockHero, username ?? name, head, portrait, progress, cancellation)
+                        : format == ExportFormat.TowerUnite
+                        ? TowerUniteExporter.Export(new ExportScene(model, rig, face, scale), textures, maps, staging, name, towerUnite, progress, cancellation)
+                        : Source2Exporter.Export(new ExportScene(model, rig, face, scale), textures, maps, staging, name, progress, cancellation);
+                    Directory.Delete(Path.Combine(staging, textureDir), true);
+                    foreach (string file in atlas?.Files ?? new List<string>())
+                        if (File.Exists(Full(file)))
+                            File.Delete(Full(file));
+                }
                 else if (format == ExportFormat.Fbx)
                     FbxWriter.Write(new ExportScene(model, rig, face, scale), textures, maps, Path.Combine(staging, fileName), cancellation);
                 else
@@ -1376,7 +1525,7 @@ namespace Rbx2Source.Export
                 {
                     Directory.Delete(Path.Combine(staging, textureDir), true);
                 }
-                else if (!source)
+                else if (!source && !game)
                 {
                     // Raw downloads replaced by composites, packed maps, or the atlas are not referenced by the model. FBX
                     // materials have no metalness/roughness input, so those maps are kept beside it instead.

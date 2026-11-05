@@ -75,17 +75,30 @@ namespace Rbx2Source.Export
 
         public static string Export(ExportScene scene, IReadOnlyDictionary<string, string> textures, IReadOnlyDictionary<string, MaterialMaps> maps,
             string folder, string name, GarrysModInstall install, IProgress<string> progress, CancellationToken cancellation, string playerName = null,
-            string itemLabel = null, string itemType = null, ISet<string> gearGroups = null, SfmInstall sfm = null, string playerCategory = null)
+            string itemLabel = null, string itemType = null, ISet<string> gearGroups = null, SfmInstall sfm = null, string playerCategory = null,
+            IReadOnlyDictionary<string, string> accessoryGroups = null)
         {
             // Source Filmmaker gets the same model without the Garry's Mod parts (its player animations, first-person arms,
             // Lua, spawn menu and addon.json), compiled with SFM's studiomdl. Its models and materials folders go into SFM's
             // usermod folder.
             WavefrontModel model = scene.Model;
-            // Held gear goes in its own optional bodygroup instead of the body (and the first-person arms).
-            bool IsBody(ObjTriangle triangle) => gearGroups == null || !gearGroups.Contains(triangle.Group);
             AvatarRig rig = scene.Rig;
             ValvePlayer valve = rig != null ? install.Player : null;
             bool player = rig != null;
+            // Held gear goes in its own optional bodygroup instead of the body (and the first-person arms), and every other worn
+            // accessory gets its own bodygroup, shown by default, so players can toggle it. Accessories sharing a name (one
+            // outfit's pieces) toggle as one. A Source model holds at most 32 body parts; accessories past that stay in the body.
+            var accessorySmds = new List<(string Name, string File, HashSet<string> Groups)>();
+            if (player && accessoryGroups != null)
+                foreach (var item in accessoryGroups.Where(pair => gearGroups == null || !gearGroups.Contains(pair.Key))
+                    .GroupBy(pair => pair.Value, pair => pair.Key, StringComparer.Ordinal).Take(30))
+                {
+                    var groups = new HashSet<string>(item, StringComparer.Ordinal);
+                    if (model.Triangles.Any(triangle => groups.Contains(triangle.Group)))
+                        accessorySmds.Add((item.Key, "accessory_" + (accessorySmds.Count + 1) + ".smd", groups));
+                }
+            var separate = new HashSet<string>(accessorySmds.SelectMany(a => a.Groups), StringComparer.Ordinal);
+            bool IsBody(ObjTriangle triangle) => (gearGroups == null || !gearGroups.Contains(triangle.Group)) && !separate.Contains(triangle.Group);
             string id = Regex.Replace(name.ToLowerInvariant(), "[^a-z0-9_]", "_");
 
             if (rig != null)
@@ -120,9 +133,14 @@ namespace Rbx2Source.Export
 
             progress?.Report("Writing Source model (" + model.Triangles.Count + " triangles, " + bones.Count + " bones)...");
             File.WriteAllText(Path.Combine(src, "reference.smd"), Smd(bones, model, scene, units, boneOf, materialNames, IsBody, cancellation), Encoding.ASCII);
-            bool hasGear = player && model.Triangles.Any(triangle => !IsBody(triangle));
+            bool hasGear = player && gearGroups != null && model.Triangles.Any(triangle => gearGroups.Contains(triangle.Group));
             if (hasGear)
-                File.WriteAllText(Path.Combine(src, "gear.smd"), Smd(bones, model, scene, units, boneOf, materialNames, t => !IsBody(t), cancellation), Encoding.ASCII);
+                File.WriteAllText(Path.Combine(src, "gear.smd"), Smd(bones, model, scene, units, boneOf, materialNames, t => gearGroups.Contains(t.Group), cancellation), Encoding.ASCII);
+            foreach (var accessory in accessorySmds)
+                File.WriteAllText(Path.Combine(src, accessory.File),
+                    Smd(bones, model, scene, units, boneOf, materialNames, triangle => accessory.Groups.Contains(triangle.Group), cancellation), Encoding.ASCII);
+            if (accessorySmds.Count > 0)
+                progress?.Report("Bodygroups you can toggle: " + string.Join(", ", accessorySmds.Select(a => a.Name)) + ".");
             List<string> flexes = player ? WriteFlexes(Path.Combine(src, "face.vta"), bones, model, scene, units, IsBody, cancellation) : null;
             if (flexes != null)
                 progress?.Report("Face: " + flexes.Count + " flexes for posing, with blinking" + (flexes.Contains(JawDropFlex) ? " and voice chat mouth movement." : "."));
@@ -139,7 +157,8 @@ namespace Rbx2Source.Export
 
             string modelName = sfm != null ? (player ? "roporter/" : "roporter/items/") + id + ".mdl"
                 : player ? "player/roporter/" + id + ".mdl" : "roporter/items/" + id + ".mdl";
-            File.WriteAllText(Path.Combine(src, "model.qc"), Qc(modelName, materialDir, bones, rig, valve, player, scene, units, flexes, hasGear, sfm == null), Encoding.ASCII);
+            File.WriteAllText(Path.Combine(src, "model.qc"), Qc(modelName, materialDir, bones, rig, valve, player, scene, units, flexes, hasGear, sfm == null,
+                accessorySmds.Select(a => (a.Name, a.File)).ToList()), Encoding.ASCII);
             if (sfm != null)
             {
                 progress?.Report("Compiling with Source Filmmaker's studiomdl...");
@@ -247,81 +266,18 @@ namespace Rbx2Source.Export
         // First-person arm radius as a share of Valve's shoulder-to-wrist length (about 2 units on a 23-unit citizen arm).
         private const double ArmRadius = 0.085;
 
-        // R6 blocks in first person: the corner radius (about 4 units, a block about 6 units across) and the stretch blended
-        // at the elbow and wrist on each side of the joint, as shares of the arm's length.
-        private const double BlockArmRadius = 0.18, BlockJointBlend = 0.06;
-
-        // A first-person arm triangle corner in Source space, for slicing R6 blocks.
-        private struct ArmCorner
-        {
-            public double[] Point, Normal;
-            public double U, V;
-        }
-
-        private static ArmCorner Between(ArmCorner a, ArmCorner b, double t)
-        {
-            double[] normal = Matrix.Add(a.Normal, Matrix.Scale(Matrix.Subtract(b.Normal, a.Normal), t));
-            double length = Matrix.Length(normal);
-            return new ArmCorner
-            {
-                Point = Matrix.Add(a.Point, Matrix.Scale(Matrix.Subtract(b.Point, a.Point), t)),
-                Normal = length > 1e-9 ? Matrix.Scale(normal, 1 / length) : a.Normal,
-                U = a.U + (b.U - a.U) * t, V = a.V + (b.V - a.V) * t
-            };
-        }
-
-        // Cuts a triangle into the bands between planes across the arm (at the given distances along the axis from the
-        // origin), interpolating position, normal and UV, so a long block side can bend at the elbow and wrist.
-        private static List<ArmCorner[]> Slice(ArmCorner[] triangle, double[] origin, double[] axis, IEnumerable<double> cuts)
-        {
-            double Along(ArmCorner c) => Matrix.Dot(Matrix.Subtract(c.Point, origin), axis);
-            var pieces = new List<List<ArmCorner>> { triangle.ToList() };
-            foreach (double cut in cuts)
-            {
-                var next = new List<List<ArmCorner>>();
-                foreach (List<ArmCorner> polygon in pieces)
-                {
-                    double[] offsets = polygon.Select(c => Along(c) - cut).ToArray();
-                    if (offsets.All(o => o >= -1e-9) || offsets.All(o => o <= 1e-9))
-                    {
-                        next.Add(polygon);
-                        continue;
-                    }
-                    var below = new List<ArmCorner>();
-                    var above = new List<ArmCorner>();
-                    for (int i = 0; i < polygon.Count; i++)
-                    {
-                        int j = (i + 1) % polygon.Count;
-                        if (offsets[i] <= 0)
-                            below.Add(polygon[i]);
-                        if (offsets[i] >= 0)
-                            above.Add(polygon[i]);
-                        if ((offsets[i] < 0 && offsets[j] > 0) || (offsets[i] > 0 && offsets[j] < 0))
-                        {
-                            ArmCorner crossing = Between(polygon[i], polygon[j], offsets[i] / (offsets[i] - offsets[j]));
-                            below.Add(crossing);
-                            above.Add(crossing);
-                        }
-                    }
-                    if (below.Count >= 3)
-                        next.Add(below);
-                    if (above.Count >= 3)
-                        next.Add(above);
-                }
-                pieces = next;
-            }
-            var result = new List<ArmCorner[]>();
-            foreach (List<ArmCorner> polygon in pieces)
-                for (int i = 1; i + 1 < polygon.Count; i++)
-                    result.Add(new[] { polygon[0], polygon[i], polygon[i + 1] });
-            return result;
-        }
+        // R6 blocks in first person: the corner radius as a share of the arm's length. Thicker than ArmRadius so the block still
+        // reads as one, but not by much: at 0.18 the two blocks filled most of the view with the fists up.
+        private const double BlockArmRadius = 0.11;
+        // An R6 first-person block: how far it reaches past the wrist (units), and its length as a share of the forearm's.
+        private const double BlockPastWrist = 2, BlockLength = 1.1;
 
         private static string LuaString(string text) => "\"" + text.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "") + "\"";
 
+
         // First-person arms: Spine4 with the clavicle, arm, hand and finger bones (like Valve's c_arms models) and the triangles
         // those bones mainly carry. Garry's Mod bonemerges the arms onto each weapon's viewmodel by bone name, so every bone
-        // takes the viewmodel's position; each arm is scaled to Valve's arm length so its pieces meet at the viewmodel's joints.
+        // takes the viewmodel's position; each arm segment is scaled to Valve's so its pieces meet at the viewmodel's joints.
         private static string ArmsSmd(List<Bone> bones, WavefrontModel model, ExportScene scene, double units, int[] boneOf, ValvePlayer valve,
             Dictionary<string, string> materials, Func<ObjTriangle, bool> include, out int triangles, CancellationToken cancellation)
         {
@@ -336,24 +292,36 @@ namespace Rbx2Source.Export
             for (int k = 0; k < keep.Count; k++)
                 map[keep[k]] = k;
 
+            // Each segment is fitted to Valve's own: the upper arm about the shoulder to Valve's upper arm, then the forearm, hand
+            // and fingers from the fitted elbow to Valve's forearm. Fitting the arm as a whole put a long Roblox forearm past
+            // the viewmodel's wrist, so the hands reached further up the screen than Valve's.
             var pivot = new Dictionary<char, double[]>();
-            var scale = new Dictionary<char, double>();
+            var elbow = new Dictionary<char, double[]>();
+            var fittedElbow = new Dictionary<char, double[]>();
+            var upperScale = new Dictionary<char, double>();
+            var foreScale = new Dictionary<char, double>();
             foreach (char side in new[] { 'L', 'R' })
             {
                 double[] Ours(string bone) => bones.First(b => b.Name == Prefix + side + "_" + bone).Position;
                 double[] Valve(string bone) => valve.Find(Prefix + side + "_" + bone).WorldPosition;
-                double ours = Matrix.Length(Matrix.Subtract(Ours("Forearm"), Ours("UpperArm"))) + Matrix.Length(Matrix.Subtract(Ours("Hand"), Ours("Forearm")));
-                double theirs = Matrix.Length(Matrix.Subtract(Valve("Forearm"), Valve("UpperArm"))) + Matrix.Length(Matrix.Subtract(Valve("Hand"), Valve("Forearm")));
+                double ourUpper = Matrix.Length(Matrix.Subtract(Ours("Forearm"), Ours("UpperArm"))), ourFore = Matrix.Length(Matrix.Subtract(Ours("Hand"), Ours("Forearm")));
+                double valveUpper = Matrix.Length(Matrix.Subtract(Valve("Forearm"), Valve("UpperArm"))), valveFore = Matrix.Length(Matrix.Subtract(Valve("Hand"), Valve("Forearm")));
                 pivot[side] = Ours("UpperArm");
-                scale[side] = ours > 1e-6 ? theirs / ours : 1;
+                elbow[side] = Ours("Forearm");
+                // A segment with no length (a joint the rig could not place) takes the whole arm's scale.
+                double whole = ourUpper + ourFore > 1e-6 ? (valveUpper + valveFore) / (ourUpper + ourFore) : 1;
+                upperScale[side] = ourUpper > 1e-6 ? valveUpper / ourUpper : whole;
+                foreScale[side] = ourFore > 1e-6 ? valveFore / ourFore : whole;
+                fittedElbow[side] = Matrix.Add(pivot[side], Matrix.Scale(Matrix.Subtract(elbow[side], pivot[side]), upperScale[side]));
             }
-            double[] Fit(double[] p, char side) => Matrix.Add(pivot[side], Matrix.Scale(Matrix.Subtract(p, pivot[side]), scale[side]));
+            bool IsUpper(string part) => part == "UpperArm" || part == "Clavicle";
+            double SegmentScale(char side, string part) => IsUpper(part) ? upperScale[side] : foreScale[side];
+            // A point carried by a part of the arm (the upper arm, or the forearm and everything past it).
+            double[] Fit(double[] p, char side, string part) => IsUpper(part)
+                ? Matrix.Add(pivot[side], Matrix.Scale(Matrix.Subtract(p, pivot[side]), upperScale[side]))
+                : Matrix.Add(fittedElbow[side], Matrix.Scale(Matrix.Subtract(p, elbow[side]), foreScale[side]));
 
-            // R6 arms are one block, rigid on the hand in the playermodel. A hand-rigid block swings across the screen when the
-            // viewmodel turns the hand, so in first person the block is jointed like Valve's arms instead: the upper arm down to
-            // the elbow, the forearm down to the wrist, the hand past it, blending over a short stretch at each joint. The block
-            // only has vertices at its ends, so its triangles are sliced along the arm (see Slice) to bend there; blending it
-            // from shoulder to hand in one piece made it curve like a noodle.
+            // R6 arms are one block (see Straight).
             var wholeArm = new Dictionary<int, char>();
             var wholeSides = new HashSet<char>();
             int Bone(char side, string name) => bones.FindIndex(b => b.Name == Prefix + side + "_" + name);
@@ -362,47 +330,25 @@ namespace Rbx2Source.Export
                 {
                     wholeSides.Add(side);
                     wholeArm[Bone(side, "Hand")] = side;
+                    wholeArm[Bone(side, "UpperArm")] = side;
+                    wholeArm[Bone(side, "Forearm")] = side;
                 }
             List<KeyValuePair<int, double>> RigLinks(int position) =>
                 Links(position, scene.Rig, boneOf).Where(l => l.Key != spine && map.ContainsKey(l.Key)).ToList();
-            // The R6 side whose block a vertex belongs to (its weight on that side's hand, apart from the tiny anchor weight
-            // that keeps a finger or helper bone in the skeleton), or null.
+            // The R6 side whose block a vertex belongs to (its main weight is on that side's upper arm or hand, the bones the block
+            // blends between), or null.
             char? WholeSide(List<KeyValuePair<int, double>> links)
             {
                 KeyValuePair<int, double> main = links.OrderByDescending(l => l.Value).FirstOrDefault();
-                return main.Value >= 0.9 && wholeArm.TryGetValue(main.Key, out char found) ? found : (char?)null;
+                return wholeArm.TryGetValue(main.Key, out char found) ? found : (char?)null;
             }
-            // The arm of an R6 block, measured from the shoulder joint towards the wrist (unfitted Source space).
-            (double[] Shoulder, double[] Axis, double Elbow, double Wrist) BlockArm(char side)
+            // The direction an R6 block runs, from the shoulder joint to the wrist (unfitted Source space).
+            double[] BlockAxis(char side)
             {
-                double[] shoulder = bones[Bone(side, "UpperArm")].Position;
-                double[] axis = Matrix.Subtract(bones[Bone(side, "Hand")].Position, shoulder);
-                double length = Math.Max(Matrix.Length(axis), 1e-6);
-                axis = Matrix.Scale(axis, 1 / length);
-                return (shoulder, axis, Matrix.Dot(Matrix.Subtract(bones[Bone(side, "Forearm")].Position, shoulder), axis), length);
+                double[] axis = Matrix.Subtract(bones[Bone(side, "Hand")].Position, pivot[side]);
+                return Matrix.Scale(axis, 1 / Math.Max(Matrix.Length(axis), 1e-6));
             }
-            List<KeyValuePair<int, double>> Jointed(double[] p, char side)
-            {
-                var arm = BlockArm(side);
-                double along = Matrix.Dot(Matrix.Subtract(p, arm.Shoulder), arm.Axis), blend = BlockJointBlend * arm.Wrist;
-                double Step(double x)
-                {
-                    double t = Math.Max(0, Math.Min(1, x));
-                    return t * t * (3 - 2 * t);
-                }
-                double pastElbow = Step((along - arm.Elbow + blend) / (2 * blend)), pastWrist = Step((along - arm.Wrist + blend) / (2 * blend));
-                var links = new List<KeyValuePair<int, double>>();
-                foreach (var share in new[] { (Bone(side, "UpperArm"), 1 - pastElbow), (Bone(side, "Forearm"), pastElbow - pastWrist), (Bone(side, "Hand"), pastWrist) })
-                    if (share.Item2 > 1e-4)
-                        links.Add(new KeyValuePair<int, double>(share.Item1, share.Item2));
-                return links;
-            }
-            List<KeyValuePair<int, double>> ArmLinks(int position)
-            {
-                var links = RigLinks(position);
-                char? side = WholeSide(links);
-                return side.HasValue ? Jointed(ToSource(scene.Point(model.Positions[position]), units), side.Value) : links;
-            }
+            List<KeyValuePair<int, double>> ArmLinks(int position) => RigLinks(position);
 
             // Roblox arms are much thicker for their length than Valve's (a blocky arm is half as wide as it is long), so a
             // uniformly fitted arm fills the bottom of the first-person view. Across the arm, each side is instead scaled to
@@ -437,7 +383,9 @@ namespace Rbx2Source.Export
                 if (part == "UpperArm" || part == "Forearm")
                     radii[side].Add(Matrix.Length(Across(ToSource(scene.Point(model.Positions[position]), units), side, part)));
             }
-            var thin = new Dictionary<char, double>();
+            // Per side, the scale across the arm that brings it to Valve's thickness (no thinner than each segment's own scale).
+            var thinTarget = new Dictionary<char, double>();
+            double Thin(char side, string part) => Math.Min(SegmentScale(side, part), thinTarget[side]);
             foreach (char side in new[] { 'L', 'R' })
             {
                 double[] Valve(string bone) => valve.Find(Prefix + side + "_" + bone).WorldPosition;
@@ -446,7 +394,7 @@ namespace Rbx2Source.Export
                 double radius = sorted.Count > 0 ? sorted[Math.Min(sorted.Count - 1, (int)(sorted.Count * 0.9))] : 0;
                 // An R6 block keeps more of its bulk: measured at its corners, Valve's radius would leave a thin stick.
                 double target = (wholeSides.Contains(side) ? BlockArmRadius : ArmRadius) * valveLength;
-                thin[side] = radius > 1e-6 ? Math.Min(scale[side], target / radius) : scale[side];
+                thinTarget[side] = radius > 1e-6 ? target / radius : double.MaxValue;
             }
             // Fitted to Valve's length, then thinned across the upper arm or forearm axis (hands and fingers use the forearm's).
             // Roblox hands reach much further past the wrist than Valve's (13-19 units once fitted, against about 7), so the
@@ -461,7 +409,7 @@ namespace Rbx2Source.Export
                 double[] axis = Matrix.Subtract(Ours("Hand"), Ours("Forearm"));
                 double axisLength = Matrix.Length(axis);
                 forearmAxis[side] = axisLength > 1e-6 ? Matrix.Scale(axis, 1 / axisLength) : new double[] { 0, 0, -1 };
-                wrist[side] = Fit(Ours("Hand"), side);
+                wrist[side] = Fit(Ours("Hand"), side, "Hand");
 
                 double[] valveHand = valve.Find(Prefix + side + "_Hand").WorldPosition;
                 double[] valveAxis = Matrix.Subtract(valveHand, valve.Find(Prefix + side + "_Forearm").WorldPosition);
@@ -478,7 +426,7 @@ namespace Rbx2Source.Export
                         continue;
                     string part = PartOf(links.OrderByDescending(l => l.Value).First().Key, out char linkSide);
                     if (linkSide == side && part != null && (part == "Hand" || part.StartsWith("Finger", StringComparison.Ordinal)))
-                        reaches.Add(Matrix.Dot(Matrix.Subtract(Fit(ToSource(scene.Point(model.Positions[position]), units), side), wrist[side]), forearmAxis[side]));
+                        reaches.Add(Matrix.Dot(Matrix.Subtract(Fit(ToSource(scene.Point(model.Positions[position]), units), side, "Hand"), wrist[side]), forearmAxis[side]));
                 }
                 // The 95th percentile, so a held item or stray vertex doesn't decide the hand's length.
                 List<double> sorted = reaches.OrderBy(r => r).ToList();
@@ -502,28 +450,60 @@ namespace Rbx2Source.Export
             double[] Shape(double[] p, List<KeyValuePair<int, double>> links)
             {
                 PartOf(links.OrderByDescending(l => l.Value).First().Key, out char side);
-                double[] result = Fit(p, side);
                 double total = links.Sum(l => l.Value);
+                // Each bone's fit, blended by its weight (so the elbow stays smooth where the two segments' scales meet).
+                double[] result = new double[3];
+                foreach (var link in links)
+                {
+                    string part = PartOf(link.Key, out char linkSide) ?? "UpperArm";
+                    result = Matrix.Add(result, Matrix.Scale(Fit(p, linkSide, part), link.Value / total));
+                }
                 foreach (var link in links)
                 {
                     string part = PartOf(link.Key, out char linkSide);
                     if (part == null || part == "Clavicle")
                         continue;
                     double[] across = Across(p, linkSide, part == "UpperArm" ? "UpperArm" : "Forearm");
-                    result = Matrix.Add(result, Matrix.Scale(across, (thin[linkSide] - scale[linkSide]) * link.Value / total));
+                    result = Matrix.Add(result, Matrix.Scale(across, (Thin(linkSide, part) - SegmentScale(linkSide, part)) * link.Value / total));
                 }
                 double past = Matrix.Dot(Matrix.Subtract(result, wrist[side]), forearmAxis[side]);
                 if (past > 0)
                     result = Matrix.Subtract(result, Matrix.Scale(forearmAxis[side], past * (1 - shorten[side])));
-                // An R6 block also reaches about half its width above the shoulder joint (10 units once fitted, nearly a
-                // whole Valve upper arm), which rises in front of the first-person camera. It is flattened to the arm's radius.
-                if (wholeSides.Contains(side))
-                {
-                    double behind = -Matrix.Dot(Matrix.Subtract(result, pivot[side]), upperAxis[side]);
-                    if (behind > shoulderCap[side])
-                        result = Matrix.Add(result, Matrix.Scale(upperAxis[side], behind - shoulderCap[side]));
-                }
+                // Roblox's blocky arms overlap at the elbow, the upper arm block reaching about half a forearm past the joint.
+                // With the elbow bent in first person, that overlap stuck out past the elbow as a long block. The upper arm is
+                // cut back to about the forearm's thickness past the elbow (the forearm reaches back over the joint, so no gap
+                // opens), in proportion to how much the vertex follows the upper arm.
+                double upperShare = links.Where(l => IsUpper(PartOf(l.Key, out _) ?? "")).Sum(l => l.Value) / total;
+                double beyondElbow = Matrix.Dot(Matrix.Subtract(result, fittedElbow[side]), upperAxis[side]);
+                if (upperShare > 0 && beyondElbow > shoulderCap[side])
+                    result = Matrix.Subtract(result, Matrix.Scale(upperAxis[side], (beyondElbow - shoulderCap[side]) * upperShare));
                 return result;
+            }
+
+            // An R6 arm is one rigid block in first person too: laid straight along the forearm, its end just past the wrist and
+            // the rest running back off screen, at about Valve's thickness and with no elbow.
+            var blockEnds = new Dictionary<char, (double Start, double End)>();
+            foreach (char side in wholeSides)
+            {
+                BodyPart arm = side == 'L' ? BodyPart.LeftLowerArm : BodyPart.RightLowerArm;
+                double[] shoulder = pivot[side], axis = BlockAxis(side);
+                var along = model.Triangles.Where(t => scene.Rig.Parts.TryGetValue(t.Group, out BodyPart part) && part == arm).SelectMany(t => t.Corners)
+                    .Select(c => Matrix.Dot(Matrix.Subtract(ToSource(scene.Point(model.Positions[c.Position]), units), shoulder), axis)).ToList();
+                blockEnds[side] = along.Count > 0 ? (along.Min(), along.Max()) : (0, 1);
+            }
+            double[] Straight(double[] p, char side)
+            {
+                double[] axis = BlockAxis(side), offset = Matrix.Subtract(p, pivot[side]);
+                double along = Matrix.Dot(offset, axis);
+                double[] across = Matrix.Subtract(offset, Matrix.Scale(axis, along));
+                double[] forearm = Matrix.Subtract(wrist[side], fittedElbow[side]);
+                double forearmLength = Math.Max(Matrix.Length(forearm), 1e-6);
+                forearm = Matrix.Scale(forearm, 1 / forearmLength);
+                across = Matrix.Subtract(across, Matrix.Scale(forearm, Matrix.Dot(across, forearm)));
+                var (start, end) = blockEnds[side];
+                double[] tip = Matrix.Add(wrist[side], Matrix.Scale(forearm, BlockPastWrist));
+                double back = (end - along) / Math.Max(end - start, 1e-6) * BlockLength * forearmLength;
+                return Matrix.Add(Matrix.Subtract(tip, Matrix.Scale(forearm, back)), Matrix.Scale(across, Thin(side, "Forearm")));
             }
 
             var arms = new List<Bone>();
@@ -534,61 +514,36 @@ namespace Rbx2Source.Export
                 while (parent >= 0 && !map.ContainsKey(parent))
                     parent = bones[parent].Parent;
                 Match match = armBone.Match(b.Name);
-                double[] position = match.Success && match.Groups[2].Value != "Clavicle" ? Fit(b.Position, match.Groups[1].Value[0]) : b.Position;
+                double[] position = match.Success && match.Groups[2].Value != "Clavicle" ? Fit(b.Position, match.Groups[1].Value[0], match.Groups[2].Value) : b.Position;
                 arms.Add(new Bone { Name = b.Name, Parent = parent >= 0 ? map[parent] : -1, Position = position, Rotation = b.Rotation });
             }
 
             var text = new StringBuilder(Nodes(arms)).Append(Skeleton(arms.Select(b => Local(b, arms)).ToList())).Append("triangles\n");
-            // Slices across an R6 arm: every 5% of its length, and closer together through the blend at the elbow and wrist.
-            List<double> BlockCuts(char side)
-            {
-                var arm = BlockArm(side);
-                double blend = BlockJointBlend * arm.Wrist;
-                var cuts = new List<double>();
-                for (int k = -10; k <= 30; k++)
-                    cuts.Add(k * arm.Wrist / 20);
-                foreach (double joint in new[] { arm.Elbow, arm.Wrist })
-                    for (int k = -2; k <= 2; k++)
-                        cuts.Add(joint + k * blend / 2);
-                return cuts.Distinct().OrderBy(d => d).ToList();
-            }
             foreach (ObjTriangle triangle in model.Triangles.Where(include))
             {
                 cancellation.ThrowIfCancellationRequested();
                 var rigLinks = triangle.Corners.Select(c => RigLinks(c.Position)).ToList();
                 if (rigLinks.Any(links => links.Sum(l => l.Value) < 0.5))
                     continue;
-                var corners = triangle.Corners.Select(corner =>
+                char? block = rigLinks.Select(WholeSide).Distinct().Count() == 1 ? WholeSide(rigLinks[0]) : null;
+                triangles++;
+                text.Append(materials[triangle.Material]).Append('\n');
+                for (int c = 0; c < 3; c++)
                 {
+                    ObjCorner corner = triangle.Corners[c];
+                    double[] point = ToSource(scene.Point(model.Positions[corner.Position]), units);
                     double[] n = DirectionToSource(ExportScene.Direction(model.Normals[corner.Normal]));
                     double length = Matrix.Length(n);
+                    n = length > 0 ? Matrix.Scale(n, 1 / length) : new double[] { 0, 0, 1 };
                     float[] uv = corner.Texture >= 0 ? model.Texcoords[corner.Texture] : new float[2];
-                    return new ArmCorner
-                    {
-                        Point = ToSource(scene.Point(model.Positions[corner.Position]), units),
-                        Normal = length > 0 ? Matrix.Scale(n, 1 / length) : new double[] { 0, 0, 1 }, U = uv[0], V = uv[1]
-                    };
-                }).ToArray();
-                // An R6 block's triangle is sliced along the arm, and each piece is weighted by where its corners lie.
-                char? block = rigLinks.Select(WholeSide).Distinct().Count() == 1 ? WholeSide(rigLinks[0]) : null;
-                List<ArmCorner[]> pieces = block.HasValue
-                    ? Slice(corners, BlockArm(block.Value).Shoulder, BlockArm(block.Value).Axis, BlockCuts(block.Value))
-                    : new List<ArmCorner[]> { corners };
-                foreach (ArmCorner[] piece in pieces)
-                {
-                    triangles++;
-                    text.Append(materials[triangle.Material]).Append('\n');
-                    for (int c = 0; c < 3; c++)
-                    {
-                        var links = block.HasValue ? Jointed(piece[c].Point, block.Value) : rigLinks[c];
-                        double total = links.Sum(l => l.Value);
-                        double[] p = Shape(piece[c].Point, links);
-                        text.Append(map[links[0].Key]).Append(' ').Append(V(p)).Append(' ').Append(V(piece[c].Normal)).Append(' ')
-                            .Append(F(piece[c].U)).Append(' ').Append(F(piece[c].V)).Append(' ').Append(links.Count);
-                        foreach (var link in links)
-                            text.Append(' ').Append(map[link.Key]).Append(' ').Append(F(link.Value / total));
-                        text.Append('\n');
-                    }
+                    var links = block.HasValue ? new List<KeyValuePair<int, double>> { new KeyValuePair<int, double>(Bone(block.Value, "Forearm"), 1) } : rigLinks[c];
+                    double total = links.Sum(l => l.Value);
+                    double[] p = block.HasValue ? Straight(point, block.Value) : Shape(point, links);
+                    text.Append(map[links[0].Key]).Append(' ').Append(V(p)).Append(' ').Append(V(n)).Append(' ')
+                        .Append(F(uv[0])).Append(' ').Append(F(uv[1])).Append(' ').Append(links.Count);
+                    foreach (var link in links)
+                        text.Append(' ').Append(map[link.Key]).Append(' ').Append(F(link.Value / total));
+                    text.Append('\n');
                 }
             }
             return triangles > 0 ? text.Append("end\n").ToString() : null;
@@ -616,7 +571,7 @@ namespace Rbx2Source.Export
         }
 
         // Source models here have no flex animation, so the mood (the "Default" face) is applied to the mesh.
-        private static void BakeDefaultExpression(WavefrontModel model, FaceShapes face)
+        internal static void BakeDefaultExpression(WavefrontModel model, FaceShapes face)
         {
             FaceShape mood = face?.Shapes.FirstOrDefault(s => s.Name == FaceShapeBuilder.MoodShapeName && s.Weight > 0);
             if (mood == null)
@@ -915,7 +870,8 @@ namespace Rbx2Source.Export
         }
 
         private static string Qc(string modelName, string materialDir, List<Bone> bones, AvatarRig rig, ValvePlayer valve, bool player,
-            ExportScene scene, double units, List<string> flexes = null, bool hasGear = false, bool garrysMod = true)
+            ExportScene scene, double units, List<string> flexes = null, bool hasGear = false, bool garrysMod = true,
+            IReadOnlyList<(string Name, string File)> accessories = null)
         {
             var qc = new StringBuilder();
             qc.Append("// Generated by RoPorter\n");
@@ -940,6 +896,15 @@ namespace Rbx2Source.Export
             // Held gear: an optional part, hidden by default.
             if (hasGear)
                 qc.Append("$bodygroup \"gear\"\n{\n\tblank\n\tstudio \"gear.smd\"\n}\n");
+            // Each worn accessory: its own part, shown by default, with a blank option that hides it.
+            foreach (var (name, file) in accessories ?? new List<(string, string)>())
+            {
+                // The QC is written as ASCII, so curly quotes become straight ones and anything else non-ASCII is dropped.
+                string label = Regex.Replace(name.Replace('‘', '\'').Replace('’', '\'').Replace('“', ' ').Replace('”', ' '),
+                    "[\"\\\\\\r\\n]|[^\\u0020-\\u007e]", " ").Trim();
+                qc.Append("$bodygroup \"").Append(label.Length > 0 ? label : "Accessory")
+                    .Append("\"\n{\n\tstudio \"").Append(file).Append("\"\n\tblank\n}\n");
+            }
             qc.Append("$cdmaterials \"").Append(materialDir).Append("\"\n");
             qc.Append("$surfaceprop \"").Append(rig != null ? "flesh" : "plastic").Append("\"\n");
             qc.Append("$contents \"solid\"\n");
@@ -1044,8 +1009,12 @@ namespace Rbx2Source.Export
                 {
                     string mode = material.Texture != null && textures != null && textures.TryGetValue(material.Name, out string path)
                         ? GltfWriter.AlphaMode(Full(path)) : "BLEND";
-                    vmt.Append(mode == "MASK" ? "\t\"$alphatest\" \"1\"\n" : "\t\"$translucent\" \"1\"\n");
+                    // A see-through part (its material's opacity, such as a glass hat) stays see-through even when its texture's
+                    // own alpha is only on or off.
+                    vmt.Append(mode == "MASK" && material.Opacity >= 0.99f ? "\t\"$alphatest\" \"1\"\n" : "\t\"$translucent\" \"1\"\n");
                 }
+                if (material.Opacity < 0.99f)
+                    vmt.Append("\t\"$alpha\" \"").Append(F(material.Opacity)).Append("\"\n");
                 // Back faces are drawn only for DoubleSided accessories, as in Roblox: outline effects are inside-out shells
                 // whose front faces must stay hidden.
                 if (material.DoubleSided)

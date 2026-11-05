@@ -83,6 +83,7 @@ namespace Rbx2Source.Export
         }.Concat(new[] { "Left", "Right" }.SelectMany(side => Fingers.SelectMany(finger => Phalanges.Select(p => side + finger + p)))).ToArray();
 
         private static readonly int[] Parents = BuildParents();
+        public static int[] ParentIndices => (int[])Parents.Clone();
 
         private static int[] BuildParents()
         {
@@ -176,9 +177,9 @@ namespace Rbx2Source.Export
         // Accessories (from the avatar API) let rigid items follow their real attachment bone and mark layered clothing.
         // connectJoints blends the body's weights across its joints (see ConnectJoints).
         public static AvatarRig Build(WavefrontModel model, IReadOnlyList<AccessoryInfo> accessories, CancellationToken cancellation = default,
-            bool connectJoints = false)
+            bool connectJoints = false, IReadOnlyDictionary<BodyPart, string> r6Attachments = null)
         {
-            var rig = new AvatarRig { accessories = accessories, connectJoints = connectJoints };
+            var rig = new AvatarRig { accessories = accessories, connectJoints = connectJoints, r6Attachments = r6Attachments };
             var groupBounds = new Dictionary<string, PartBounds>(StringComparer.Ordinal);
             var groupPositions = new Dictionary<string, HashSet<int>>(StringComparer.Ordinal);
             var positionGroup = new Dictionary<int, string>();
@@ -588,8 +589,8 @@ namespace Rbx2Source.Export
                     position[LeftFoot + offset] = Nearest(foot, position[LeftLowerLeg + offset]);
                 }
 
-                // R6 limbs are one block (found as the middle part). Their joints go along the block, and its vertices are
-                // split between the limb's three bones at them (see WholeLimbBone), so the limb bends at the elbow or knee.
+                // R6 limbs are one block (found as the middle part). Their joints go along the block, but it doesn't bend: it is rigid on
+                // the limb's upper bone (see WholeLimbBone).
                 if (upperArm == null && hand == null && lowerArm != null)
                 {
                     double top = lowerArm.Max[1], bottom = lowerArm.Min[1];
@@ -988,7 +989,8 @@ namespace Rbx2Source.Export
                 foreach (int index in groupPositions[pair.Key])
                 {
                     Joints[index] = new[] { WholeLimbBone(pair.Value, model.Positions[index][1]), 0, 0, 0 };
-                    Weights[index] = new[] { 1f, 0, 0, 0 };                }
+                    Weights[index] = new[] { 1f, 0, 0, 0 };
+                }
                 samples[pair.Key] = SampleSurface(model, pair.Key, 0.03 * height);
                 foreach (double[] p in samples[pair.Key])
                 {
@@ -1204,7 +1206,7 @@ namespace Rbx2Source.Export
         private readonly HashSet<BodyPart> wholeLimbs = new HashSet<BodyPart>();
         public bool IsWholeLimb(BodyPart part) => wholeLimbs.Contains(part);
 
-        // The bone an accessory welded to a body part follows. An R6 limb is one block, rigid on its end bone, so anything
+        // The bone an accessory welded to a body part follows. An R6 limb is one block, rigid on its upper bone, so anything
         // attached anywhere on it (gloves at the shoulder or grip attachment, say) follows that same bone.
         private int AccessoryBone(BodyPart part)
         {
@@ -1212,20 +1214,38 @@ namespace Rbx2Source.Export
             {
                 if (wholeLimbs.Contains(Part(side + "LowerArm")) &&
                     (part == Part(side + "UpperArm") || part == Part(side + "LowerArm") || part == Part(side + "Hand")))
-                    return PartBone[Part(side + "Hand")];
+                    return WholeLimbBone(Part(side + "LowerArm"), 0);
                 if (wholeLimbs.Contains(Part(side + "LowerLeg")) &&
                     (part == Part(side + "UpperLeg") || part == Part(side + "LowerLeg") || part == Part(side + "Foot")))
-                    return PartBone[Part(side + "Foot")];
+                    return WholeLimbBone(Part(side + "LowerLeg"), 0);
             }
-            return PartBone[part];
+            return WholeLimbBone(part, 0);
         }
 
-        // The bone a body part's point follows: its part's bone, except that a whole-limb (R6) block is rigid on the limb's end
-        // bone: arms on the hands, legs on the feet.
+        // The bone a body part's point follows: its part's bone, except that a whole-limb (R6) block doesn't bend: it is rigid on
+        // the limb's upper bone and pivots at the shoulder or hip, as in Roblox.
         private int WholeLimbBone(BodyPart part, double y)
         {
-            int bone = PartBone[part];
-            return wholeLimbs.Contains(part) ? bone + 1 : bone;
+            if (wholeLimbs.Contains(part))
+                switch (part)
+                {
+                    case BodyPart.LeftLowerArm: return Attached(part, PartBone[BodyPart.LeftUpperArm]);
+                    case BodyPart.RightLowerArm: return Attached(part, PartBone[BodyPart.RightUpperArm]);
+                    case BodyPart.LeftLowerLeg: return Attached(part, PartBone[BodyPart.LeftUpperLeg]);
+                    case BodyPart.RightLowerLeg: return Attached(part, PartBone[BodyPart.RightUpperLeg]);
+                }
+            return Attached(part, PartBone[part]);
+        }
+
+        // The bone chosen for an R6 avatar's body part (the app's R6 body parts window; keyed by LowerArm, LowerLeg, Head and
+        // UpperTorso, since an R6 limb is found as its middle part), or the usual one. R15 avatars ignore it.
+        private IReadOnlyDictionary<BodyPart, string> r6Attachments;
+        private int Attached(BodyPart part, int usual)
+        {
+            if (wholeLimbs.Count == 0 || r6Attachments == null || !r6Attachments.TryGetValue(part, out string name))
+                return usual;
+            int bone = Array.IndexOf(BoneNames, name);
+            return bone >= 0 ? bone : usual;
         }
 
         // Items that came down with the raised right arm: the gear, and anything worn on that arm.
@@ -1465,7 +1485,9 @@ namespace Rbx2Source.Export
         private Dictionary<int, double> VolumeInfluence(float[] p, double height, HashSet<int> allowed)
         {
             double softness = 0.02 * height;
-            var metrics = volumes.Where(pair => allowed.Contains(pair.Key))
+            // An R6 part attached far along its limb can leave no body part among the bones near an item: any part will do then.
+            bool near = volumes.Keys.Any(allowed.Contains);
+            var metrics = volumes.Where(pair => !near || allowed.Contains(pair.Key))
                 .ToDictionary(pair => pair.Key, pair => VolumeMetric(p, pair.Value, softness));
             double nearest = metrics.Values.Min();
             return KeepConnected(metrics.Where(pair => pair.Value <= nearest + 4 * softness)

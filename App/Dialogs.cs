@@ -11,8 +11,8 @@ namespace Rbx2Source
     {
         public static Task Show(Window owner, string message, string title = "RoPorter") => Ask(owner, message, title, false);
 
-        // Returns whether Yes was chosen.
-        public static async Task<bool> Ask(Window owner, string message, string title = "RoPorter", bool question = true)
+        // Returns whether Yes was chosen. Details (such as release notes) go in a scrolling box under the message.
+        public static async Task<bool> Ask(Window owner, string message, string title = "RoPorter", bool question = true, string details = null)
         {
             var dialog = new Window
             {
@@ -29,11 +29,15 @@ namespace Rbx2Source
                 no.Click += (sender, args) => dialog.Close(false);
                 buttons.Children.Add(no);
             }
-            dialog.Content = new StackPanel
-            {
-                Margin = new Thickness(20), Spacing = 16,
-                Children = { new SelectableTextBlock { Text = message, TextWrapping = TextWrapping.Wrap }, buttons }
-            };
+            var content = new StackPanel { Margin = new Thickness(20), Spacing = 16 };
+            content.Children.Add(new SelectableTextBlock { Text = message, TextWrapping = TextWrapping.Wrap });
+            if (!string.IsNullOrWhiteSpace(details))
+                content.Children.Add(new TextBox
+                {
+                    Text = details.Trim(), IsReadOnly = true, TextWrapping = TextWrapping.Wrap, AcceptsReturn = true, Width = 500, Height = 220
+                });
+            content.Children.Add(buttons);
+            dialog.Content = content;
             return await dialog.ShowDialog<bool>(owner);
         }
     }
