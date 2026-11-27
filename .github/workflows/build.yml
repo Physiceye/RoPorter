@@ -13,8 +13,15 @@ jobs:
     - uses: actions/setup-dotnet@v4
       with:
         dotnet-version: '10.0.x'
+    # The test project (and its Roblox test files) is kept out of the repository; build only when it's absent.
     - name: Test exports
-      run: dotnet test Tests/Rbx2Source.Tests.csproj --configuration Release
+      shell: pwsh
+      run: |
+        if (Test-Path Tests/Rbx2Source.Tests.csproj) {
+          dotnet test Tests/Rbx2Source.Tests.csproj --configuration Release
+        } else {
+          dotnet build Rbx2Source.csproj --configuration Release
+        }
 
   publish:
     strategy:

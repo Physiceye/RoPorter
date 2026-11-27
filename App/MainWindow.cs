@@ -25,25 +25,40 @@ namespace Rbx2Source
 {
     // RoPorter's window: the Export page (what to export, where, in which format, and its log) and the Settings page, with
     // Discord, GitHub and bug-report links along the bottom. Runs on Windows, Linux and macOS.
-    public sealed class MainWindow : Window
+    public sealed partial class MainWindow : Window
     {
         public const string DefaultApiBase = "https://api.physiceye.com";
         // Source 2 (ExportFormat.Source2, icon "source2.png") is left out of the list for now.
         private static readonly ExportFormat[] Formats = { ExportFormat.Glb, ExportFormat.Gltf, ExportFormat.Fbx, ExportFormat.GarrysMod, ExportFormat.SourceFilmmaker,
-            ExportFormat.TowerUnite, ExportFormat.Deadlock };
-        private static readonly string[] FormatNames = { "GLB", "glTF", "FBX", "Garry's Mod", "Source Filmmaker", "Tower Unite", "Deadlock" };
+            ExportFormat.TowerUnite, ExportFormat.Deadlock, ExportFormat.Left4Dead2, ExportFormat.TeamFortress2 };
+        private static readonly string[] FormatNames = { "GLB", "glTF", "FBX", "Garry's Mod", "Source Filmmaker", "Tower Unite", "Deadlock", "Left 4 Dead 2", "Team Fortress 2" };
         // Model files share one icon; each game has its Steam icon.
-        private static readonly string[] FormatIcons = { "mesh_icon.png", "mesh_icon.png", "mesh_icon.png", "gmod.tga", "sfm.tga", "towerunite.tga", "deadlock.tga" };
-        private const string FolderSetting = "folder", DarkModeSetting = "darkmode", CacheSetting = "cache", CloudKeySetting = "cloudkey", HeroSetting = "deadlockhero";
-        private static readonly string[] SettingNames = { FolderSetting, DarkModeSetting, "singletexture", "vrchat", "facetracking", "connectjoints", "discord", "mood", "ownfolder",
-            CacheSetting, CloudKeySetting, HeroSetting, "r6leftarm", "r6rightarm", "r6leftleg", "r6rightleg", "r6torso", "r6head" };
-        private static readonly Dictionary<string, string> Saved = SettingsStore.Load(SettingNames, FolderSetting);
+        private static readonly string[] FormatIcons = { "mesh_icon.png", "mesh_icon.png", "mesh_icon.png", "gmod.tga", "sfm.tga", "towerunite.tga", "deadlock.tga", "l4d2.tga", "TF2.tga" };
+        private const string FolderSetting = "folder", DarkModeSetting = "darkmode", CacheSetting = "cache", CloudKeySetting = "cloudkey", HeroSetting = "deadlockhero",
+            SurvivorSetting = "l4d2survivor", ClassSetting = "tf2class";
+        private static readonly string[] SettingNames = new[] { FolderSetting, DarkModeSetting, "singletexture", "vrchat", "facetracking", "connectjoints", "discord", "mood", "ownfolder",
+            CacheSetting, CloudKeySetting, HeroSetting, SurvivorSetting, ClassSetting, "r6leftarm", "r6rightarm", "r6leftleg", "r6rightleg", "r6torso", "r6head", ShareLikesSetting }
+            .Concat(Formats.Select(FolderSettingFor)).Distinct().ToArray();
+
+        // The output folder is remembered per format: FBX, GLB and glTF share the "folder" setting, and each game has its own
+        // ("folder_garrysmod", ...), which starts as that shared folder until a different one is chosen or exported to.
+        private static string FolderSettingFor(ExportFormat format) =>
+            format == ExportFormat.Glb || format == ExportFormat.Gltf || format == ExportFormat.Fbx
+                ? FolderSetting : FolderSetting + "_" + format.ToString().ToLowerInvariant();
+        private static readonly Dictionary<string, string> Saved = LoadSettings();
+
+        private static Dictionary<string, string> LoadSettings()
+        {
+            SettingsStore.Secrets.Add(CloudKeySetting);
+            return SettingsStore.Load(SettingNames, FolderSetting);
+        }
 
         // The buttons in the bottom right, from the repository (Data/links.json) so they can change without a new release:
-        // { "1": { "text": "...", "url": "https://..." }, "2": ... }, in key order. The last copy downloaded is kept beside the
-        // settings and shown until (or if) a new one arrives.
+        // { "1": { "text": "...", "url": "https://..." }, "2": ... }, in key order. It is downloaded at every start and never
+        // saved on the user's PC; offline, there are no buttons.
         private const string LinksUrl = "https://raw.githubusercontent.com/Physiceye/RoPorter/refs/heads/main/Data/links.json";
-        private static readonly string LinksCache = Path.Combine(Export.ContentCache.DataFolder, "links.json");
+        // Where versions up to 2.1.2 saved a copy of links.json; deleted at start.
+        private static readonly string OldLinksCache = Path.Combine(Export.ContentCache.DataFolder, "links.json");
         private readonly StackPanel links = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
         private const string CloudKeysPage = "https://create.roblox.com/dashboard/credentials?activeTab=ApiKeysTab";
         // The steps behind the "How to set up a key" button: the permissions RoPorter's direct requests use.
@@ -58,20 +73,37 @@ namespace Rbx2Source
 
         // Export types: 0 Avatar (a user), 1 Catalog Item, 2 Bundle (exported like an avatar wearing it), 3 Model (a .rbxm or
         // .rbxmx file, exported like a catalog item), 4 Place (a .rbxl or .rbxlx file; a map in Garry's Mod).
-        private const int ModelType = 3, PlaceType = 4;
-        private static readonly string[] TypeNames = { "Avatar", "Catalog Item", "Bundle", "Model", "Place" };
-        private static readonly string[] TypeIcons = { "Humanoid_icon", "Accoutrement_icon", "Player_icon", "Model_icon", "Workspace_icon" };
+        private const int BundleType = 2, ModelType = 3, PlaceType = 4, MeshType = 5, OutfitType = 6;
+        private static readonly string[] TypeNames = { "Avatar", "Catalog Item", "Bundle", "Model", "Place", "Mesh", "Outfit" };
+        private static readonly string[] TypeIcons = { "Humanoid_icon", "Accoutrement_icon", "Player_icon", "Model_icon", "Workspace_icon", "mesh_icon", "Starterpack_icon" };
 
         private readonly ComboBox exportType = new ComboBox { HorizontalAlignment = HorizontalAlignment.Stretch, HorizontalContentAlignment = HorizontalAlignment.Left };
         private readonly ComboBox exportFormat = new ComboBox { Width = 185 };
         private readonly Button r6PartsButton = new Button { Content = "R6 Configuration", IsVisible = false };
         // The Deadlock hero the avatar replaces, listed from the game the first time Deadlock is chosen.
         private readonly ComboBox deadlockHero = new ComboBox { Width = 170, IsVisible = false, PlaceholderText = "Hero to replace" };
-        private List<DeadlockHero> heroes;
+        private List<DeadlockHero> heroes; 
+        // The Left 4 Dead 2 survivor the avatar (and its first-person arms) replaces.
+        private readonly ComboBox l4d2Survivor = new ComboBox
+        {
+            Width = 170, IsVisible = false, PlaceholderText = "Survivor to replace",
+            ItemsSource = L4d2Survivor.All.Select(survivor => survivor.Name).ToList()
+        };
+        // The Team Fortress 2 class the avatar (and its first-person arms) replaces.
+        private readonly ComboBox tf2Class = new ComboBox
+        {
+            Width = 170, IsVisible = false, PlaceholderText = "Class to replace",
+            ItemsSource = Tf2Class.All.Select(playerClass => playerClass.Name).ToList()
+        };
         private readonly TextBox input = new TextBox();
         private readonly TextBlock inputLabel = new TextBlock { Text = "User ID:", VerticalAlignment = VerticalAlignment.Center };
         private readonly Button openModel = new Button { Content = "Open...", IsVisible = false, Margin = new Thickness(6, 0, 0, 0) };
+        // The Mesh type's texture: an image asset ID put on the mesh (optional; without one the mesh is plain grey).
+        private readonly TextBlock textureLabel = new TextBlock { Text = "Texture ID:", VerticalAlignment = VerticalAlignment.Center, IsVisible = false, Margin = new Thickness(8, 0, 6, 0) };
+        private readonly TextBox textureInput = new TextBox { Width = 160, IsVisible = false, PlaceholderText = "optional" };
         private readonly TextBox outputFolder = new TextBox { Text = LoadOutputFolder() };
+        // Optional: replaces the username or item name in the export's folder, files and in-game name.
+        private readonly TextBox exportName = new TextBox { PlaceholderText = "Optional", MaxLength = 64 };
         private readonly Button browse = new Button { Content = "Browse..." };
         private readonly Slider scale = new Slider { Minimum = 10, Maximum = 100, Value = 80, Width = 220, SmallChange = 1, LargeChange = 10, VerticalAlignment = VerticalAlignment.Center };
         private readonly TextBlock scaleValue = new TextBlock { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(6, 0, 0, 0) };
@@ -106,6 +138,11 @@ namespace Rbx2Source
         private readonly CheckBox applyMood = new CheckBox { Content = "Apply mood expression", IsChecked = true };
         // Each export in its own folder (on by default); off collects many exports in the output folder itself.
         private readonly CheckBox ownFolder = new CheckBox { Content = "Export into its own folder", IsChecked = true };
+        // The avatar's own first-person hands in Garry's Mod, Left 4 Dead 2 and Team Fortress 2 (on by default); off keeps the
+        // game's (Garry's Mod's citizen hands, or the survivor's or class's own arms).
+        private readonly CheckBox firstPersonHands = new CheckBox { Content = "Export first-person hands", IsChecked = true };
+        // Garry's Mod avatars and bundles also as friendly and hostile NPCs (off by default: it compiles a second model).
+        private readonly CheckBox gmodNpcs = new CheckBox { Content = "Make Garry's Mod NPCs" };
         private readonly CheckBox cacheContent = new CheckBox { Content = "Keep downloaded files", IsChecked = true };
         private readonly TextBlock cacheSize = new TextBlock();
         private readonly TextBox cloudKey = new TextBox { PasswordChar = '•', Width = 340, HorizontalAlignment = HorizontalAlignment.Left };
@@ -116,7 +153,7 @@ namespace Rbx2Source
         private readonly WrapPanel libraryCards = new WrapPanel { Orientation = Orientation.Horizontal };
         private readonly ComboBox libraryFilter = new ComboBox { Width = 160 };
         private readonly TextBlock libraryInfo = new TextBlock { VerticalAlignment = VerticalAlignment.Center };
-        private static readonly string[] LibraryFilters = { "All", "Avatars", "Catalog items", "Bundles", "Models", "Places" };
+        private static readonly string[] LibraryFilters = { "All", "Avatars", "Catalog items", "Bundles", "Models", "Places", "Outfits" };
         private Control libraryPage;
         private readonly Control exportPage, settingsPage;
 
@@ -139,15 +176,27 @@ namespace Rbx2Source
         // The last message from the API that was logged, so looking up several IDs in a row doesn't repeat it.
         private string lastApiMessage;
 
-        private bool IsBundle => exportType.SelectedIndex == 2;
+        // Bundles and saved outfits both export as Roblox's render of an outfit, with its items as the assets.
+        private bool IsBundle => exportType.SelectedIndex == BundleType || IsOutfit;
+        private bool IsOutfit => exportType.SelectedIndex == OutfitType;
         private bool IsModel => exportType.SelectedIndex == ModelType;
         private bool IsPlace => exportType.SelectedIndex == PlaceType;
         private bool IsFile => IsModel || IsPlace;
-        private bool IsAvatarLike => exportType.SelectedIndex == 0 || exportType.SelectedIndex == 2;
+        private bool IsMesh => exportType.SelectedIndex == MeshType;
+        private bool IsAvatarLike => exportType.SelectedIndex == 0 || IsBundle;
         private bool IsDeadlock => Formats[Math.Max(0, exportFormat.SelectedIndex)] == ExportFormat.Deadlock;
-        // Deadlock replaces a hero, so it takes avatars and bundles only.
-        private bool TypeAllowed(int type) => !IsDeadlock || type == 0 || type == 2;
-        private static int InputSlot(int type) => type == ModelType || type == PlaceType ? type : 0;
+        private bool IsL4d2 => Formats[Math.Max(0, exportFormat.SelectedIndex)] == ExportFormat.Left4Dead2;
+        private bool IsTf2 => Formats[Math.Max(0, exportFormat.SelectedIndex)] == ExportFormat.TeamFortress2;
+        // Deadlock replaces a hero and Left 4 Dead 2 a survivor, so they take avatars and bundles only; Team Fortress 2 replaces a
+        // class with those, and builds maps from places.
+        // Which export types each format takes: Deadlock replaces a hero, so only avatars and bundles; every other format takes
+        // anything (an avatar or bundle replaces a Left 4 Dead 2 survivor or Team Fortress 2 class, anything else becomes a map
+        // prop there, and a place a Team Fortress 2 map), except places in Left 4 Dead 2, which has no map export.
+        private static bool Supported(int type, ExportFormat format) =>
+            format == ExportFormat.Deadlock ? type == 0 || type == BundleType || type == OutfitType : !(format == ExportFormat.Left4Dead2 && type == PlaceType);
+        private bool TypeAllowed(int type) => Supported(type, Formats[Math.Max(0, exportFormat.SelectedIndex)]);
+        private bool FormatAllowed(int format) => Supported(Math.Max(0, exportType.SelectedIndex), Formats[format]);
+        private static int InputSlot(int type) => type == ModelType || type == PlaceType || type == MeshType ? type : 0;
 
         public MainWindow()
         {
@@ -171,10 +220,12 @@ namespace Rbx2Source
             exportFormat.ItemTemplate = new FuncDataTemplate<int>((i, scope) => IconText(formatBitmaps[i], FormatNames[i]));
             exportFormat.SelectionBoxItemTemplate = exportFormat.ItemTemplate;
             exportFormat.ItemsSource = Enumerable.Range(0, FormatNames.Length).ToList();
+            exportFormat.ContainerPrepared += (sender, args) => args.Container.IsEnabled = FormatAllowed(args.Index);
             exportFormat.SelectedIndex = 0;
             SetTab(exportTab, "Configuration_icon.png", "Export");
             SetTab(settingsTab, "Starterpack_icon.png", "Settings");
             SetTab(libraryTab, "Workspace_icon.png", "Library");
+            SetTab(shareTab, "Player_icon.png", "Community");
             preview.Source = brokenPreview;
             previewFrame.Child = preview;
             scaleRow.Children.Add(new TextBlock { Text = "Scale:", VerticalAlignment = VerticalAlignment.Center });
@@ -186,14 +237,17 @@ namespace Rbx2Source
             settingsPage.IsVisible = false;
             libraryPage = BuildLibraryPage();
             libraryPage.IsVisible = false;
+            sharePage = BuildSharePage();
+            sharePage.IsVisible = false;
 
             var tabs = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2, Margin = new Thickness(12, 8, 12, 0) };
             tabs.Children.Add(exportTab);
             tabs.Children.Add(settingsTab);
             tabs.Children.Add(libraryTab);
+            tabs.Children.Add(shareTab);
             var bottom = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto"), Margin = new Thickness(12, 0, 12, 10) };
             bottom.Children.Add(new TextBlock { Text = "v" + typeof(MainWindow).Assembly.GetName().Version.ToString(3), VerticalAlignment = VerticalAlignment.Center });
-            ShowLinks(ReadCachedLinks());
+            DeleteOldLinksCache();
             Grid.SetColumn(links, 1);
             bottom.Children.Add(links);
             var root = new DockPanel();
@@ -201,21 +255,29 @@ namespace Rbx2Source
             DockPanel.SetDock(bottom, Dock.Bottom);
             root.Children.Add(tabs);
             root.Children.Add(bottom);
-            root.Children.Add(new Panel { Children = { exportPage, settingsPage, libraryPage } });
+            root.Children.Add(new Panel { Children = { exportPage, settingsPage, libraryPage, sharePage } });
             Content = root;
 
             exportTab.Click += (sender, args) => ShowPage(ExportPageIndex);
             settingsTab.Click += async (sender, args) =>
             {
                 ShowPage(SettingsPageIndex);
-                await UpdateCacheSizeAsync();
+                await Guarded(UpdateCacheSizeAsync);
             };
             libraryTab.Click += async (sender, args) =>
             {
                 ShowPage(LibraryPageIndex);
-                await RefreshLibraryAsync();
+                await Guarded(RefreshLibraryAsync);
+            };
+            // The shared list loads the first time the tab is opened; Refresh loads it again.
+            shareTab.Click += async (sender, args) =>
+            {
+                ShowPage(SharePageIndex);
+                if (shareCards.Children.Count == 0 && !shareLoading)
+                    await Guarded(() => RefreshSharesAsync(false));
             };
             WireExportPage();
+            WireMeshPreview();
             BindSetting(darkMode, DarkModeSetting);
             darkMode.IsCheckedChanged += (sender, args) => ApplyTheme();
             ApplyTheme();
@@ -224,7 +286,7 @@ namespace Rbx2Source
             Opened += async (sender, args) =>
             {
                 ShowPresence("Browsing", null);
-                await Task.WhenAll(UpdateLinksAsync(), CheckForUpdatesAsync());
+                await Guarded(() => Task.WhenAll(UpdateLinksAsync(), CheckForUpdatesAsync()));
             };
             Closing += (sender, args) =>
             {
@@ -240,7 +302,23 @@ namespace Rbx2Source
                 discord.Dispose();
                 previewTimer.Stop();
                 previewCancellation?.Cancel();
+                ownedPreview?.Dispose();
+                foreach (Bitmap old in libraryPictures)
+                    old.Dispose();
             };
+        }
+
+        // Runs background work started from an event handler; an unexpected failure is logged instead of closing the app.
+        private async Task Guarded(Func<Task> work)
+        {
+            try
+            {
+                await work();
+            }
+            catch (Exception error)
+            {
+                AppendLog("Something went wrong: " + error.Message);
+            }
         }
 
         private Grid BuildExportPage()
@@ -248,7 +326,7 @@ namespace Rbx2Source
             var layout = new Grid
             {
                 Margin = new Thickness(12), ColumnDefinitions = new ColumnDefinitions("Auto,*,Auto"),
-                RowDefinitions = new RowDefinitions("Auto,Auto,Auto,Auto,Auto,Auto,*"), RowSpacing = 6, ColumnSpacing = 8
+                RowDefinitions = new RowDefinitions("Auto,Auto,Auto,Auto,Auto,Auto,Auto,*"), RowSpacing = 6, ColumnSpacing = 8
             };
             void Place(Control control, int row, int column, int columnSpan = 1)
             {
@@ -260,27 +338,41 @@ namespace Rbx2Source
             Place(new TextBlock { Text = "Export:", VerticalAlignment = VerticalAlignment.Center }, 0, 0);
             Place(exportType, 0, 1);
             Place(inputLabel, 1, 0);
-            var inputRow = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto") };
+            var inputRow = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto,Auto,Auto") };
             inputRow.Children.Add(input);
             Grid.SetColumn(openModel, 1);
             inputRow.Children.Add(openModel);
+            Grid.SetColumn(textureLabel, 2);
+            inputRow.Children.Add(textureLabel);
+            Grid.SetColumn(textureInput, 3);
+            inputRow.Children.Add(textureInput);
             Place(inputRow, 1, 1);
-            Place(new TextBlock { Text = "Output folder:", VerticalAlignment = VerticalAlignment.Center }, 2, 0);
-            Place(outputFolder, 2, 1);
-            Place(browse, 3, 0);
-            Place(scaleRow, 3, 1);
-            Place(new TextBlock { Text = "Export format:", VerticalAlignment = VerticalAlignment.Bottom }, 4, 0);
-            Grid.SetRowSpan(previewFrame, 5);
+            Place(new TextBlock { Text = "Export name:", VerticalAlignment = VerticalAlignment.Center }, 2, 0);
+            Place(exportName, 2, 1);
+            Place(new TextBlock { Text = "Output folder:", VerticalAlignment = VerticalAlignment.Center }, 3, 0);
+            Place(outputFolder, 3, 1);
+            Place(browse, 4, 0);
+            Place(scaleRow, 4, 1);
+            Place(new TextBlock { Text = "Export format:", VerticalAlignment = VerticalAlignment.Bottom }, 5, 0);
+            Grid.SetRowSpan(previewFrame, 6);
             Place(previewFrame, 0, 2);
             var actions = new WrapPanel { Orientation = Orientation.Horizontal };
-            foreach (Control control in new Control[] { exportFormat, deadlockHero, export, upload, cancel, openFolder, r6PartsButton })
+            foreach (Control control in new Control[] { exportFormat, deadlockHero, l4d2Survivor, tf2Class, export, upload, cancel, openFolder, r6PartsButton })
             {
                 control.Margin = new Thickness(0, 0, 6, 0);
                 actions.Children.Add(control);
             }
-            Place(actions, 5, 0, 3);
-            Place(log, 6, 0, 3);
+            // Share sits at the far right of the row, apart from the export buttons.
+            var actionRow = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto") };
+            actionRow.Children.Add(actions);
+            share.VerticalAlignment = VerticalAlignment.Bottom;
+            Grid.SetColumn(share, 1);
+            actionRow.Children.Add(share);
+            Place(actionRow, 6, 0, 3);
+            Place(log, 7, 0, 3);
 
+            ToolTip.SetTip(exportName, "A name for the export instead of the username or item name, so several exports of one account don't replace each other.\n" +
+                "Letters, digits and underscores are kept; anything else becomes an underscore.");
             ToolTip.SetTip(openModel, "Choose a model (.rbxm, .rbxmx) or place (.rbxl, .rbxlx) saved from Roblox Studio. You can also drop one on the window.");
             ToolTip.SetTip(scale, "Scales the exported model down. 1 is full size, 0.8 is the default and 0.1 is the smallest.");
             ToolTip.SetTip(upload, "Packs the exported Garry's Mod addon and uploads it to the Steam Workshop. Steam must be running.");
@@ -307,7 +399,7 @@ namespace Rbx2Source
             };
 
             page.Children.Add(Heading("Export options"));
-            foreach (CheckBox box in new[] { singleTexture, vrchatShapes, faceTracking, connectJoints, applyMood, ownFolder })
+            foreach (CheckBox box in new[] { singleTexture, vrchatShapes, faceTracking, connectJoints, applyMood, ownFolder, firstPersonHands, gmodNpcs })
                 page.Children.Add(box);
             BindSetting(singleTexture, "singletexture");
             BindSetting(vrchatShapes, "vrchat");
@@ -315,15 +407,26 @@ namespace Rbx2Source
             BindSetting(connectJoints, "connectjoints");
             BindSetting(applyMood, "mood");
             BindSetting(ownFolder, "ownfolder");
-            ToolTip.SetTip(singleTexture, "Merges every material into one material and one texture.");
-            ToolTip.SetTip(vrchatShapes, "Adds VRChat visemes.");
-            ToolTip.SetTip(faceTracking, "Adds Unified Expressions face shapes for VRCFaceTracking.");
+            BindSetting(firstPersonHands, "firstpersonhands");
+            ToolTip.SetTip(firstPersonHands, "Garry's Mod, Left 4 Dead 2 and Team Fortress 2: makes first-person hands (viewmodel arms) from the avatar's arms.\n" +
+                "Off, the game's own are kept: Garry's Mod's citizen hands, or the replaced survivor's or class's arms.");
+            BindSetting(gmodNpcs, "gmodnpcs");
+            ToolTip.SetTip(gmodNpcs, "Garry's Mod avatars and bundles: also adds the avatar as a friendly and a hostile NPC (a citizen with " +
+                "Half-Life 2's citizen animations), in the spawn menu's NPC tab under RoPorter.");
+            ToolTip.SetTip(singleTexture, "Merges every material into one material and one texture.\n" +
+                "Deadlock exports and Tower Unite avatars always use one texture; Garry's Mod and Team Fortress 2 maps don't use this option.");
+            ToolTip.SetTip(vrchatShapes, "Adds VRChat visemes. Avatars, bundles and outfits in GLB, glTF and FBX.");
+            ToolTip.SetTip(faceTracking, "Adds Unified Expressions face shapes for VRCFaceTracking. Avatars, bundles and outfits in GLB, glTF and FBX.");
             ToolTip.SetTip(connectJoints, "Blends the body's weights across its joints so the surface stretches when they bend, instead of each " +
-                "part moving on its own. For UGC bundles modelled as one connected body; R6 avatars stay blocky. " +
+                "part moving on its own, and lets accessories worn on the torso (coats, sashes, skirts) bend at the waist with it. " +
+                "For UGC bundles modelled as one connected body; R6 avatars stay blocky. " +
                 "Deadlock always puts the arms and legs on the hero's joints so its animations work; this option only chooses " +
                 "whether the surface stretches across the joints or the parts stay separate blocks.");
             ToolTip.SetTip(applyMood, "Gives the face the avatar's equipped Mood (its resting expression, e.g. a smile). " +
                 "Off, the face is neutral; GLB, glTF and FBX keep the mood as a \"Default\" shape key you can turn on.");
+            // Options greyed out for the chosen type and format (see UpdateFaceOptions) still explain themselves when hovered.
+            foreach (CheckBox box in new[] { singleTexture, vrchatShapes, faceTracking, connectJoints, applyMood, firstPersonHands, gmodNpcs })
+                ToolTip.SetShowOnDisabled(box, true);
             ToolTip.SetTip(ownFolder, "Each export gets a folder named after the avatar or item. Off, exports go straight into the output folder, " +
                 "so many can be collected in one.\nGarry's Mod: they become one addon. If the output folder is Garry's Mod's addons folder, that addon is addons/RoPorter.");
 
@@ -336,7 +439,7 @@ namespace Rbx2Source
             var openCache = new Button { Content = "Open cache folder" };
             var clearCache = new Button { Content = "Clear cache" };
             page.Children.Add(new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, Children = { openCache, clearCache } });
-            ToolTip.SetTip(cacheContent, "Keeps downloaded meshes, textures and models in the rbx_cache folder next to RoPorter, so exporting them " +
+            ToolTip.SetTip(cacheContent, "Keeps downloaded meshes, textures and models in the rbx_cache folder in your local app data, so exporting them " +
                 "again does not download them again.\nAvatars, thumbnails and item lists are always downloaded fresh. Clear the cache to get items whose creators have updated them.");
             openCache.Click += async (sender, args) =>
             {
@@ -389,7 +492,8 @@ namespace Rbx2Source
         {
             exportType.SelectionChanged += (sender, args) =>
             {
-                inputLabel.Text = exportType.SelectedIndex == 0 ? "User ID:" : IsBundle ? "Bundle ID:" : IsModel ? "Model file:" : IsPlace ? "Place file:" : "Item ID:";
+                inputLabel.Text = exportType.SelectedIndex == 0 ? "User ID:" : IsOutfit ? "Outfit ID:" : IsBundle ? "Bundle ID:" : IsModel ? "Model file:" : IsPlace ? "Place file:"
+                    : IsMesh ? "Mesh ID:" : "Item ID:";
                 // The ID box holds the file's path for the Model and Place types.
                 if (InputSlot(shownType) != InputSlot(exportType.SelectedIndex))
                 {
@@ -398,6 +502,15 @@ namespace Rbx2Source
                 }
                 shownType = exportType.SelectedIndex;
                 openModel.IsVisible = IsFile;
+                textureLabel.IsVisible = textureInput.IsVisible = IsMesh;
+                l4d2Survivor.IsVisible = IsL4d2 && IsAvatarLike;
+                tf2Class.IsVisible = IsTf2 && IsAvatarLike;
+                // Formats this type can't go to are greyed out, as types are for the chosen format; the format falls back to GLB.
+                for (int format = 0; format < FormatNames.Length; format++)
+                    if (exportFormat.ContainerFromIndex(format) is Control option)
+                        option.IsEnabled = FormatAllowed(format);
+                if (!FormatAllowed(exportFormat.SelectedIndex))
+                    exportFormat.SelectedIndex = 0;
                 UpdateFaceOptions(false);
                 UpdateScale(false);
                 SchedulePreview();
@@ -408,6 +521,26 @@ namespace Rbx2Source
                 if (!IsFile && args.Text != null && args.Text.Any(c => !char.IsDigit(c)))
                     args.Handled = true;
             }, RoutingStrategies.Tunnel);
+            // The texture ID is digits only too; pasted text (an rbxassetid:// link, say) keeps just its digits.
+            textureInput.AddHandler(TextInputEvent, (sender, args) =>
+            {
+                if (args.Text != null && args.Text.Any(c => !char.IsDigit(c)))
+                    args.Handled = true;
+            }, RoutingStrategies.Tunnel);
+            textureInput.TextChanged += (sender, args) =>
+            {
+                string text = textureInput.Text ?? "";
+                string digits = new string(text.Where(char.IsDigit).Take(19).ToArray());
+                if (digits != text)
+                {
+                    textureInput.Text = digits;
+                    textureInput.CaretIndex = digits.Length;
+                    return;
+                }
+                // The mesh preview is drawn with the texture, so a new texture ID redraws it.
+                if (IsMesh)
+                    SchedulePreview();
+            };
             input.TextChanged += (sender, args) =>
             {
                 string text = input.Text ?? "";
@@ -444,19 +577,36 @@ namespace Rbx2Source
             scaleValue.Text = (scale.Value / 100.0).ToString("0.00", CultureInfo.CurrentCulture);
             exportFormat.SelectionChanged += async (sender, args) =>
             {
+                ShowFormatFolder();
                 UpdateFaceOptions(false);
                 UpdateUpload();
                 deadlockHero.IsVisible = IsDeadlock;
-                // Deadlock mods don't go on the Workshop; the hero list takes the button's place in the row.
-                upload.IsVisible = !deadlockHero.IsVisible;
+                l4d2Survivor.IsVisible = IsL4d2 && IsAvatarLike;
+                tf2Class.IsVisible = IsTf2 && IsAvatarLike;
+                // Deadlock, Left 4 Dead 2 and Team Fortress 2 mods don't go on the Workshop; the hero, survivor or class list takes the button's place.
+                upload.IsVisible = !IsDeadlock && !IsL4d2 && !IsTf2;
                 UpdateScale(false);
                 for (int type = 0; type < TypeNames.Length; type++)
                     if (exportType.ContainerFromIndex(type) is Control item)
                         item.IsEnabled = TypeAllowed(type);
-                if (IsDeadlock && !IsAvatarLike)
+                if (!TypeAllowed(exportType.SelectedIndex))
                     exportType.SelectedIndex = 0;
                 if (deadlockHero.IsVisible)
                     await LoadHeroesAsync();
+            };
+            if (Saved.TryGetValue(SurvivorSetting, out string savedSurvivor))
+                l4d2Survivor.SelectedIndex = L4d2Survivor.All.ToList().FindIndex(survivor => survivor.Key == savedSurvivor);
+            l4d2Survivor.SelectionChanged += (sender, args) =>
+            {
+                if (l4d2Survivor.SelectedIndex >= 0)
+                    SaveSetting(SurvivorSetting, L4d2Survivor.All[l4d2Survivor.SelectedIndex].Key);
+            };
+            if (Saved.TryGetValue(ClassSetting, out string savedClass))
+                tf2Class.SelectedIndex = Tf2Class.All.ToList().FindIndex(playerClass => playerClass.Key == savedClass);
+            tf2Class.SelectionChanged += (sender, args) =>
+            {
+                if (tf2Class.SelectedIndex >= 0)
+                    SaveSetting(ClassSetting, Tf2Class.All[tf2Class.SelectedIndex].Key);
             };
             deadlockHero.SelectionChanged += (sender, args) =>
             {
@@ -538,15 +688,15 @@ namespace Rbx2Source
             return result;
         }
 
-        private static List<KeyValuePair<string, string>> ReadCachedLinks()
+        private static void DeleteOldLinksCache()
         {
             try
             {
-                return File.Exists(LinksCache) ? ParseLinks(File.ReadAllText(LinksCache)) : new List<KeyValuePair<string, string>>();
+                if (File.Exists(OldLinksCache))
+                    File.Delete(OldLinksCache);
             }
             catch (Exception error) when (error is IOException || error is UnauthorizedAccessException)
             {
-                return new List<KeyValuePair<string, string>>();
             }
         }
 
@@ -557,41 +707,28 @@ namespace Rbx2Source
                 links.Children.Add(LinkButton(entry.Key, entry.Value, "Opens " + entry.Value));
         }
 
-        // Downloads the current links.json; the buttons change only if it holds at least one usable link, and it is kept for
-        // the next start.
+        // Downloads the current links.json; the buttons show only if it holds at least one usable link.
         private async Task UpdateLinksAsync()
         {
             try
             {
-                string json;
-                using (var client = new HttpClient { Timeout = TimeSpan.FromSeconds(15) })
-                {
-                    client.DefaultRequestHeaders.UserAgent.ParseAdd("RoPorter/" + RobloxModelDownloader.AppVersion);
-                    json = await client.GetStringAsync(LinksUrl);
-                }
+                string json = await GetTextAsync(LinksUrl, "RoPorter/" + RobloxModelDownloader.AppVersion);
                 var entries = ParseLinks(json);
                 if (entries.Count == 0)
                     return;
                 ShowLinks(entries);
-                try
-                {
-                    File.WriteAllText(LinksCache, json);
-                }
-                catch (Exception error) when (error is IOException || error is UnauthorizedAccessException)
-                {
-                }
             }
             catch (Exception error) when (error is HttpRequestException || error is TaskCanceledException)
             {
-                // Offline or GitHub unreachable: the buttons from the last start stay.
+                // Offline or GitHub unreachable: no buttons.
             }
         }
 
-        private const int ExportPageIndex = 0, SettingsPageIndex = 1, LibraryPageIndex = 2;
+        private const int ExportPageIndex = 0, SettingsPageIndex = 1, LibraryPageIndex = 2, SharePageIndex = 3;
 
         private void ShowPage(int page)
         {
-            var pages = new[] { (exportPage, exportTab), (settingsPage, settingsTab), (libraryPage, libraryTab) };
+            var pages = new[] { (exportPage, exportTab), (settingsPage, settingsTab), (libraryPage, libraryTab), (sharePage, shareTab) };
             for (int i = 0; i < pages.Length; i++)
             {
                 pages[i].Item1.IsVisible = i == page;
@@ -606,7 +743,7 @@ namespace Rbx2Source
             foreach (string filter in LibraryFilters)
                 libraryFilter.Items.Add(new ComboBoxItem { Content = filter });
             libraryFilter.SelectedIndex = 0;
-            libraryFilter.SelectionChanged += async (sender, args) => await RefreshLibraryAsync();
+            libraryFilter.SelectionChanged += async (sender, args) => await Guarded(RefreshLibraryAsync);
             var refresh = new Button { Content = "Refresh" };
             refresh.Click += async (sender, args) => await RefreshLibraryAsync();
             var open = new Button { Content = "Open folder" };
@@ -615,8 +752,6 @@ namespace Rbx2Source
                 if (Directory.Exists(outputFolder.Text))
                     await OpenAsync(outputFolder.Text);
             };
-            ToolTip.SetTip(refresh, "Looks through the output folder again.");
-            ToolTip.SetTip(open, "Opens the output folder.");
             var bar = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Margin = new Thickness(12, 12, 12, 6) };
             bar.Children.Add(new TextBlock { Text = "Show:", VerticalAlignment = VerticalAlignment.Center });
             bar.Children.Add(libraryFilter);
@@ -630,19 +765,29 @@ namespace Rbx2Source
             return page;
         }
 
-        // Lists the exports in the output folder (read off the UI thread; a folder of Garry's Mod addons can be large).
+        // Lists the exports in every format's output folder (read off the UI thread; a folder of Garry's Mod addons can be large).
+        // An export found through two folders (one inside the other) is listed once.
         private async Task RefreshLibraryAsync()
         {
-            string folder = outputFolder.Text ?? "";
-            string type = new[] { null, "Avatar", "Catalog Item", "Bundle", "Model", "Place" }[Math.Max(0, libraryFilter.SelectedIndex)];
-            List<ExportLibrary.Entry> entries = await Task.Run(() => ExportLibrary.List(folder));
+            List<string> folders = AllOutputFolders();
+            string folder = folders.Count == 1 ? folders[0] : folders.Count + " output folders";
+            string type = new[] { null, "Avatar", "Catalog Item", "Bundle", "Model", "Place", "Outfit" }[Math.Max(0, libraryFilter.SelectedIndex)];
+            List<ExportLibrary.Entry> entries = await Task.Run(() => folders.SelectMany(ExportLibrary.List)
+                .GroupBy(e => e.File ?? e.Folder ?? "", StringComparer.OrdinalIgnoreCase).Select(g => g.First())
+                .OrderByDescending(e => e.Date).ToList());
             var shown = entries.Where(e => type == null || e.Type == type).ToList();
             libraryCards.Children.Clear();
-            libraryInfo.Text = !Directory.Exists(folder) ? "The output folder doesn't exist yet." : shown.Count == 0 ? "Nothing exported here yet."
+            foreach (Bitmap old in libraryPictures)
+                old.Dispose();
+            libraryPictures.Clear();
+            libraryInfo.Text = !folders.Any(Directory.Exists) ? "The output folder doesn't exist yet." : shown.Count == 0 ? "Nothing exported here yet."
                 : shown.Count + " export" + (shown.Count == 1 ? "" : "s") + " in " + folder;
             foreach (ExportLibrary.Entry entry in shown)
                 libraryCards.Children.Add(LibraryCard(entry));
         }
+
+        // The Library cards' pictures, freed when the cards are rebuilt.
+        private readonly List<Bitmap> libraryPictures = new List<Bitmap>();
 
         private Control LibraryCard(ExportLibrary.Entry entry)
         {
@@ -650,7 +795,7 @@ namespace Rbx2Source
             try
             {
                 if (entry.Picture != null && File.Exists(entry.Picture))
-                    picture = ToBitmap(File.ReadAllBytes(entry.Picture));
+                    libraryPictures.Add(picture = ToBitmap(File.ReadAllBytes(entry.Picture)));
             }
             catch (Exception error) when (error is IOException || error is UnauthorizedAccessException || error is ArgumentException)
             {
@@ -670,7 +815,6 @@ namespace Rbx2Source
             content.Children.Add(new TextBlock { Text = entry.Type + " · " + entry.Format, FontSize = 12, TextTrimming = TextTrimming.CharacterEllipsis });
             content.Children.Add(new TextBlock { Text = entry.Date.ToString("g", CultureInfo.CurrentCulture), FontSize = 12, Opacity = 0.7 });
             var card = new Button { Content = content, Margin = new Thickness(6), Padding = new Thickness(8), VerticalAlignment = VerticalAlignment.Top };
-            ToolTip.SetTip(card, "Opens " + entry.Folder + "\n" + entry.File);
             card.Click += async (sender, args) => await OpenAsync(entry.Folder);
             return card;
         }
@@ -779,7 +923,7 @@ namespace Rbx2Source
             if (folders.Count > 0 && folders[0].TryGetLocalPath() is string path)
             {
                 outputFolder.Text = path;
-                SaveSetting(FolderSetting, path);
+                SaveSetting(FolderSettingFor(Formats[Math.Max(0, exportFormat.SelectedIndex)]), path);
             }
         }
 
@@ -838,27 +982,53 @@ namespace Rbx2Source
                 await PreviewMeshesAsync(file, description, current);
         }
 
+        // A mesh's real look: the mesh downloaded and drawn, with the texture ID's image on it when one is entered (both kept in
+        // the content cache, so exporting it then needs no downloads). Roblox's own mesh thumbnail, shown until then, has no
+        // texture and is often blank. A mesh or texture that can't be downloaded keeps the thumbnail.
+        private async Task PreviewMeshAsync(RobloxModelDownloader downloader, long meshId, CancellationTokenSource current)
+        {
+            long? textureId = long.TryParse((textureInput.Text ?? "").Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out long texture) && texture > 0
+                ? texture : (long?)null;
+            try
+            {
+                CancellationToken token = current.Token;
+                MeshRender mesh = await Task.Run(async () =>
+                {
+                    var textures = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+                    ModelContents contents = ModelFileBuilder.FromMesh(meshId, textureId, "Mesh " + meshId);
+                    WavefrontModel model = await ModelFileBuilder.BuildAsync(contents, (id, cancel) => downloader.DownloadAssetAsync(id, cancel), textures, null, token);
+                    return MeshRender.Prepare(model, textures);
+                });
+                if (current != previewCancellation || mesh == null)
+                    return;
+                // Drawn at Roblox's thumbnail angle; dragging the preview turns it.
+                ShowMeshPreview(mesh, "Mesh " + meshId + (textureId.HasValue ? " with texture " + textureId.Value : ""));
+            }
+            catch (Exception error) when (error is HttpRequestException || error is InvalidDataException || error is NotSupportedException ||
+                error is AssetAccessException || error is IOException || error is ArgumentException || error is IndexOutOfRangeException)
+            {
+                // The thumbnail stays.
+            }
+        }
+
         // A model file's real look: its meshes and textures downloaded (kept in the content cache, so exporting it then needs
         // no downloads) and drawn in place of the boxes. A failure keeps the boxes.
         private async Task PreviewMeshesAsync(string file, string description, CancellationTokenSource current)
         {
             try
             {
-                using (var client = CreateClient())
+                var downloader = new RobloxModelDownloader(Http, DefaultApiBase);
+                CancellationToken token = current.Token;
+                byte[] picture = await Task.Run(async () =>
                 {
-                    var downloader = new RobloxModelDownloader(client, DefaultApiBase);
-                    CancellationToken token = current.Token;
-                    byte[] picture = await Task.Run(async () =>
-                    {
-                        var textures = new Dictionary<string, byte[]>(StringComparer.Ordinal);
-                        ModelContents contents = ModelFileBuilder.Read(File.ReadAllBytes(file));
-                        WavefrontModel model = await ModelFileBuilder.BuildAsync(contents, (id, cancel) => downloader.DownloadAssetAsync(id, cancel), textures, null, token);
-                        using (Picture render = PlaceRender.Render(model, textures, 256))
-                            return render?.Encode(PictureFormat.Png);
-                    }, token);
-                    if (picture != null && current == previewCancellation)
-                        ShowPreview(ToBitmap(picture), description, picture);
-                }
+                    var textures = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+                    ModelContents contents = ModelFileBuilder.Read(File.ReadAllBytes(file));
+                    WavefrontModel model = await ModelFileBuilder.BuildAsync(contents, (id, cancel) => downloader.DownloadAssetAsync(id, cancel), textures, null, token);
+                    using (Picture render = PlaceRender.Render(model, textures, 256))
+                        return render?.Encode(PictureFormat.Png);
+                }, token);
+                if (picture != null && current == previewCancellation)
+                    ShowPreview(ToBitmap(picture), description, picture);
             }
             catch (Exception error) when (!(error is OutOfMemoryException))
             {
@@ -874,6 +1044,7 @@ namespace Rbx2Source
             if (!value)
                 exportedAddon = null;
             UpdateUpload();
+            UpdateShare();
         }
 
         private void UpdateUpload() =>
@@ -888,12 +1059,21 @@ namespace Rbx2Source
         }
 
         // bytes: the picture's file (PNG or JPEG), kept for the Library when the item is exported.
-        private void ShowPreview(Bitmap image, string description, byte[] bytes = null)
+        // keepMesh: a new drawing of the turnable mesh preview; anything else replaces it.
+        private void ShowPreview(Bitmap image, string description, byte[] bytes = null, bool keepMesh = false)
         {
+            if (!keepMesh)
+                ForgetMeshPreview();
             preview.Source = image ?? brokenPreview;
             previewBytes = image != null ? bytes : null;
             ToolTip.SetTip(previewFrame, description);
+            // Pictures made for one preview are freed when replaced; the app's own icons are shared and kept.
+            if (ownedPreview != null && ownedPreview != image)
+                ownedPreview.Dispose();
+            ownedPreview = image != null && image != brokenPreview && image != partIcon && Array.IndexOf(typeBitmaps, image) < 0 ? image : null;
         }
+
+        private Bitmap ownedPreview;
 
         private byte[] previewBytes;
 
@@ -922,50 +1102,73 @@ namespace Rbx2Source
             }
             try
             {
-                using (var client = CreateClient())
+                var downloader = new RobloxModelDownloader(Http, DefaultApiBase);
+                if (bundle)
                 {
-                    var downloader = new RobloxModelDownloader(client, DefaultApiBase);
-                    if (bundle)
+                    // Bundles and outfits: the details (name and outfit) the export needs, then the picture. A missing picture
+                    // only leaves the broken preview.
+                    long bundleId = long.Parse(text, CultureInfo.InvariantCulture);
+                    bool outfit = IsOutfit;
+                    RobloxModelDownloader.BundleInfo details = outfit ? await downloader.GetOutfitAsync(bundleId, current.Token)
+                        : await downloader.GetBundleAsync(bundleId, current.Token);
+                    Bitmap picture = null;
+                    byte[] pictureBytes = null;
+                    string problem = null;
+                    try
                     {
-                        // Bundles: the details (name and outfit) the export needs, then the catalog picture. A missing picture
-                        // only leaves the broken preview.
-                        long bundleId = long.Parse(text, CultureInfo.InvariantCulture);
-                        RobloxModelDownloader.BundleInfo details = await downloader.GetBundleAsync(bundleId, current.Token);
-                        Bitmap picture = null;
-                        byte[] pictureBytes = null;
-                        string problem = null;
-                        try
-                        {
-                            pictureBytes = await downloader.DownloadBundleThumbnailAsync(bundleId, current.Token);
-                            picture = ToBitmap(pictureBytes);
-                        }
-                        catch (Exception error) when (!(error is OperationCanceledException) && !(error is ApiMessageException))
-                        {
-                            problem = error.Message;
-                        }
-                        if (current != previewCancellation)
-                            return;
-                        ShowPreview(picture, picture != null ? "Bundle " + bundleId : "No picture: " + problem, pictureBytes);
-                        loadedBundle = details;
-                        SetLoaded(true);
-                        Title = "RoPorter - " + details.Name;
-                        loadedName = details.Name;
-                        ShowPresence("Viewing " + details.Name, "Bundle");
-                        return;
+                        pictureBytes = await downloader.DownloadPictureAsync(details, current.Token);
+                        picture = ToBitmap(pictureBytes);
                     }
-                    long id = await downloader.ResolveIdAsync(text, avatar, current.Token);
-                    byte[] bytes = await downloader.DownloadThumbnailAsync(id, avatar, current.Token);
+                    catch (Exception error) when (!(error is OperationCanceledException) && !(error is ApiMessageException))
+                    {
+                        problem = error.Message;
+                    }
                     if (current != previewCancellation)
                         return;
-                    ShowPreview(ToBitmap(bytes), (avatar ? "User " : "Item ") + id, bytes);
+                    ShowPreview(picture, picture != null ? (outfit ? "Outfit " : "Bundle ") + bundleId : "No picture: " + problem, pictureBytes);
+                    loadedBundle = details;
                     SetLoaded(true);
-                    await ShowTitleAsync(downloader, id, avatar, current);
-                    if (avatar)
+                    Title = "RoPorter - " + details.Name;
+                    loadedName = details.Name;
+                    ShowPresence("Viewing " + details.Name, outfit ? "Outfit" : "Bundle");
+                    return;
+                }
+                if (IsMesh)
+                {
+                    // A mesh needs no details to export: its thumbnail is shown when Roblox has one.
+                    long meshId = long.Parse(text, CultureInfo.InvariantCulture);
+                    Bitmap meshPicture = null;
+                    byte[] meshBytes = null;
+                    try
                     {
-                        string rig = await downloader.GetAvatarTypeAsync(id, current.Token);
-                        if (current == previewCancellation)
-                            r6PartsButton.IsVisible = rig == "R6";
+                        meshBytes = await downloader.DownloadThumbnailAsync(meshId, false, current.Token);
+                        meshPicture = ToBitmap(meshBytes);
                     }
+                    catch (Exception error) when (!(error is OperationCanceledException) && !(error is ApiMessageException))
+                    {
+                    }
+                    if (current != previewCancellation)
+                        return;
+                    ShowPreview(meshPicture ?? typeBitmaps[MeshType], "Mesh " + meshId, meshBytes);
+                    SetLoaded(true);
+                    Title = "RoPorter - Mesh " + meshId;
+                    loadedName = "Mesh " + meshId;
+                    ShowPresence("Viewing a mesh", "Mesh");
+                    await PreviewMeshAsync(downloader, meshId, current);
+                    return;
+                }
+                long id = await downloader.ResolveIdAsync(text, avatar, current.Token);
+                byte[] bytes = await downloader.DownloadThumbnailAsync(id, avatar, current.Token);
+                if (current != previewCancellation)
+                    return;
+                ShowPreview(ToBitmap(bytes), (avatar ? "User " : "Item ") + id, bytes);
+                SetLoaded(true);
+                await ShowTitleAsync(downloader, id, avatar, current);
+                if (avatar)
+                {
+                    string rig = await downloader.GetAvatarTypeAsync(id, current.Token);
+                    if (current == previewCancellation)
+                        r6PartsButton.IsVisible = rig == "R6";
                 }
             }
             catch (OperationCanceledException)
@@ -1018,13 +1221,8 @@ namespace Rbx2Source
         {
             try
             {
-                Newtonsoft.Json.Linq.JObject release;
-                using (var client = new HttpClient { Timeout = TimeSpan.FromSeconds(15) })
-                {
-                    client.DefaultRequestHeaders.UserAgent.ParseAdd("RoPorter");
-                    client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
-                    release = Newtonsoft.Json.Linq.JObject.Parse(await client.GetStringAsync(ReleasesApi));
-                }
+                Newtonsoft.Json.Linq.JObject release = Newtonsoft.Json.Linq.JObject.Parse(
+                    await GetTextAsync(ReleasesApi, "RoPorter", "application/vnd.github+json"));
                 string tag = release.Value<string>("tag_name") ?? "";
                 Version current = Normalize(typeof(MainWindow).Assembly.GetName().Version);
                 if (!Version.TryParse(tag.TrimStart('v', 'V'), out Version latest) || Normalize(latest) <= current)
@@ -1074,10 +1272,50 @@ namespace Rbx2Source
             box.IsCheckedChanged += (sender, args) => SaveSetting(name, box.IsChecked == true ? "true" : "false");
         }
 
-        private static string LoadOutputFolder() =>
-            Saved.TryGetValue(FolderSetting, out string folder) && folder.Length > 0
-                ? folder
-                : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Roblox Exports");
+        private static string LoadOutputFolder() => LoadOutputFolder(Formats[0]);
+
+        private static string LoadOutputFolder(ExportFormat format) =>
+            Saved.TryGetValue(FolderSettingFor(format), out string own) && own.Length > 0 ? own
+            : Saved.TryGetValue(FolderSetting, out string shared) && shared.Length > 0 ? shared
+            : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Roblox Exports");
+
+        // The format whose folder the output folder box shows, and folders typed for a format but not yet saved (only a chosen
+        // or exported-to folder is saved), so switching format and back keeps what was typed.
+        private int folderFormat;
+        private readonly Dictionary<string, string> typedFolders = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        // Shows the chosen format's output folder.
+        private void ShowFormatFolder()
+        {
+            int now = Math.Max(0, exportFormat.SelectedIndex);
+            string before = FolderSettingFor(Formats[folderFormat]), after = FolderSettingFor(Formats[now]);
+            folderFormat = now;
+            if (before == after)
+                return;
+            typedFolders[before] = outputFolder.Text ?? "";
+            outputFolder.Text = typedFolders.TryGetValue(after, out string typed) ? typed : LoadOutputFolder(Formats[now]);
+        }
+
+        // Every format's output folder (the Library lists them all), each once.
+        private List<string> AllOutputFolders()
+        {
+            var folders = new List<string>();
+            foreach (string folder in new[] { outputFolder.Text ?? "" }.Concat(Formats.Select(LoadOutputFolder)))
+            {
+                string full;
+                try
+                {
+                    full = Path.GetFullPath(folder.Trim()).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                }
+                catch (Exception error) when (error is ArgumentException || error is NotSupportedException || error is PathTooLongException)
+                {
+                    continue;
+                }
+                if (folder.Trim().Length > 0 && !folders.Contains(full, StringComparer.OrdinalIgnoreCase))
+                    folders.Add(full);
+            }
+            return folders;
+        }
 
         // Shows how much the content cache holds (counted off the UI thread; a big cache has many files).
         private async Task UpdateCacheSizeAsync()
@@ -1087,7 +1325,8 @@ namespace Rbx2Source
                 " file" + (files == 1 ? "" : "s") + " (" + (bytes / 1048576.0).ToString("0.0", CultureInfo.CurrentCulture) + " MB).";
         }
 
-        private static HttpClient CreateClient() => new HttpClient(new HttpClientHandler
+        // One client for the whole run, so connections are reused instead of opened for every preview and export.
+        private static readonly HttpClient Http = new HttpClient(new HttpClientHandler
         {
             AllowAutoRedirect = false,
             UseCookies = false,
@@ -1096,6 +1335,34 @@ namespace Rbx2Source
         {
             Timeout = TimeSpan.FromSeconds(60)
         };
+
+        // A GET with its own headers and a shorter timeout, through the shared client (which follows no redirects).
+        private static async Task<string> GetTextAsync(string url, string userAgent, string accept = null)
+        {
+            using (var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15)))
+            {
+                for (int redirects = 0; ; redirects++)
+                {
+                    using (var request = new HttpRequestMessage(HttpMethod.Get, url))
+                    {
+                        request.Headers.UserAgent.ParseAdd(userAgent);
+                        if (accept != null)
+                            request.Headers.Accept.ParseAdd(accept);
+                        using (HttpResponseMessage response = await Http.SendAsync(request, timeout.Token))
+                        {
+                            int status = (int)response.StatusCode;
+                            if (status >= 300 && status < 400 && response.Headers.Location != null && redirects < 3)
+                            {
+                                url = new Uri(request.RequestUri, response.Headers.Location).AbsoluteUri;
+                                continue;
+                            }
+                            response.EnsureSuccessStatusCode();
+                            return await response.Content.ReadAsStringAsync(timeout.Token);
+                        }
+                    }
+                }
+            }
+        }
 
         private async Task ExportAsync()
         {
@@ -1108,7 +1375,7 @@ namespace Rbx2Source
                 bool avatar = IsAvatarLike;
                 RobloxModelDownloader.BundleInfo bundle = IsBundle ? loadedBundle : null;
                 if (IsBundle && bundle == null)
-                    throw new InvalidDataException("The bundle's details have not loaded yet.");
+                    throw new InvalidDataException("The " + (IsOutfit ? "outfit" : "bundle") + "'s details have not loaded yet.");
                 string selection = input.Text ?? "";
                 ExportFormat format = Formats[exportFormat.SelectedIndex];
                 string hero = format == ExportFormat.Deadlock && deadlockHero.SelectedIndex >= 0 ? heroes[deadlockHero.SelectedIndex].Key : null;
@@ -1116,33 +1383,41 @@ namespace Rbx2Source
                     throw new InvalidDataException("Choose the hero to replace.");
                 if (format == ExportFormat.Deadlock && !avatar)
                     throw new InvalidDataException("Only avatars and bundles can replace a Deadlock hero.");
+                // Avatars and bundles replace a survivor or class; anything else becomes a prop (or a place a map) for the game.
+                string survivor = format == ExportFormat.Left4Dead2 && avatar && l4d2Survivor.SelectedIndex >= 0 ? L4d2Survivor.All[l4d2Survivor.SelectedIndex].Key : null;
+                if (format == ExportFormat.Left4Dead2 && avatar && survivor == null)
+                    throw new InvalidDataException("Choose the survivor to replace.");
+                string playerClass = format == ExportFormat.TeamFortress2 && avatar && tf2Class.SelectedIndex >= 0 ? Tf2Class.All[tf2Class.SelectedIndex].Key : null;
+                if (format == ExportFormat.TeamFortress2 && avatar && playerClass == null)
+                    throw new InvalidDataException("Choose the class to replace.");
                 string folder = Path.GetFullPath(outputFolder.Text ?? "");
-                SaveSetting(FolderSetting, folder);
+                SaveSetting(FolderSettingFor(format), folder);
                 var progress = new Progress<string>(AppendLog);
-                string name = loadedName ?? selection;
+                string customName = string.IsNullOrWhiteSpace(exportName.Text) ? null : exportName.Text.Trim();
+                string name = customName ?? loadedName ?? selection;
                 ShowPresence("Exporting " + name, "To " + FormatNames[exportFormat.SelectedIndex]);
                 bool faces = faceTracking.IsChecked == true, vrchat = vrchatShapes.IsChecked == true, single = singleTexture.IsChecked == true,
-                    joints = connectJoints.IsChecked == true, mood = applyMood.IsChecked == true, own = ownFolder.IsChecked == true;
+                    joints = connectJoints.IsChecked == true, mood = applyMood.IsChecked == true, own = ownFolder.IsChecked == true,
+                    hands = firstPersonHands.IsChecked == true, npcs = gmodNpcs.IsChecked == true;
                 float size = IsPlace ? 1f : (float)Math.Round(scale.Value) / 100f;
-                using (var client = CreateClient())
+                var downloader = new RobloxModelDownloader(Http, DefaultApiBase);
+                string modelFile = IsFile ? Path.GetFullPath(selection.Trim()) : null;
+                long? meshId = IsMesh ? long.Parse(selection.Trim(), CultureInfo.InvariantCulture) : (long?)null;
+                long? textureId = IsMesh && !string.IsNullOrWhiteSpace(textureInput.Text) ? long.Parse(textureInput.Text.Trim(), CultureInfo.InvariantCulture) : (long?)null;
+                long id = modelFile != null ? 0 : meshId ?? bundle?.Id ?? await downloader.ResolveIdAsync(selection, avatar, cancellation.Token);
+                var r6 = R6Attachments();
+                CancellationToken token = cancellation.Token;
+                // Off the UI thread: building and compiling take a while.
+                string path = await Task.Run(() => downloader.ExportAsync(id, avatar, "", folder, progress, token, format,
+                    avatar && faces, vrchat, single, size, avatar && joints, bundle, mood, own, modelFile, r6, hero, customName, survivor, playerClass, hands, avatar && npcs, meshId, textureId));
+                AppendLog("Export complete: " + path);
+                RecordExport(path, downloader.ExportFolder, id, format, name);
+                ShowPresence("Exported " + name, "To " + FormatNames[exportFormat.SelectedIndex]);
+                if (downloader.ExportFolder != null && format == ExportFormat.GarrysMod && Workshop.IsAddon(downloader.ExportFolder) ||
+                    downloader.ExportFolder != null && format == ExportFormat.SourceFilmmaker && SfmWorkshop.IsExport(downloader.ExportFolder))
                 {
-                    var downloader = new RobloxModelDownloader(client, DefaultApiBase);
-                    string modelFile = IsFile ? Path.GetFullPath(selection.Trim()) : null;
-                    long id = modelFile != null ? 0 : bundle?.Id ?? await downloader.ResolveIdAsync(selection, avatar, cancellation.Token);
-                    var r6 = R6Attachments();
-                    CancellationToken token = cancellation.Token;
-                    // Off the UI thread: building and compiling take a while.
-                    string path = await Task.Run(() => downloader.ExportAsync(id, avatar, "", folder, progress, token, format,
-                        avatar && faces, vrchat, single, size, avatar && joints, bundle, mood, own, modelFile, r6, hero));
-                    AppendLog("Export complete: " + path);
-                    RecordExport(path, downloader.ExportFolder, id, format, name);
-                    ShowPresence("Exported " + name, "To " + FormatNames[exportFormat.SelectedIndex]);
-                    if (downloader.ExportFolder != null && format == ExportFormat.GarrysMod && Workshop.IsAddon(downloader.ExportFolder) ||
-                        downloader.ExportFolder != null && format == ExportFormat.SourceFilmmaker && SfmWorkshop.IsExport(downloader.ExportFolder))
-                    {
-                        exportedAddon = downloader.ExportFolder;
-                        exportedFormat = format;
-                    }
+                    exportedAddon = downloader.ExportFolder;
+                    exportedFormat = format;
                 }
             }
             catch (OperationCanceledException)
@@ -1191,11 +1466,12 @@ namespace Rbx2Source
         }
 
         // What each R6 body part can be attached to (the first choice is the default). An R6 limb is one rigid block found as its
-        // middle part, so that part names it. Nothing is applied to R15 avatars.
+        // middle part, so that part names it. Nothing is applied to R15 avatars. Arms default to the shoulder, as in Roblox: games
+        // turn the hand a lot (holding weapons), and a block hung from the wrist then swings out from the body.
         private static readonly (string Label, BodyPart Part, string Setting, (string Text, string Bone)[] Choices)[] R6Parts =
         {
-            ("Left arm", BodyPart.LeftLowerArm, "r6leftarm", new[] { ("Wrist (hand)", "LeftHand"), ("Elbow (forearm)", "LeftLowerArm"), ("Shoulder (upper arm)", "LeftUpperArm") }),
-            ("Right arm", BodyPart.RightLowerArm, "r6rightarm", new[] { ("Wrist (hand)", "RightHand"), ("Elbow (forearm)", "RightLowerArm"), ("Shoulder (upper arm)", "RightUpperArm") }),
+            ("Left arm", BodyPart.LeftLowerArm, "r6leftarm", new[] { ("Shoulder (upper arm)", "LeftUpperArm"), ("Elbow (forearm)", "LeftLowerArm"), ("Wrist (hand)", "LeftHand") }),
+            ("Right arm", BodyPart.RightLowerArm, "r6rightarm", new[] { ("Shoulder (upper arm)", "RightUpperArm"), ("Elbow (forearm)", "RightLowerArm"), ("Wrist (hand)", "RightHand") }),
             ("Left leg", BodyPart.LeftLowerLeg, "r6leftleg", new[] { ("Ankle (foot)", "LeftFoot"), ("Knee (calf)", "LeftLowerLeg"), ("Hip (thigh)", "LeftUpperLeg") }),
             ("Right leg", BodyPart.RightLowerLeg, "r6rightleg", new[] { ("Ankle (foot)", "RightFoot"), ("Knee (calf)", "RightLowerLeg"), ("Hip (thigh)", "RightUpperLeg") }),
             ("Torso", BodyPart.UpperTorso, "r6torso", new[] { ("Spine", "Spine"), ("Chest", "Chest"), ("Upper chest", "UpperChest"), ("Hips", "Hips") }),
@@ -1277,12 +1553,13 @@ namespace Rbx2Source
 
         private void SetBusy(bool busy)
         {
-            foreach (Control control in new Control[] { exportType, exportFormat, deadlockHero, input, openModel, outputFolder, browse, singleTexture, ownFolder, scale })
+            foreach (Control control in new Control[] { exportType, exportFormat, deadlockHero, l4d2Survivor, tf2Class, input, openModel, textureInput, exportName, outputFolder, browse, ownFolder, scale })
                 control.IsEnabled = !busy;
             export.IsEnabled = !busy && loaded;
             UpdateFaceOptions(busy);
             UpdateScale(busy);
             UpdateUpload();
+            UpdateShare();
             cancel.IsEnabled = busy;
         }
 
@@ -1331,19 +1608,28 @@ namespace Rbx2Source
             }
         }
 
-        // Face shape options apply to avatars outside Garry's Mod (Source models get no shape keys).
-        // Face tracking and the VRChat shape keys are independent.
+        // Greys out the export options the chosen type and format don't use. Face shape options apply to avatars outside the
+        // game formats (Source models get no shape keys); face tracking and the VRChat shape keys are independent.
         private void UpdateFaceOptions(bool busy)
         {
             ExportFormat chosen = Formats[Math.Max(0, exportFormat.SelectedIndex)];
             // The game formats bake the face's mood into the mesh instead of keeping shape keys.
             bool avatar = IsAvatarLike && chosen != ExportFormat.GarrysMod && chosen != ExportFormat.SourceFilmmaker &&
-                chosen != ExportFormat.TowerUnite && chosen != ExportFormat.Source2 && chosen != ExportFormat.Deadlock;
+                chosen != ExportFormat.TowerUnite && chosen != ExportFormat.Source2 && chosen != ExportFormat.Deadlock && chosen != ExportFormat.Left4Dead2 &&
+                chosen != ExportFormat.TeamFortress2;
             vrchatShapes.IsEnabled = !busy && avatar;
             faceTracking.IsEnabled = !busy && avatar;
             // Joint blending applies to avatars and bundles in every format.
             connectJoints.IsEnabled = !busy && IsAvatarLike;
             applyMood.IsEnabled = !busy && IsAvatarLike;
+            // Deadlock and Tower Unite avatars always merge into one texture, and Garry's Mod and Team Fortress 2 maps keep
+            // the place's own materials.
+            singleTexture.IsEnabled = !busy && chosen != ExportFormat.Deadlock && !(chosen == ExportFormat.TowerUnite && IsAvatarLike) &&
+                !(IsPlace && (chosen == ExportFormat.GarrysMod || chosen == ExportFormat.TeamFortress2));
+            // First-person hands are made for the games with viewmodel arms; NPCs only for Garry's Mod.
+            firstPersonHands.IsEnabled = !busy && IsAvatarLike && (chosen == ExportFormat.GarrysMod || chosen == ExportFormat.Left4Dead2 ||
+                chosen == ExportFormat.TeamFortress2);
+            gmodNpcs.IsEnabled = !busy && IsAvatarLike && chosen == ExportFormat.GarrysMod;
         }
 
         private void ShowPresence(string details, string state)

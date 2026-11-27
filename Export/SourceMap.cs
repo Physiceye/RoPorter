@@ -11,24 +11,68 @@ using System.Threading.Tasks;
 
 namespace Rbx2Source.Export
 {
-    // Builds a Garry's Mod map from a Roblox place. The place's large blocks and wedges become brushes (solid, lightmapped world
-    // geometry) as far as Source's limits allow; meshes become static props; everything else (small details, spheres,
-    // cylinders, unions, and parts past the brush limit) is merged into static props by area, each part keeping its own
+    // The game a map is built for: its compile tools, the content they mount, and how its maps are named and entered.
+    public sealed class MapGame
+    {
+        public string Name { get; private set; }
+        public string AppId { get; private set; }
+        // The game's tool (vbsp.exe, ...) by name; it may not exist.
+        public Func<string, string> Tool { get; private set; }
+        // Packs and folders the tools mount (highest priority first), and the platform's.
+        public IReadOnlyList<string> Content { get; private set; }
+        public IReadOnlyList<string> Platform { get; private set; }
+        // Map names start with this (it picks the game mode menu or list the map is shown in).
+        public string Prefix { get; private set; }
+        // The game's own sky, for a place whose sky images can't be had.
+        public string Sky { get; private set; }
+        // Team Fortress 2 spawns each team at its own info_player_teamspawn; Garry's Mod uses info_player_start.
+        public bool TeamSpawns { get; private set; }
+        // The map's materials and models packed into the .bsp (with bspzip), so servers send them with the map.
+        public bool Pack { get; private set; }
+        // Garry's Mod's map list picture (maps\thumb) and addon.
+        public bool Addon { get; private set; }
+
+        public static MapGame GarrysMod(GarrysModInstall install)
+        {
+            string Under(string relative) => Path.Combine(install.Folder, relative);
+            return new MapGame
+            {
+                Name = "Garry's Mod", AppId = "4000", Tool = exe => Path.Combine(install.Folder, "bin", exe),
+                Content = new[] { Under(Path.Combine("garrysmod", "garrysmod.vpk")), Under(Path.Combine("sourceengine", "hl2_textures.vpk")),
+                    Under(Path.Combine("sourceengine", "hl2_misc.vpk")), Under("garrysmod"), Under("sourceengine") },
+                Platform = new[] { Under(Path.Combine("platform", "platform_misc.vpk")), Under("platform") },
+                // Garry's Mod lists gm_ maps under Sandbox.
+                Prefix = "gm_", Sky = "painted", Addon = true
+            };
+        }
+
+        public static MapGame TeamFortress2(Tf2Install install) => new MapGame
+        {
+            Name = "Team Fortress 2", AppId = "440", Tool = install.Tool, Content = install.Content.ToList(),
+            Platform = new[] { Path.Combine(install.Folder, "platform", "platform_misc.vpk"), Path.Combine(install.Folder, "platform") },
+            // A map without objectives, to walk around in: Team Fortress 2's community calls these trade_ maps.
+            Prefix = "trade_", Sky = "sky_tf2_04", TeamSpawns = true, Pack = true
+        };
+    }
+
+    // Builds a Garry's Mod or Team Fortress 2 map from a Roblox place. The place's large blocks and wedges become brushes (solid,
+    // lightmapped world geometry) as far as Source's limits allow; meshes become static props; everything else (small details,
+    // spheres, cylinders, unions, and parts past the brush limit) is merged into static props by area, each part keeping its own
     // collision. Terrain becomes displacements. The place's lights, sun, sky and spawn points carry over, a sky shell seals it,
-    // and falling off the world kills, as in Roblox. Garry's Mod's own studiomdl, vbsp, vvis and vrad compile it.
+    // and falling off the world kills, as in Roblox. The game's own studiomdl, vbsp, vvis and vrad compile it.
     public static class SourceMap
     {
-        // Player size, as for avatars: a Roblox character's eyes (about 4.6 studs up) at a Garry's Mod player's (64 units).
+        // Player size, as for avatars: a Roblox character's eyes (about 4.6 studs up) at a Source player's (64 units).
         public const double UnitsPerStud = 14;
 
         // Builds the map in folder (an addon folder: maps\, materials\, models\, with the sources in src\) and returns the
         // map's path in it.
         public static Task<string> ExportAsync(ModelContents contents, Func<long, CancellationToken, Task<byte[]>> download, string folder,
-            string name, float scale, GarrysModInstall install, IProgress<string> progress, CancellationToken cancellation) =>
-            new Builder(contents, download, folder, name, UnitsPerStud * scale, install, progress, cancellation).ExportAsync();
+            string name, float scale, MapGame game, IProgress<string> progress, CancellationToken cancellation) =>
+            new Builder(contents, download, folder, name, UnitsPerStud * scale, game, progress, cancellation).ExportAsync();
 
-        // The map's name in Garry's Mod: gm_ and the place's name (Garry's Mod lists gm_ maps under Sandbox).
-        public static string MapName(string name) => "gm_" + Regex.Replace(name.ToLowerInvariant(), "[^a-z0-9_]", "_");
+        // The place's name as a map name's lowercase letters, digits and underscores.
+        private static string MapId(string name) => Regex.Replace(name.ToLowerInvariant(), "[^a-z0-9_]", "_");
 
         private sealed class Side
         {
@@ -112,7 +156,7 @@ namespace Rbx2Source.Export
             private readonly Func<long, CancellationToken, Task<byte[]>> download;
             private readonly string folder, map, id, materialDir, materialFolder;
             private readonly double units;
-            private readonly GarrysModInstall install;
+            private readonly MapGame game;
             private readonly IProgress<string> progress;
             private readonly CancellationToken cancellation;
             private readonly ModelFileBuilder.MeshCache meshes;
@@ -147,17 +191,17 @@ namespace Rbx2Source.Export
             private bool clipped;
 
             public Builder(ModelContents contents, Func<long, CancellationToken, Task<byte[]>> download, string folder, string name, double units,
-                GarrysModInstall install, IProgress<string> progress, CancellationToken cancellation)
+                MapGame game, IProgress<string> progress, CancellationToken cancellation)
             {
                 this.contents = contents;
                 this.download = download;
                 this.folder = folder;
                 this.units = units;
-                this.install = install;
+                this.game = game;
                 this.progress = progress;
                 this.cancellation = cancellation;
-                map = MapName(name);
-                id = map.Substring(3);
+                id = MapId(name);
+                map = game.Prefix + id;
                 materialDir = "roporter/maps/" + id + "/";
                 materialFolder = Path.Combine(folder, "materials", "roporter", "maps", id);
                 meshes = new ModelFileBuilder.MeshCache(download, progress);
@@ -167,9 +211,9 @@ namespace Rbx2Source.Export
 
             private string Tool(string exe)
             {
-                string path = Path.Combine(install.Folder, "bin", exe);
+                string path = game.Tool(exe);
                 if (!File.Exists(path))
-                    throw new InvalidDataException("Garry's Mod's map compiler is missing (" + path + "). Verify Garry's Mod's files in Steam.");
+                    throw new InvalidDataException(game.Name + "'s map compiler is missing (" + path + "). Verify " + game.Name + "'s files in Steam.");
                 return path;
             }
 
@@ -261,14 +305,14 @@ namespace Rbx2Source.Export
                     string vmf = Path.Combine(src, map + ".vmf");
                     File.WriteAllText(vmf, Vmf(sky), Encoding.ASCII);
                     string bsp = Path.Combine(src, map + ".bsp");
-                    string game = "-game \"" + SourceExporter.ToolPath(folder.TrimEnd('\\', '/')) + "\" ";
+                    string gameArgument = "-game \"" + SourceExporter.ToolPath(folder.TrimEnd('\\', '/')) + "\" ";
                     progress?.Report("Compiling the map (vbsp)...");
                     // No t-junction repair: on a large place it overflows vbsp (a road of many parts merges into one face
                     // with too many edges to fix).
                     string log;
                     // The October 2026 vbsp crashes on loose textures like studiomdl (see HideTextures); vrad reads them fine.
                     using (SourceExporter.HideTextures(folder))
-                        log = Run(vbsp, game + "-notjunc \"" + SourceExporter.ToolPath(vmf) + "\"");
+                        log = Run(vbsp, gameArgument + "-notjunc \"" + SourceExporter.ToolPath(vmf) + "\"");
                     File.WriteAllText(Path.Combine(src, "vbsp.log"), log);
                     if (!File.Exists(bsp))
                         throw new InvalidDataException("vbsp could not build the map:" + Environment.NewLine + SourceExporter.ToolFailure(log, vbsp));
@@ -277,13 +321,13 @@ namespace Rbx2Source.Export
                     else
                     {
                         progress?.Report("Computing visibility (vvis)...");
-                        Run(vvis, game + "\"" + SourceExporter.ToolPath(bsp) + "\"");
+                        Run(vvis, gameArgument + "\"" + SourceExporter.ToolPath(bsp) + "\"");
                     }
                     progress?.Report("Lighting the map (vrad)...");
                     var watch = Stopwatch.StartNew();
                     // Props are lit per vertex. vrad's fast mode takes seconds where full quality takes minutes on a place
                     // with detailed meshes.
-                    log = Run(vrad, game + "-fast -StaticPropLighting \"" + SourceExporter.ToolPath(bsp) + "\"");
+                    log = Run(vrad, gameArgument + "-fast -StaticPropLighting \"" + SourceExporter.ToolPath(bsp) + "\"");
                     File.WriteAllText(Path.Combine(src, "vrad.log"), log);
                     if (!Regex.IsMatch(log, @"Writing .*\.bsp", RegexOptions.IgnoreCase))
                         throw new InvalidDataException("vrad could not light the map:" + Environment.NewLine + SourceExporter.ToolFailure(log, vrad));
@@ -293,6 +337,8 @@ namespace Rbx2Source.Export
                     File.Move(bsp, Path.Combine(maps, map + ".bsp"));
                     foreach (string leftover in new[] { ".prt", ".lin" })
                         File.Delete(Path.Combine(src, map + leftover));
+                    if (game.Pack)
+                        PackContent(Path.Combine(maps, map + ".bsp"), src);
                 }
                 finally
                 {
@@ -301,35 +347,73 @@ namespace Rbx2Source.Export
                 return Path.Combine("maps", map + ".bsp");
             }
 
-            // The map's picture: in Garry's Mod's map list (maps\thumb) and as the Workshop icon.
+            // The map's picture: in Garry's Mod's map list (maps\thumb) and as the Workshop icon (the export's picture in the
+            // library for other games).
             private void WritePictures()
             {
                 using (Picture picture = render.Draw(512, sunTravel))
                 {
-                    string thumbs = Path.Combine(folder, "maps", "thumb");
-                    Directory.CreateDirectory(thumbs);
-                    using (Picture thumbnail = picture.Resized(256, 256))
-                        thumbnail.Save(Path.Combine(thumbs, map + ".png"), PictureFormat.Png);
+                    if (game.Addon)
+                    {
+                        string thumbs = Path.Combine(folder, "maps", "thumb");
+                        Directory.CreateDirectory(thumbs);
+                        using (Picture thumbnail = picture.Resized(256, 256))
+                            thumbnail.Save(Path.Combine(thumbs, map + ".png"), PictureFormat.Png);
+                    }
                     Workshop.WriteIcon(picture.Encode(PictureFormat.Png), Path.Combine(folder, Workshop.IconFile));
                 }
             }
 
-            // studiomdl, vbsp, vvis and vrad find Garry's Mod's content (tool textures, the stock sky) and this addon's own
-            // materials and models through a temporary gameinfo.txt in the addon folder.
+            // studiomdl, vbsp, vvis and vrad find the game's content (tool textures, the stock sky) and this export's own
+            // materials and models through a temporary gameinfo.txt in the export folder.
             private string GameInfo()
             {
-                string root = SourceExporter.ToolPath(install.Folder);
-                string Path(string relative) => System.IO.Path.Combine(root, relative).Replace('\\', '/');
-                return "\"GameInfo\"\n{\n\tgame \"RoPorter\"\n\ttype multiplayer_only\n\tFileSystem\n\t{\n\t\tSteamAppId 4000\n\t\tSearchPaths\n\t\t{\n" +
+                string Mount(string kind, string path) => "\t\t\t" + kind + " \"" + SourceExporter.ToolPath(path).Replace('\\', '/') + "\"\n";
+                return "\"GameInfo\"\n{\n\tgame \"RoPorter\"\n\ttype multiplayer_only\n\tFileSystem\n\t{\n\t\tSteamAppId " + game.AppId + "\n\t\tSearchPaths\n\t\t{\n" +
                     "\t\t\tgame+mod |gameinfo_path|.\n" +
-                    "\t\t\tgame \"" + Path("garrysmod/garrysmod.vpk") + "\"\n" +
-                    "\t\t\tgame \"" + Path("sourceengine/hl2_textures.vpk") + "\"\n" +
-                    "\t\t\tgame \"" + Path("sourceengine/hl2_misc.vpk") + "\"\n" +
-                    "\t\t\tgame \"" + Path("garrysmod") + "\"\n" +
-                    "\t\t\tgame \"" + Path("sourceengine") + "\"\n" +
-                    "\t\t\tplatform \"" + Path("platform/platform_misc.vpk") + "\"\n" +
-                    "\t\t\tplatform \"" + Path("platform") + "\"\n" +
+                    string.Concat(game.Content.Select(path => Mount("game", path))) +
+                    string.Concat(game.Platform.Select(path => Mount("platform", path))) +
                     "\t\t}\n\t}\n}\n";
+            }
+
+            // Packs the map's materials and models into its .bsp with bspzip, so it plays (and servers send it) on its own.
+            // If packing fails the loose files are kept beside the map instead.
+            private void PackContent(string bsp, string src)
+            {
+                string bspzip = game.Tool("bspzip.exe");
+                var files = new[] { "materials", "models" }.Select(sub => Path.Combine(folder, sub)).Where(Directory.Exists)
+                    .SelectMany(sub => Directory.EnumerateFiles(sub, "*", SearchOption.AllDirectories)).ToList();
+                if (files.Count == 0)
+                    return;
+                if (!File.Exists(bspzip))
+                {
+                    progress?.Report(game.Name + "'s bspzip.exe is missing, so the map's materials and models are beside it, not packed in it.");
+                    return;
+                }
+                progress?.Report("Packing " + files.Count + " material and model files into the map (bspzip)...");
+                string list = Path.Combine(src, "pack.txt");
+                var text = new StringBuilder();
+                foreach (string file in files)
+                    text.Append(Path.GetRelativePath(folder, file).Replace('\\', '/')).Append('\n').Append(SourceExporter.ToolPath(file)).Append('\n');
+                File.WriteAllText(list, text.ToString(), Encoding.ASCII);
+                string packed = Path.Combine(src, map + "_packed.bsp");
+                // bspzip only accepts -game before the command; after it, it prints its usage and does nothing.
+                string log = Run(bspzip, "-game \"" + SourceExporter.ToolPath(folder.TrimEnd('\\', '/')) + "\" -addlist \"" +
+                    SourceExporter.ToolPath(bsp) + "\" \"" + SourceExporter.ToolPath(list) + "\" \"" + SourceExporter.ToolPath(packed) + "\"");
+                File.WriteAllText(Path.Combine(src, "bspzip.log"), log);
+                File.Delete(list);
+                if (!File.Exists(packed) || new FileInfo(packed).Length <= new FileInfo(bsp).Length)
+                {
+                    File.Delete(packed);
+                    progress?.Report("bspzip could not pack the map, so its materials and models are beside it, not packed in it:" + Environment.NewLine +
+                        SourceExporter.ToolFailure(log, bspzip));
+                    return;
+                }
+                File.Delete(bsp);
+                File.Move(packed, bsp);
+                foreach (string sub in new[] { "materials", "models" })
+                    if (Directory.Exists(Path.Combine(folder, sub)))
+                        Directory.Delete(Path.Combine(folder, sub), true);
             }
 
             private string Run(string exe, string arguments, string workingDirectory = null)
@@ -348,13 +432,7 @@ namespace Rbx2Source.Export
                     process.Start();
                     process.BeginOutputReadLine();
                     process.BeginErrorReadLine();
-                    while (!process.WaitForExit(200))
-                        if (cancellation.IsCancellationRequested)
-                        {
-                            try { process.Kill(); } catch (InvalidOperationException) { }
-                            cancellation.ThrowIfCancellationRequested();
-                        }
-                    process.WaitForExit();
+                    SourceExporter.WaitForTool(process, Path.GetFileNameWithoutExtension(exe), TimeSpan.FromMinutes(60), cancellation);
                 }
                 lock (output)
                     return output.ToString();
@@ -1646,7 +1724,7 @@ namespace Rbx2Source.Export
                 {
                     double[] origin = Source(spawn.CFrame, 0, spawn.Size[1] / 2 + 1 / units, 0);
                     double[] look = Direction(Rotate(spawn.CFrame, new double[] { 0, 0, -1 }));
-                    AddEntity("info_player_start", origin, "0 " + F(Math.Atan2(look[1], look[0]) * 180 / Math.PI) + " 0");
+                    AddSpawn(origin, "0 " + F(Math.Atan2(look[1], look[0]) * 180 / Math.PI) + " 0");
                 }
                 if (spawns.Count > 0)
                     return;
@@ -1658,16 +1736,27 @@ namespace Rbx2Source.Export
                     if (low[0] <= center[0] && high[0] >= center[0] && low[2] <= center[2] && high[2] >= center[2])
                         top = Math.Max(top, high[1]);
                 }
-                AddEntity("info_player_start", Point(center[0], top > double.MinValue ? top + 1 / units : center[1], center[2]), "0 0 0");
+                AddSpawn(Point(center[0], top > double.MinValue ? top + 1 / units : center[1], center[2]), "0 0 0");
             }
 
-            private void AddEntity(string classname, double[] origin, string angles)
+            // A spawn point; in Team Fortress 2 both teams (RED and BLU) spawn at every one, as Roblox's neutral spawns.
+            private void AddSpawn(double[] origin, string angles)
+            {
+                AddEntity("info_player_start", origin, angles);
+                if (game.TeamSpawns)
+                    foreach (string team in new[] { "2", "3" })
+                        AddEntity("info_player_teamspawn", origin, angles, ("TeamNum", team));
+            }
+
+            private void AddEntity(string classname, double[] origin, string angles, params (string Key, string Value)[] keys)
             {
                 var text = new StringBuilder("entity\n{\n");
                 Key(text, "id", (nextId++).ToString(CultureInfo.InvariantCulture));
                 Key(text, "classname", classname);
                 Key(text, "origin", V(origin));
                 Key(text, "angles", angles);
+                foreach (var (key, value) in keys)
+                    Key(text, key, value);
                 entities.Add(text.Append("}\n").ToString());
             }
 
@@ -1726,7 +1815,7 @@ namespace Rbx2Source.Export
                 entities.Add(text.Append("}\n").ToString());
             }
 
-            // The place's Sky as the map's skybox, or Roblox's default sky when the place has none (Garry's Mod's own when its
+            // The place's Sky as the map's skybox, or Roblox's default sky when the place has none (the game's own when its
             // images can't be had). Roblox's front (-Z) is Source's +X side ("rt"), its left (-X) Source's +Y ("bk").
             private async Task<string> SkyAsync()
             {
@@ -1739,8 +1828,8 @@ namespace Rbx2Source.Export
                         : await ImageAsync(sky.Get<string>("Skybox" + face)).ConfigureAwait(false);
                     if (image == null)
                     {
-                        progress?.Report("The place's sky is incomplete; the map uses Garry's Mod's sky.");
-                        return "painted";
+                        progress?.Report("The place's sky is incomplete; the map uses " + game.Name + "'s sky.");
+                        return game.Sky;
                     }
                     images[suffix] = image;
                 }

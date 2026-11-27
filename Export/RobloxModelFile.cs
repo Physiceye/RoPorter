@@ -11,6 +11,8 @@ namespace Rbx2Source.Export
     public static partial class RobloxModelFile
     {
         private static readonly byte[] BinaryMagic = Encoding.ASCII.GetBytes("<roblox!");
+        // The largest uncompressed chunk accepted, so a damaged file cannot ask for gigabytes of memory.
+        internal const int MaxChunkSize = 256 * 1024 * 1024;
 
         private static readonly string[] MeshProperties = { "MeshId", "MeshContent" };
         private static readonly string[] TextureProperties = { "TextureID", "TextureId", "TextureContent", "ColorMap", "ColorMapContent" };
@@ -114,9 +116,13 @@ namespace Rbx2Source.Export
                 int stored = compressed > 0 ? compressed : size;
                 if (stored < 0 || size < 0 || stored > data.Length - position)
                     throw new InvalidDataException("The model file is truncated.");
+                if (size > MaxChunkSize)
+                    throw new InvalidDataException("The model file has a chunk that is too large.");
                 byte[] chunk = ChunkData(data, position, compressed, size);
                 position += stored;
 
+                if ((name == "INST" || name == "PROP") && chunk.Length < 8)
+                    throw new InvalidDataException("The model file has a truncated " + name + " chunk.");
                 if (name == "INST")
                 {
                     int classIndex = BitConverter.ToInt32(chunk, 0);
@@ -128,7 +134,7 @@ namespace Rbx2Source.Export
                     int classIndex = BitConverter.ToInt32(chunk, 0);
                     string property = ReadString(chunk, 4, out int offset);
                     classes.TryGetValue(classIndex, out string className);
-                    if (!Wanted(className, property))
+                    if (!Wanted(className, property) || offset >= chunk.Length)
                         continue;
                     byte type = chunk[offset++];
                     if (type == 0x02)

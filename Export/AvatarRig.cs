@@ -518,6 +518,18 @@ namespace Rbx2Source.Export
             return null;
         }
 
+        // The shoulder of an upper arm wider than it is tall (held out sideways in the render, as some UGC bodies are): its
+        // end nearest the body, half the arm's thickness in from that end and down from its top. The middle of its box, as
+        // for a hanging arm, put the joint halfway along the arm, so the ragdoll's arm swung from there and looked detached.
+        private static double[] RaisedShoulder(PartBounds upperArm, double centerX)
+        {
+            // Its depth (front to back) is its thickness: an arm held at an angle has a nearly square box across the front.
+            double thickness = Math.Min(upperArm.Size(2), Math.Min(upperArm.Size(0), upperArm.Size(1)));
+            bool innerIsMin = Math.Abs(upperArm.Min[0] - centerX) < Math.Abs(upperArm.Max[0] - centerX);
+            double x = innerIsMin ? upperArm.Min[0] + 0.5 * thickness : upperArm.Max[0] - 0.5 * thickness;
+            return new[] { x, upperArm.Max[1] - 0.5 * thickness, upperArm.Center(2) };
+        }
+
         private void PlaceBones(Dictionary<BodyPart, PartBounds> actual, PartBounds body)
         {
             double centerX = body.Center(0), centerZ = body.Center(2), height = body.Size(1), width = body.Size(0), floor = body.Min[1];
@@ -557,9 +569,10 @@ namespace Rbx2Source.Export
                 double sign = side == "Right" ? 1 : -1;
                 int offset = side == "Right" ? 3 : 0;
                 PartBounds upperArm = Get(Part(side + "UpperArm")), lowerArm = Get(Part(side + "LowerArm")), hand = Get(Part(side + "Hand"));
-                position[LeftUpperArm + offset] = upperArm != null
+                position[LeftUpperArm + offset] = upperArm == null ? Template(0.61, sign, 0.34)
+                    : upperArm.Size(1) >= upperArm.Size(0)
                     ? new[] { upperArm.Center(0), upperArm.Max[1] - 0.5 * Math.Min(upperArm.Size(0), 0.5 * upperArm.Size(1)), upperArm.Center(2) }
-                    : Template(0.61, sign, 0.34);
+                    : RaisedShoulder(upperArm, centerX);
                 position[LeftLowerArm + offset] = Joint(upperArm, lowerArm) ?? Template(0.52, sign, 0.38);
                 position[LeftHand + offset] = Joint(lowerArm, hand) ?? Template(0.42, sign, 0.40);
                 // A forearm hidden under a sleeve is missing from the render: the wrist is where the hand comes closest to
@@ -1145,11 +1158,20 @@ namespace Rbx2Source.Export
                     continue;
                 }
                 bool drape = !layered && bone == HeadBone && !HeldGroups.Contains(group.Name) && PartBoxes.ContainsKey(BodyPart.Head);
+                // "Connect joints": a rigid accessory on the torso (a coat panel, a sash, a skirt) follows the torso's bones
+                // around it instead of only the one it is welded to, so it bends at the waist with the body under it instead of
+                // leaving a gap. Never the arms or legs: a chest piece that followed them tore when they swung.
+                bool bend = connectJoints && !layered && !HeldGroups.Contains(group.Name) && TorsoBones.Contains(bone);
                 foreach (var entry in group.Nearest)
                 {
                     if (drape)
                     {
                         Drape(entry.Key, model.Positions[entry.Key][1], height);
+                        continue;
+                    }
+                    if (bend)
+                    {
+                        SetWeights(entry.Key, BodyInfluence(model, model.Positions[entry.Key], bone));
                         continue;
                     }
                     if (!layered || entry.Value.Count == 0)
@@ -1160,7 +1182,7 @@ namespace Rbx2Source.Export
                     }
                     SetWeights(entry.Key, VolumeInfluence(model.Positions[entry.Key], height, allowed));
                 }
-                if (layered)
+                if (layered || bend)
                     SmoothWeights(model, group.Name, 4);
             }
 
@@ -1510,6 +1532,45 @@ namespace Rbx2Source.Export
             return bones.Count > 0 ? bones : null;
         }
 
+        private static readonly HashSet<int> TorsoBones = new HashSet<int> { Hips, Spine, Chest };
+
+        // The torso weights of the body surface nearest to a point (its four nearest body vertices, closer ones counting
+        // more), so an accessory over a connected joint moves exactly as the body under it. Only the torso's bones: arm and
+        // leg weights are left out. The accessory's own bone if no body vertex carries one.
+        private List<KeyValuePair<float[], int>> bodyVertices;
+        private Dictionary<int, double> BodyInfluence(WavefrontModel model, float[] p, int bone)
+        {
+            bodyVertices ??= model.Triangles.Where(t => Parts.ContainsKey(t.Group)).SelectMany(t => t.Corners).Select(c => c.Position)
+                .Distinct().Select(i => new KeyValuePair<float[], int>(model.Positions[i], i)).ToList();
+            // The four nearest, kept in order without sorting every body vertex.
+            var nearest = new List<KeyValuePair<double, int>>(5);
+            foreach (var vertex in bodyVertices)
+            {
+                double distance = Distance(p, vertex.Key);
+                if (nearest.Count == 4 && distance >= nearest[3].Key)
+                    continue;
+                int at = nearest.FindIndex(n => n.Key > distance);
+                nearest.Insert(at < 0 ? nearest.Count : at, new KeyValuePair<double, int>(distance, vertex.Value));
+                if (nearest.Count > 4)
+                    nearest.RemoveAt(4);
+            }
+            var influence = new Dictionary<int, double>();
+            foreach (var near in nearest)
+            {
+                double closeness = 1 / Math.Max(near.Key, 1e-4);
+                for (int k = 0; k < 4; k++)
+                {
+                    int joint = Joints[near.Value][k];
+                    float weight = Weights[near.Value][k];
+                    if (weight > 0 && TorsoBones.Contains(joint))
+                        influence[joint] = (influence.TryGetValue(joint, out double existing) ? existing : 0) + weight * closeness;
+                }
+            }
+            if (influence.Count == 0)
+                influence[bone] = 1;
+            return influence;
+        }
+
         private static HashSet<int> Within(int bone, int steps)
         {
             var reached = new HashSet<int> { bone };
@@ -1722,7 +1783,8 @@ namespace Rbx2Source.Export
 
         // Unity's humanoid auto-mapper only accepts transforms that skin something (or have several child bones), so
         // bones that deform nothing (spine, neck, shoulders, toes, eyes, jaw, fingers) were skipped. Each one gets a
-        // negligible weight on the vertex nearest to it among those fully weighted to its closest weighted ancestor.
+        // negligible weight on the vertex nearest to it among those fully weighted to its closest weighted ancestor (or,
+        // once those run out, mostly weighted to it).
         public void AnchorHelperBones(WavefrontModel model)
         {
             if (Joints == null || Joints.Length < model.Positions.Count)
@@ -1733,17 +1795,25 @@ namespace Rbx2Source.Export
                 .SelectMany(t => t.Corners).Select(c => c.Position));
             var weighted = new HashSet<int>();
             var rigid = new Dictionary<int, List<int>>();
+            // Vertices mostly on one bone that share it with one other: where "Connect body joints" blends nearly every vertex
+            // of a small part (a hand), its few rigid vertices run out before its helper bones (fingers) do, and studiomdl drops
+            // a bone that skins nothing. At most two bones, so the anchor survives Source's three-bone limit.
+            var mostly = new Dictionary<int, List<int>>();
             foreach (int i in used)
             {
+                int count = 0;
                 for (int k = 0; k < 4; k++)
                     if (Weights[i][k] > 0)
+                    {
                         weighted.Add(Joints[i][k]);
-                if (Weights[i][0] >= 1)
-                {
-                    if (!rigid.TryGetValue(Joints[i][0], out List<int> list))
-                        rigid[Joints[i][0]] = list = new List<int>();
-                    list.Add(i);
-                }
+                        count++;
+                    }
+                var into = Weights[i][0] >= 1 ? rigid : Weights[i][0] >= 0.5f && count <= 2 ? mostly : null;
+                if (into == null)
+                    continue;
+                if (!into.TryGetValue(Joints[i][0], out List<int> list))
+                    into[Joints[i][0]] = list = new List<int>();
+                list.Add(i);
             }
 
             var taken = new HashSet<int>();
@@ -1752,15 +1822,20 @@ namespace Rbx2Source.Export
                 if (weighted.Contains(bone))
                     continue;
                 int ancestor = Bones[bone].Parent;
-                while (ancestor >= 0 && !rigid.ContainsKey(ancestor))
+                while (ancestor >= 0 && !rigid.ContainsKey(ancestor) && !mostly.ContainsKey(ancestor))
                     ancestor = Bones[ancestor].Parent;
                 if (ancestor < 0)
                     continue;
                 double[] target = Bones[bone].Position;
+                // A fully rigid vertex if one is free, otherwise one mostly on the ancestor.
+                List<int> candidates = rigid.TryGetValue(ancestor, out List<int> held) && held.Any(i => !taken.Contains(i)) ? held
+                    : mostly.TryGetValue(ancestor, out List<int> shared) ? shared : null;
+                if (candidates == null)
+                    continue;
                 int best = -1;
                 bool bestBody = false;
                 double bestDistance = double.MaxValue;
-                foreach (int i in rigid[ancestor])
+                foreach (int i in candidates)
                 {
                     if (taken.Contains(i))
                         continue;
@@ -1780,12 +1855,26 @@ namespace Rbx2Source.Export
                 // same anchor: anchoring one copy alone opened a hairline crack there whenever the helper bone moved (fingers
                 // curling round a first-person weapon, VRChat hand gestures).
                 float[] at = model.Positions[best];
-                foreach (int i in rigid[ancestor])
+                foreach (int i in candidates)
                     if (i == best || (!taken.Contains(i) && model.Positions[i][0] == at[0] && model.Positions[i][1] == at[1] && model.Positions[i][2] == at[2]))
                     {
                         taken.Add(i);
-                        Joints[i] = new[] { ancestor, bone, 0, 0 };
-                        Weights[i] = new[] { 1 - AnchorWeight, AnchorWeight, 0, 0 };
+                        if (Weights[i][0] >= 1)
+                        {
+                            Joints[i] = new[] { ancestor, bone, 0, 0 };
+                            Weights[i] = new[] { 1 - AnchorWeight, AnchorWeight, 0, 0 };
+                            continue;
+                        }
+                        // A blended vertex keeps its bones, scaled down to make room for the anchor.
+                        int free = Array.FindIndex(Weights[i], 1, w => w <= 0);
+                        if (free < 0)
+                            continue;
+                        Joints[i] = (int[])Joints[i].Clone();
+                        Weights[i] = (float[])Weights[i].Clone();
+                        for (int k = 0; k < 4; k++)
+                            Weights[i][k] *= 1 - AnchorWeight;
+                        Joints[i][free] = bone;
+                        Weights[i][free] = AnchorWeight;
                     }
             }
         }

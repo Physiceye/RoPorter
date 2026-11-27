@@ -162,14 +162,20 @@ namespace Rbx2Source.Export
                 int stored = compressed > 0 ? compressed : size;
                 if (stored < 0 || size < 0 || stored > data.Length - position)
                     throw new InvalidDataException("The model file is truncated.");
+                if (size > MaxChunkSize)
+                    throw new InvalidDataException("The model file has a chunk that is too large.");
                 byte[] chunk = ChunkData(data, position, compressed, size);
                 position += stored;
 
+                if ((name == "INST" && chunk.Length < 13) || (name == "PROP" && chunk.Length < 8) || (name == "PRNT" && chunk.Length < 5))
+                    throw new InvalidDataException("The model file has a truncated " + name + " chunk.");
                 if (name == "INST")
                 {
                     int classIndex = BitConverter.ToInt32(chunk, 0);
                     string className = ReadString(chunk, 4, out int offset);
                     offset++; // object format (1 for services)
+                    if (offset + 4 > chunk.Length)
+                        throw new InvalidDataException("The model file has a truncated INST chunk.");
                     int count = BitConverter.ToInt32(chunk, offset);
                     offset += 4;
                     int[] referents = ReadReferents(chunk, ref offset, count);

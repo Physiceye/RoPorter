@@ -7,8 +7,8 @@ using System.Text;
 
 namespace Rbx2Source
 {
-    // Settings are remembered between runs in "littlefart" next to the program (or in the user's RoPorter folder, see
-    // ContentCache.DataFolder): "name=value" lines, encrypted for the user. On
+    // Settings are remembered between runs in "littlefart" in the user's RoPorter folder (see ContentCache.DataFolder):
+    // "name=value" lines, encrypted for the user. On
     // Windows the file is protected for the Windows user (only that user on that PC can read it); on Linux and macOS it is
     // encrypted with a key kept in the user's own config folder, readable only by them. Anywhere else, or if the file is
     // damaged, RoPorter starts with its defaults. Older plain-text files are read and encrypted on the next save.
@@ -61,14 +61,19 @@ namespace Rbx2Source
             return settings;
         }
 
+        // Settings (such as API keys) that are never written to disk unencrypted.
+        public static readonly ISet<string> Secrets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         public static void Save(IDictionary<string, string> settings)
         {
             try
             {
-                byte[] text = Encoding.UTF8.GetBytes(string.Join("\n", settings.Select(setting => setting.Key + "=" + setting.Value)));
+                static byte[] Text(IEnumerable<KeyValuePair<string, string>> values) =>
+                    Encoding.UTF8.GetBytes(string.Join("\n", values.Select(setting => setting.Key + "=" + setting.Value)));
                 byte[] data;
                 try
                 {
+                    byte[] text = Text(settings);
                     data = OperatingSystem.IsWindows()
                         ? WindowsMagic.Concat(ProtectedData.Protect(text, Entropy, DataProtectionScope.CurrentUser)).ToArray()
                         : KeyMagic.Concat(Encrypt(text)).ToArray();
@@ -76,7 +81,8 @@ namespace Rbx2Source
                 catch (Exception error) when (error is CryptographicException || error is IOException || error is UnauthorizedAccessException ||
                     error is PlatformNotSupportedException)
                 {
-                    data = text;
+                    // Encryption is unavailable: everything but the secrets is kept (they last until RoPorter closes).
+                    data = Text(settings.Where(setting => !Secrets.Contains(setting.Key)));
                 }
                 System.IO.File.WriteAllBytes(File, data);
             }
@@ -111,14 +117,22 @@ namespace Rbx2Source
         private static byte[] Key(bool create)
         {
             if (System.IO.File.Exists(KeyFile))
-                return System.IO.File.ReadAllBytes(KeyFile);
+            {
+                byte[] existing = System.IO.File.ReadAllBytes(KeyFile);
+                if (existing.Length != 32)
+                    throw new CryptographicException("The settings key is damaged.");
+                return existing;
+            }
             if (!create)
                 throw new CryptographicException("There is no settings key for this user.");
             Directory.CreateDirectory(Path.GetDirectoryName(KeyFile));
             byte[] key = RandomNumberGenerator.GetBytes(32);
-            System.IO.File.WriteAllBytes(KeyFile, key);
+            // Created readable only by the user from the start, rather than made private after it is written.
+            var options = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write };
             if (!OperatingSystem.IsWindows())
-                System.IO.File.SetUnixFileMode(KeyFile, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+                options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+            using (var stream = new FileStream(KeyFile, options))
+                stream.Write(key);
             return key;
         }
     }

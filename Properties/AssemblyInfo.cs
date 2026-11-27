@@ -7,11 +7,11 @@ using System.Resources;
 // set of attributes. Change these attribute values to modify the information
 // associated with an assembly.
 [assembly: AssemblyTitle("RoPorter")]
-[assembly: AssemblyDescription("Download textured Roblox avatars and catalog items as GLB / glTF models.")]
+[assembly: AssemblyDescription("Download textured Roblox avatars and Roblox catalog items.")]
 [assembly: AssemblyConfiguration("")]
-[assembly: AssemblyCompany("")]
+[assembly: AssemblyCompany("Physiceye")]
 [assembly: AssemblyProduct("RoPorter")]
-[assembly: AssemblyCopyright("")]
+[assembly: AssemblyCopyright("Copyright © 2026 Physiceye")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
 
@@ -33,6 +33,6 @@ using System.Resources;
 // You can specify all the values or you can default the Build and Revision Numbers 
 // by using the '*' as shown below:
 // [assembly: AssemblyVersion("1.0.*")]
-[assembly: AssemblyVersion("2.1.2")]
-[assembly: AssemblyFileVersion("2.1.2")]
+[assembly: AssemblyVersion("2.1.5")]
+[assembly: AssemblyFileVersion("2.1.5")]
 [assembly: NeutralResourcesLanguageAttribute("en-US")]

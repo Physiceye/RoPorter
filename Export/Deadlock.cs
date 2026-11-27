@@ -393,13 +393,7 @@ namespace Rbx2Source.Export
                 process.ErrorDataReceived += (sender, args) => { lock (output) output.AppendLine(args.Data); };
                 process.BeginOutputReadLine();
                 process.BeginErrorReadLine();
-                while (!process.WaitForExit(200))
-                    if (cancellation.IsCancellationRequested)
-                    {
-                        process.Kill();
-                        cancellation.ThrowIfCancellationRequested();
-                    }
-                process.WaitForExit();
+                SourceExporter.WaitForTool(process, "CS2's resourcecompiler", TimeSpan.FromMinutes(15), cancellation);
                 string log;
                 lock (output)
                     log = output.ToString();

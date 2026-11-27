@@ -353,6 +353,12 @@ namespace Rbx2Source.Export
         {
             public double[] Scale, Offset;
             public double Flip, Error, HeadHeight;
+            // The 90th-percentile distance from a rendered head vertex to the fitted mesh. The median (Error) ignores a head
+            // whose shape differs only at its edges, such as a square head fitted with a round mesh; this catches it.
+            public double Spread;
+
+            // Whether the mesh has the rendered head's shape, so it can stand in for it (see ReplaceHead).
+            public bool SameShape => Spread <= 0.06 * HeadHeight;
 
             public float[] Point(float[] p) => new[]
             {
@@ -452,6 +458,13 @@ namespace Rbx2Source.Export
             }
             if (best == null || best.Error > 0.03 * headHeight)
                 throw new InvalidDataException("The rendered head does not match the dynamic head mesh closely enough to add face shapes.");
+            {
+                var placed = sources.Select(i => best.Point(mesh.Positions[i]).Select(v => (double)v).ToArray()).ToList();
+                var index = new SpatialIndex(placed, headHeight / 40);
+                var distances = sample.Select(p => index.Nearest(p[0], p[1], p[2], 1, 24))
+                    .Select(match => match.Count > 0 ? match[0].Value : headHeight).OrderBy(d => d).ToList();
+                best.Spread = distances.Count > 0 ? distances[Math.Min(distances.Count - 1, (int)(distances.Count * 0.9))] : 0;
+            }
             return best;
         }
 

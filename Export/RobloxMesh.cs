@@ -79,6 +79,10 @@ namespace Rbx2Source.Export
                 {
                     throw new InvalidDataException("The mesh is truncated.", error);
                 }
+                catch (Exception error) when (error is ArgumentException || error is OverflowException || error is IndexOutOfRangeException)
+                {
+                    throw new InvalidDataException("The mesh is damaged.", error);
+                }
             }
             if (mesh.invalidVertices.Count > 0)
                 mesh.Faces.RemoveAll(face => face.Any(mesh.invalidVertices.Contains));
@@ -321,7 +325,9 @@ namespace Rbx2Source.Export
                 float[] p = Vector(corner * 3), n = Vector(corner * 3 + 1), uv = Vector(corner * 3 + 2);
                 Positions.Add(new[] { p[0] * scale, p[1] * scale, p[2] * scale });
                 Normals.Add(n);
-                Texcoords.Add(new[] { uv[0], 1 - uv[1] });
+                // Kept as stored: V counts up from the image's bottom, as in binary meshes and OBJ files (the exporters
+                // expect that). Flipping it here put old meshes' textures upside down.
+                Texcoords.Add(new[] { uv[0], uv[1] });
             }
             for (int face = 0; face < faceCount; face++)
                 Faces.Add(new[] { face * 3, face * 3 + 1, face * 3 + 2 });

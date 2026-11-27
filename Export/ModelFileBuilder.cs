@@ -101,6 +101,29 @@ namespace Rbx2Source.Export
             return contents;
         }
 
+        // A lone mesh asset with an optional texture (the Mesh export type): one part holding it at its own size, as a
+        // SpecialMesh shows it, in white so the texture keeps its own colours (grey without one, like an untextured mesh).
+        public static ModelContents FromMesh(long meshId, long? textureId, string name)
+        {
+            var instance = new RobloxInstance { ClassName = "Part" };
+            instance.Properties["Name"] = name;
+            var contents = new ModelContents { Roots = new List<RobloxInstance> { instance } };
+            contents.Parts.Add(new PlacedPart
+            {
+                Instance = instance,
+                CFrame = new float[] { 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 },
+                Size = new float[] { 1, 1, 1 },
+                Shape = PartShape.Mesh,
+                Scale = new float[] { 1, 1, 1 },
+                Offset = new float[3],
+                MeshId = meshId,
+                TextureId = textureId,
+                Color = textureId.HasValue ? new float[] { 1, 1, 1 } : DefaultColor,
+                Material = 256
+            });
+            return contents;
+        }
+
         // Every instance below these, leaving out the camera (and what it holds) and Terrain, which is voxels rather than a part.
         private static IEnumerable<RobloxInstance> Walk(IEnumerable<RobloxInstance> instances)
         {
@@ -553,7 +576,8 @@ namespace Rbx2Source.Export
                 return key;
             try
             {
-                progress?.Report("Downloading texture " + id + "...");
+                progress?.Report(ContentCache.Contains(ContentCache.Assets, id.ToString(CultureInfo.InvariantCulture))
+                    ? "Texture " + id + " is in the content cache." : "Downloading texture " + id + "...");
                 byte[] image = await download(id, cancellation).ConfigureAwait(false);
                 if (!IsImage(image) && image.Length >= 8)
                 {

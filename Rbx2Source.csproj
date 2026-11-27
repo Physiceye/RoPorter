@@ -17,7 +17,8 @@
     <SelfContained Condition="'$(RuntimeIdentifier)' != ''">true</SelfContained>
     <PublishSingleFile Condition="'$(RuntimeIdentifier)' != ''">true</PublishSingleFile>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
-    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <!-- Not compressed: a compressed single-file exe looks "packed" to antivirus heuristics and gets flagged as malware. -->
+    <EnableCompressionInSingleFile>false</EnableCompressionInSingleFile>
     <DebugType Condition="'$(Configuration)' == 'Release'">embedded</DebugType>
   </PropertyGroup>
   <ItemGroup>
@@ -41,6 +42,8 @@
     <EmbeddedResource Include="Resources\Images\mesh_icon.png" LogicalName="RoPorter.mesh_icon.png" />
     <EmbeddedResource Include="Resources\Images\source2.png" LogicalName="RoPorter.source2.png" />
     <EmbeddedResource Include="Resources\Images\*.tga" LogicalName="RoPorter.%(Filename)%(Extension)" />
+    <!-- A Left 4 Dead 2 survivor's portrait and lobby backgrounds and frames, and incapacitated portrait backdrop (the .psd files are their sources; credits.txt links where they came from). -->
+    <EmbeddedResource Include="Resources\Images\L4D\*.png" LogicalName="RoPorter.L4D.%(Filename)%(Extension)" />
     <!-- Roblox's material textures, default sky and classic rbxasset:// textures (Export\RobloxContent.cs). -->
     <EmbeddedResource Include="Resources\Roblox\**\*" Exclude="Resources\Roblox\README.md" LogicalName="RoPorter.Roblox.%(RecursiveDir)%(Filename)%(Extension)" />
     <PackageReference Include="Avalonia" Version="12.1.4" />

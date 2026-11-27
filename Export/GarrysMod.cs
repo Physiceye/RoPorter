@@ -120,6 +120,233 @@ namespace Rbx2Source.Export
         }
     }
 
+    // One of Left 4 Dead 2's eight survivors, whose model (and first-person arms) an export replaces.
+    public sealed class L4d2Survivor
+    {
+        public string Name { get; }
+        // The model's internal name: models/survivors/survivor_<Key>.mdl.
+        public string Key { get; }
+        // models/weapons/arms/<Arms>.mdl
+        public string Arms { get; }
+        // The Passing and The Sacrifice show Zoey and Francis with a "_light" copy of their model.
+        public bool HasLightModel { get; }
+
+        private L4d2Survivor(string name, string key, string arms, bool light = false)
+        {
+            Name = name;
+            Key = key;
+            Arms = arms;
+            HasLightModel = light;
+        }
+
+        public string Model => "survivors/survivor_" + Key + ".mdl";
+        public string ArmsModel => "weapons/arms/" + Arms + ".mdl";
+        // Left 4 Dead 1's cast, who have a character select picture (vgui/select_<name>) instead of a lobby picture.
+        public bool Original => Arms.IndexOf("_new", StringComparison.Ordinal) < 0;
+        // The HUD, lobby and character select pictures (materials/vgui/<name>.vtf).
+        public string Portrait => "s_panel_" + Key;
+        public string LobbyPicture => Original ? "select_" + Name.ToLowerInvariant() : "s_panel_lobby_" + Key;
+
+        public static IReadOnlyList<L4d2Survivor> All { get; } = new[]
+        {
+            new L4d2Survivor("Nick", "gambler", "v_arms_gambler_new"),
+            new L4d2Survivor("Rochelle", "producer", "v_arms_producer_new"),
+            new L4d2Survivor("Coach", "coach", "v_arms_coach_new"),
+            new L4d2Survivor("Ellis", "mechanic", "v_arms_mechanic_new"),
+            new L4d2Survivor("Bill", "namvet", "v_arms_bill"),
+            new L4d2Survivor("Zoey", "teenangst", "v_arms_zoey", true),
+            new L4d2Survivor("Francis", "biker", "v_arms_francis", true),
+            new L4d2Survivor("Louis", "manager", "v_arms_louis")
+        };
+
+        public static L4d2Survivor Find(string key) => All.FirstOrDefault(s => s.Key.Equals(key, StringComparison.OrdinalIgnoreCase));
+    }
+
+    // A Left 4 Dead 2 install: its model compiler and VPK packer (from the Authoring Tools, in bin) and each survivor's
+    // skeleton, attachments, IK chains and ragdoll limits, read from the game's VPKs.
+    public sealed class L4d2Install
+    {
+        public string Folder { get; }
+        public string StudioMdl => Path.Combine(Folder, "bin", "studiomdl.exe");
+        public string VpkTool => Path.Combine(Folder, "bin", "vpk.exe");
+
+        // Highest priority first, as in the game's gameinfo.txt.
+        private static readonly string[] GameFolders = { "update", "left4dead2_dlc3", "left4dead2_dlc2", "left4dead2_dlc1", "left4dead2" };
+        public IEnumerable<string> Content => GameFolders.Select(f => Path.Combine(Folder, f)).Where(Directory.Exists);
+
+        private L4d2Install(string folder)
+        {
+            Folder = folder;
+        }
+
+        public static bool IsInstall(string folder) =>
+            !string.IsNullOrWhiteSpace(folder) && File.Exists(Path.Combine(folder, "left4dead2", "pak01_dir.vpk"));
+
+        public static L4d2Install Find()
+        {
+            foreach (string library in GarrysModInstall.SteamLibraries())
+            {
+                string folder = Path.Combine(library, "steamapps", "common", "Left 4 Dead 2");
+                if (IsInstall(folder))
+                    return new L4d2Install(folder);
+            }
+            return null;
+        }
+
+        private List<Vpk> vpks;
+
+        public byte[] ReadFile(string path)
+        {
+            // Only Valve's own packs: loose files in the game folders may be someone's mod.
+            vpks = vpks ?? Content.Select(f => Path.Combine(f, "pak01_dir.vpk")).Where(File.Exists).Select(f => new Vpk(f)).ToList();
+            return vpks.Select(v => v.Read(path)).FirstOrDefault(data => data != null)
+                ?? throw new FileNotFoundException("Left 4 Dead 2 is missing " + path + ". Verify its files in Steam.");
+        }
+
+        private readonly Dictionary<string, ValvePlayer> survivors = new Dictionary<string, ValvePlayer>(StringComparer.Ordinal);
+
+        public ValvePlayer Survivor(L4d2Survivor survivor)
+        {
+            if (!survivors.TryGetValue(survivor.Key, out ValvePlayer player))
+                survivors[survivor.Key] = player = ValvePlayer.ReadSurvivor(this, survivor);
+            return player;
+        }
+    }
+
+    // One of Team Fortress 2's nine classes, whose model (and first-person arms) an export replaces.
+    public sealed class Tf2Class
+    {
+        public string Name { get; }
+        // models/player/<Key>.mdl and models/weapons/c_models/c_<Key>_arms.mdl
+        public string Key { get; }
+        // The HUD's class pictures: materials/hud/class_<HudKey>red and class_<HudKey>blue.
+        public string HudKey { get; }
+        // The class portraits: materials/vgui/class_portraits/<PortraitKey> (and _blue, _grey, _blue_grey).
+        public string PortraitKey { get; }
+
+        private Tf2Class(string name, string key, string hudKey = null, string portraitKey = null)
+        {
+            Name = name;
+            Key = key;
+            HudKey = hudKey ?? key;
+            PortraitKey = portraitKey ?? key;
+        }
+
+        public string Model => "player/" + Key + ".mdl";
+        public string ArmsModel => "weapons/c_models/c_" + Key + "_arms.mdl";
+
+        public static IReadOnlyList<Tf2Class> All { get; } = new[]
+        {
+            new Tf2Class("Scout", "scout"),
+            new Tf2Class("Soldier", "soldier"),
+            new Tf2Class("Pyro", "pyro"),
+            new Tf2Class("Demoman", "demo", portraitKey: "demoman"),
+            new Tf2Class("Heavy", "heavy"),
+            new Tf2Class("Engineer", "engineer", hudKey: "engi"),
+            new Tf2Class("Medic", "medic"),
+            new Tf2Class("Sniper", "sniper"),
+            new Tf2Class("Spy", "spy")
+        };
+
+        public static Tf2Class Find(string key) => All.FirstOrDefault(c => c.Key.Equals(key, StringComparison.OrdinalIgnoreCase));
+    }
+
+    // Team Fortress 2's bip_ skeleton by the ValveBiped names the Source exporter fits avatars to: a class is read with its
+    // bones renamed, and the compiled files get the bip_ names back.
+    internal static class Tf2Bones
+    {
+        private const string Valve = "ValveBiped.Bip01_";
+        private static readonly Dictionary<string, string> ToValveNames = Build();
+        private static readonly Dictionary<string, string> ToTf2Names = ToValveNames.ToDictionary(pair => pair.Value, pair => pair.Key, StringComparer.Ordinal);
+
+        private static Dictionary<string, string> Build()
+        {
+            var names = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["bip_pelvis"] = "Pelvis", ["bip_spine_0"] = "Spine", ["bip_spine_1"] = "Spine1", ["bip_spine_2"] = "Spine2",
+                ["bip_spine_3"] = "Spine4", ["bip_neck"] = "Neck1", ["bip_head"] = "Head1"
+            };
+            string[] fingers = { "thumb", "index", "middle", "ring", "pinky" };
+            foreach (string side in new[] { "L", "R" })
+            {
+                names["bip_collar_" + side] = side + "_Clavicle";
+                names["bip_upperArm_" + side] = side + "_UpperArm";
+                names["bip_lowerArm_" + side] = side + "_Forearm";
+                names["bip_hand_" + side] = side + "_Hand";
+                names["bip_hip_" + side] = side + "_Thigh";
+                names["bip_knee_" + side] = side + "_Calf";
+                names["bip_foot_" + side] = side + "_Foot";
+                names["bip_toe_" + side] = side + "_Toe0";
+                for (int f = 0; f < fingers.Length; f++)
+                    for (int joint = 0; joint < 3; joint++)
+                        names["bip_" + fingers[f] + "_" + joint + "_" + side] = side + "_Finger" + f + (joint == 0 ? "" : joint.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+            return names.ToDictionary(pair => pair.Key, pair => Valve + pair.Value, StringComparer.Ordinal);
+        }
+
+        public static string ToValve(string name) => ToValveNames.TryGetValue(name, out string valve) ? valve : name;
+        public static string ToTf2(string name) => ToTf2Names.TryGetValue(name, out string tf2) ? tf2 : name;
+    }
+
+    // A Team Fortress 2 install: its model compiler and VPK packer (in bin; bin\x64's studiomdl lacks the mdllib.dll it
+    // loads) and each class's skeleton,
+    // attachments, IK chains, hitboxes, ragdoll limits and first-person arms, read from the game's VPKs.
+    public sealed class Tf2Install
+    {
+        public string Folder { get; }
+        public string StudioMdl => Tool("studiomdl.exe");
+        public string VpkTool => Tool("vpk.exe");
+
+        // A tool in bin (or bin\x64), by name.
+        public string Tool(string name) =>
+            new[] { Path.Combine(Folder, "bin", name), Path.Combine(Folder, "bin", "x64", name) }.FirstOrDefault(File.Exists) ?? Path.Combine(Folder, "bin", name);
+
+        // Valve's packs, highest priority first as in tf/gameinfo.txt (directory files, "<name>_dir.vpk").
+        private static readonly string[] Packs = { @"tf\tf2_textures_dir.vpk", @"tf\tf2_misc_dir.vpk", @"hl2\hl2_textures_dir.vpk", @"hl2\hl2_misc_dir.vpk" };
+        private IEnumerable<string> PackFiles => Packs.Select(p => Path.Combine(Folder, p.Replace('\\', Path.DirectorySeparatorChar))).Where(File.Exists);
+        // What studiomdl mounts: the packs (by the name gameinfo.txt gives them, without "_dir") and the game folders.
+        public IEnumerable<string> Content => PackFiles.Select(f => f.Replace("_dir.vpk", ".vpk"))
+            .Concat(new[] { "tf", "hl2" }.Select(f => Path.Combine(Folder, f)).Where(Directory.Exists));
+
+        private Tf2Install(string folder)
+        {
+            Folder = folder;
+        }
+
+        public static bool IsInstall(string folder) =>
+            !string.IsNullOrWhiteSpace(folder) && File.Exists(Path.Combine(folder, "tf", "tf2_misc_dir.vpk"));
+
+        public static Tf2Install Find()
+        {
+            foreach (string library in GarrysModInstall.SteamLibraries())
+            {
+                string folder = Path.Combine(library, "steamapps", "common", "Team Fortress 2");
+                if (IsInstall(folder))
+                    return new Tf2Install(folder);
+            }
+            return null;
+        }
+
+        private List<Vpk> vpks;
+
+        public byte[] ReadFile(string path)
+        {
+            // Only Valve's own packs: loose files in tf/custom may be someone's mod.
+            vpks = vpks ?? PackFiles.Select(f => new Vpk(f)).ToList();
+            return vpks.Select(v => v.Read(path)).FirstOrDefault(data => data != null)
+                ?? throw new FileNotFoundException("Team Fortress 2 is missing " + path + ". Verify its files in Steam.");
+        }
+
+        private readonly Dictionary<string, ValvePlayer> classes = new Dictionary<string, ValvePlayer>(StringComparer.Ordinal);
+
+        public ValvePlayer Player(Tf2Class tf2Class)
+        {
+            if (!classes.TryGetValue(tf2Class.Key, out ValvePlayer player))
+                classes[tf2Class.Key] = player = ValvePlayer.ReadTf2Class(this, tf2Class);
+            return player;
+        }
+    }
+
     // Valve pack file (VPK v1/v2) directory reader.
     public sealed class Vpk
     {
@@ -223,9 +450,43 @@ namespace Rbx2Source.Export
         public List<Attachment> Attachments { get; } = new List<Attachment>();
         public List<IkChain> IkChains { get; } = new List<IkChain>();
         public List<Constraint> Constraints { get; } = new List<Constraint>();
+        // The animation models a survivor includes (game paths, "models/..."); empty for Garry's Mod's player.
+        public List<string> IncludeModels { get; } = new List<string>();
+        // Team Fortress 2: the hitboxes (bone and hit group; the head's group 1 takes headshots) and the class's first-person arms.
+        public List<(string Bone, int Group)> Hitboxes { get; } = new List<(string, int)>();
+        public ValvePlayer ViewModel { get; private set; }
         public double TotalMass = 90, Inertia = 10, Damping = 0.01, RotationalDamping = 1.5;
 
         public Bone Find(string name) => Bones.FirstOrDefault(b => b.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+
+        // The rotation from the model file's own frame to the Z-up, -Y-forward frame the exporter works in (bones' world
+        // transforms are in the exporter's frame; their local ones stay as in the file). Identity for Garry's Mod's player.
+        // Team Fortress 2's classes are stored Y-up and +Z-forward: read as they were, the avatar was sized by its eye height
+        // along Z (about 2 units instead of 65), so it came out 40 times too small and lying down, and broke in game.
+        public double[] Frame { get; private set; } = Matrix.Identity;
+
+        // Turns a Y-up skeleton (its head above its root along Y) into the exporter's Z-up frame.
+        private void UseZUp()
+        {
+            Bone root = Bones.FirstOrDefault(b => b.Parent < 0);
+            Bone head = Bones.FirstOrDefault(b => b.Name.IndexOf("head", StringComparison.OrdinalIgnoreCase) >= 0);
+            if (root == null || head == null)
+                return;
+            double[] up = Matrix.Subtract(head.WorldPosition, root.WorldPosition);
+            if (up[1] <= Math.Abs(up[2]) || up[1] <= Math.Abs(up[0]))
+                return;
+            UseFrame(new double[] { 1, 0, 0, 0, 0, -1, 0, 1, 0 });
+        }
+
+        private void UseFrame(double[] frame)
+        {
+            Frame = frame;
+            foreach (Bone bone in Bones)
+            {
+                bone.WorldRotation = Matrix.Multiply(frame, bone.WorldRotation);
+                bone.WorldPosition = Matrix.Apply(frame, bone.WorldPosition);
+            }
+        }
 
         public const string AnimationModel = "models/m_anm.mdl";
         public const string StockModel = "models/player/kleiner";
@@ -236,9 +497,106 @@ namespace Rbx2Source.Export
             byte[] animations = install.ReadFile(AnimationModel);
             foreach (var bone in Mdl.Bones(animations))
                 player.Bones.Add(bone);
-            for (int i = 0; i < player.Bones.Count; i++)
+            SetWorld(player.Bones);
+            byte[] stock = install.ReadFile(StockModel + ".mdl");
+            player.Attachments.AddRange(Mdl.Attachments(stock));
+            player.IkChains.AddRange(Mdl.IkChains(stock));
+            player.ReadPhysics(install.ReadFile(StockModel + ".phy"));
+            return player;
+        }
+
+        // A Left 4 Dead 2 survivor: the skeleton of the animation model it includes (anim_<name>.mdl, which every one of its
+        // animations is authored for), with the survivor model's own attachments, IK chains and ragdoll limits.
+        internal static ValvePlayer ReadSurvivor(L4d2Install install, L4d2Survivor survivor)
+        {
+            string path = "models/" + survivor.Model;
+            byte[] model = install.ReadFile(path);
+            string animations = Mdl.Includes(model).FirstOrDefault(p => Path.GetFileName(p).StartsWith("anim_", StringComparison.OrdinalIgnoreCase))
+                ?? "models/survivors/anim_" + survivor.Key + ".mdl";
+            return ReadWithAnimations(install.ReadFile, path, model, animations);
+        }
+
+        // A Team Fortress 2 class, the same way (its animations are in <class>_animations.mdl), with its hitboxes and its
+        // first-person arms (ViewModel), every bip_ bone going by its ValveBiped name. The arms' root takes the place of the
+        // upper spine, which it matches.
+        internal static ValvePlayer ReadTf2Class(Tf2Install install, Tf2Class tf2Class)
+        {
+            string path = "models/" + tf2Class.Model;
+            byte[] model = install.ReadFile(path);
+            string animations = Mdl.Includes(model).FirstOrDefault(p => Path.GetFileName(p).Equals(tf2Class.Key + "_animations.mdl", StringComparison.OrdinalIgnoreCase))
+                ?? "models/player/" + tf2Class.Key + "_animations.mdl";
+            ValvePlayer player = ReadWithAnimations(install.ReadFile, path, model, animations);
+            player.Hitboxes.AddRange(Mdl.Hitboxes(model));
+            player.Rename(Tf2Bones.ToValve);
+            player.UseZUp();
+
+            byte[] arms = install.ReadFile("models/" + tf2Class.ArmsModel);
+            var viewModel = new ValvePlayer();
+            viewModel.Bones.AddRange(Mdl.Bones(arms));
+            SetWorld(viewModel.Bones);
+            // The arms are stored in the class's frame; their root (the upper spine) has no "head" to find it by.
+            viewModel.UseFrame(player.Frame);
+            viewModel.Attachments.AddRange(Mdl.Attachments(arms));
+            viewModel.IncludeModels.AddRange(Mdl.Includes(arms));
+            viewModel.Rename(name => name == "root" ? Tf2Bones.ToValve("bip_spine_3") : Tf2Bones.ToValve(name));
+            player.ViewModel = viewModel;
+            return player;
+        }
+
+        private void Rename(Func<string, string> rename)
+        {
+            foreach (Bone bone in Bones)
+                bone.Name = rename(bone.Name);
+            foreach (Attachment attachment in Attachments)
+                attachment.Bone = rename(attachment.Bone);
+            foreach (IkChain chain in IkChains)
+                chain.Bone = rename(chain.Bone);
+            foreach (Constraint constraint in Constraints)
+                constraint.Bone = rename(constraint.Bone);
+            for (int i = 0; i < Hitboxes.Count; i++)
+                Hitboxes[i] = (rename(Hitboxes[i].Bone), Hitboxes[i].Group);
+        }
+
+        // A model's skeleton from the animation model it includes, with the model's own attachments, IK chains and ragdoll limits.
+        private static ValvePlayer ReadWithAnimations(Func<string, byte[]> read, string path, byte[] model, string animations)
+        {
+            var player = new ValvePlayer();
+            player.IncludeModels.AddRange(Mdl.Includes(model));
+            player.Bones.AddRange(Mdl.Bones(read(animations)));
+            SetWorld(player.Bones);
+            // Attachments on the survivor's own extra bones (Zoey's holster, a bandage helper) move to the nearest bone up its
+            // chain that the animations have, keeping where they are.
+            List<Bone> own = Mdl.Bones(model).ToList();
+            SetWorld(own);
+            foreach (Attachment attachment in Mdl.Attachments(model))
             {
-                Bone bone = player.Bones[i];
+                int index = own.FindIndex(b => b.Name == attachment.Bone);
+                int target = index;
+                while (target >= 0 && player.Find(own[target].Name) == null)
+                    target = own[target].Parent;
+                if (target < 0)
+                    continue;
+                if (target != index)
+                {
+                    Bone from = own[index], to = own[target];
+                    double[] rotation = Matrix.Multiply(from.WorldRotation, attachment.Rotation);
+                    double[] position = Matrix.Add(from.WorldPosition, Matrix.Apply(from.WorldRotation, attachment.Position));
+                    double[] inverse = Matrix.Transpose(to.WorldRotation);
+                    attachment.Bone = to.Name;
+                    attachment.Rotation = Matrix.Multiply(inverse, rotation);
+                    attachment.Position = Matrix.Apply(inverse, Matrix.Subtract(position, to.WorldPosition));
+                }
+                player.Attachments.Add(attachment);
+            }
+            player.IkChains.AddRange(Mdl.IkChains(model).Where(chain => player.Find(chain.Bone) != null));
+            player.ReadPhysics(read(Path.ChangeExtension(path, ".phy")));
+            return player;
+        }
+
+        private static void SetWorld(List<Bone> bones)
+        {
+            foreach (Bone bone in bones)
+            {
                 if (bone.Parent < 0)
                 {
                     bone.WorldRotation = bone.LocalRotation;
@@ -246,16 +604,11 @@ namespace Rbx2Source.Export
                 }
                 else
                 {
-                    Bone parent = player.Bones[bone.Parent];
+                    Bone parent = bones[bone.Parent];
                     bone.WorldRotation = Matrix.Multiply(parent.WorldRotation, bone.LocalRotation);
                     bone.WorldPosition = Matrix.Add(parent.WorldPosition, Matrix.Apply(parent.WorldRotation, bone.LocalPosition));
                 }
             }
-            byte[] stock = install.ReadFile(StockModel + ".mdl");
-            player.Attachments.AddRange(Mdl.Attachments(stock));
-            player.IkChains.AddRange(Mdl.IkChains(stock));
-            player.ReadPhysics(install.ReadFile(StockModel + ".phy"));
-            return player;
         }
 
         // The text section at the end of a .phy file: solids (names, physics settings) and ragdoll constraints.
@@ -327,6 +680,14 @@ namespace Rbx2Source.Export
             return Enumerable.Range(0, count).Select(i => index + 216 * i).Select(o => Text(data, o + BitConverter.ToInt32(data, o))).ToList();
         }
 
+        // The models whose animations this one includes ($includemodel), as game paths ("models/...").
+        public static List<string> Includes(byte[] data)
+        {
+            Check(data);
+            int count = BitConverter.ToInt32(data, 336), index = BitConverter.ToInt32(data, 340);
+            return Enumerable.Range(0, count).Select(i => index + 8 * i).Select(o => Text(data, o + BitConverter.ToInt32(data, o + 4))).ToList();
+        }
+
         public static IEnumerable<ValvePlayer.Bone> Bones(byte[] data)
         {
             Check(data);
@@ -343,6 +704,21 @@ namespace Rbx2Source.Export
                     LocalRotation = Matrix.FromQuaternion(q[0], q[1], q[2], q[3])
                 };
             }
+        }
+
+        // The first hitbox set's boxes: each one's bone and hit group.
+        public static List<(string Bone, int Group)> Hitboxes(byte[] data)
+        {
+            Check(data);
+            List<string> bones = BoneNames(data);
+            var result = new List<(string, int)>();
+            if (BitConverter.ToInt32(data, 172) == 0)
+                return result;
+            int set = BitConverter.ToInt32(data, 176);
+            int count = BitConverter.ToInt32(data, set + 4), index = set + BitConverter.ToInt32(data, set + 8);
+            for (int i = 0; i < count; i++)
+                result.Add((bones[BitConverter.ToInt32(data, index + 68 * i)], BitConverter.ToInt32(data, index + 68 * i + 4)));
+            return result;
         }
 
         public static IEnumerable<ValvePlayer.Attachment> Attachments(byte[] data)

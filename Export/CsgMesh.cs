@@ -166,6 +166,9 @@ namespace Rbx2Source.Export
 
             int indexCount = Int(), encoded = Int();
             Need(encoded);
+            // Every index takes at least one encoded byte.
+            if (indexCount < 0 || indexCount > encoded)
+                throw new InvalidDataException("The union's mesh data has an invalid index count.");
             int end = offset + encoded, previous = 0;
             var indices = new int[indexCount];
             for (int i = 0; i < indexCount; i++)

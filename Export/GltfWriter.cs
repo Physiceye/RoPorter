@@ -9,7 +9,7 @@ using Newtonsoft.Json.Linq;
 
 namespace Rbx2Source.Export
 {
-    public enum ExportFormat { Glb, Gltf, Fbx, GarrysMod, SourceFilmmaker, TowerUnite, Source2, Deadlock }
+    public enum ExportFormat { Glb, Gltf, Fbx, GarrysMod, SourceFilmmaker, TowerUnite, Source2, Deadlock, Left4Dead2, TeamFortress2 }
 
     // Extra PBR textures for one material, as paths relative to the export folder.
     public sealed class MaterialMaps

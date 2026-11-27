@@ -38,7 +38,19 @@ namespace Rbx2Source
                     ? JsonConvert.DeserializeObject<List<Entry>>(System.IO.File.ReadAllText(IndexFile)) ?? new List<Entry>()
                     : new List<Entry>();
             }
-            catch (Exception error) when (error is IOException || error is UnauthorizedAccessException || error is JsonException)
+            catch (JsonException)
+            {
+                // Kept aside rather than overwritten by the next export, so the records can still be recovered by hand.
+                try
+                {
+                    System.IO.File.Copy(IndexFile, IndexFile + ".bad", true);
+                }
+                catch (Exception error) when (error is IOException || error is UnauthorizedAccessException)
+                {
+                }
+                return new List<Entry>();
+            }
+            catch (Exception error) when (error is IOException || error is UnauthorizedAccessException)
             {
                 return new List<Entry>();
             }
@@ -50,6 +62,15 @@ namespace Rbx2Source
             try
             {
                 var index = ReadIndex();
+                foreach (Entry old in index.Where(e => Same(e.File, entry.File)))
+                    if (old.Picture != null && Inside(old.Picture, Pictures))
+                        try
+                        {
+                            System.IO.File.Delete(old.Picture);
+                        }
+                        catch (Exception error) when (error is IOException || error is UnauthorizedAccessException)
+                        {
+                        }
                 index.RemoveAll(e => Same(e.File, entry.File));
                 if (picture != null)
                 {
@@ -58,7 +79,10 @@ namespace Rbx2Source
                     System.IO.File.WriteAllBytes(entry.Picture, picture);
                 }
                 index.Add(entry);
-                System.IO.File.WriteAllText(IndexFile, JsonConvert.SerializeObject(index, Formatting.Indented));
+                // Written beside it and then swapped in, so a crash mid-write never leaves a half-written index.
+                string temporary = IndexFile + ".tmp";
+                System.IO.File.WriteAllText(temporary, JsonConvert.SerializeObject(index, Formatting.Indented));
+                System.IO.File.Move(temporary, IndexFile, true);
             }
             catch (Exception error) when (error is IOException || error is UnauthorizedAccessException)
             {
@@ -85,8 +109,12 @@ namespace Rbx2Source
             foreach (Entry entry in ReadIndex())
                 if (entry.File != null && System.IO.File.Exists(entry.File) && Inside(entry.File, folder))
                 {
+                    // A picture saved by an earlier version beside the program has since moved into the data folder's "library".
                     if (entry.Picture != null && !System.IO.File.Exists(entry.Picture))
-                        entry.Picture = null;
+                    {
+                        string moved = Path.Combine(Pictures, Path.GetFileName(entry.Picture));
+                        entry.Picture = System.IO.File.Exists(moved) ? moved : null;
+                    }
                     result.Add(entry);
                 }
             bool Known(string path) => result.Any(e => Same(e.Folder, path) || Same(e.File, path) || e.File != null && Inside(e.File, path));
